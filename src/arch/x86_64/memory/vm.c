@@ -3,6 +3,7 @@
 #include "object.h"
 #include "resource.h"
 #include "klock.h"
+#include "smp64.h"
 
 // One lock over the whole address-space table: a fork marks the
 // parent pages copy-on-write and a revoke unmaps mappings that
@@ -709,6 +710,10 @@ int vm64_revoke_object_all(struct kernel_object *object) {
     klock_acquire(&vm_klock);
     int result = vm64_revoke_object_all_locked(object);
     klock_release(&vm_klock);
+    // The pages of another space changed under a CPU that cannot take the
+    // IPI while it spins on the lock above with interrupts off, so the
+    // flush goes out only once the lock is down.
+    if (!result) smp64_tlb_shootdown();
     return result;
 }
 
@@ -724,6 +729,10 @@ u32 vm64_revoke_objects(u32 index, struct kernel_object **objects, u32 count) {
     klock_acquire(&vm_klock);
     u32 revoked = vm64_revoke_objects_locked(index, objects, count);
     klock_release(&vm_klock);
+    // The pages of another space changed under a CPU that cannot take the
+    // IPI while it spins on the lock above with interrupts off, so the
+    // flush goes out only once the lock is down.
+    if (revoked) smp64_tlb_shootdown();
     return revoked;
 }
 
@@ -751,6 +760,10 @@ int vm64_clone_space(u32 source, u32 *destination) {
     klock_acquire(&vm_klock);
     int result = vm64_clone_space_locked(source, destination);
     klock_release(&vm_klock);
+    // The pages of another space changed under a CPU that cannot take the
+    // IPI while it spins on the lock above with interrupts off, so the
+    // flush goes out only once the lock is down.
+    if (!result) smp64_tlb_shootdown();
     return result;
 }
 

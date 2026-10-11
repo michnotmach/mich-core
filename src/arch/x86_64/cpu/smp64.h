@@ -33,6 +33,9 @@
 // and the object table are entered by two CPUs at once on purpose.
 #define SMP64_IPI_STRESS 0x49
 #define SMP64_IPI_NET_RX 0x4A
+// Drop every cached translation: another CPU rewrote page tables this
+// one is executing from, and a local invlpg cannot reach it.
+#define SMP64_IPI_TLBSHOT 0x4B
 #define SMP64_IPI_FIRST 0x41
 #define SMP64_IPI_LAST 0x4F
 #define SMP64_CURRENT_NONE 0xFFFFFFFFu
@@ -84,6 +87,7 @@ int smp64_catch_ap_user(u64 number);
 void smp64_syscall_prepare(void);
 void smp64_gs_user(void);
 void smp64_ipi_dispatch(u32 vector);
+int smp64_tlb_shootdown(void);
 void smp64_set_current(u32 slot);
 u32 smp64_running_slot(void);
 void smp64_note_preempt(void);

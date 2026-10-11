@@ -71,6 +71,10 @@ struct smp64_cpu {
     volatile u32 resched;
     // Set by the shared-state stress when this CPU finishes its turns.
     volatile u32 stress_done;
+    // A sender stamps the generation it wants; the target copies it back
+    // once its caches are down, which tells an owed flush from a done one.
+    volatile u32 tlb_gen;
+    volatile u32 tlb_done;
 };
 
 struct smp64_stack {
@@ -88,6 +92,7 @@ static struct smp64_cpu smp64_cpus[SMP64_MAX];
 static struct smp64_stack smp64_stacks[SMP64_MAX];
 static struct smp64_sysstack smp64_sysstacks[SMP64_MAX];
 static u32 smp64_online;
+static u32 smp64_tlb_generation;
 static u8 smp64_bsp_id;
 static struct smp64_cpu *smp64_cpu_by_apic[256];
 static struct spinlock smp64_spin = SPINLOCK_INIT;
@@ -457,6 +462,37 @@ static struct smp64_cpu *smp64_cpu(u32 index) {
 u8 smp64_cpu_apic_id(u32 index) {
     struct smp64_cpu *cpu = smp64_cpu(index);
     return cpu ? (u8)cpu->apic_id : 0;
+}
+
+static void smp64_tlb_flush_local(void) {
+    u64 root;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(root));
+    __asm__ volatile("mov %0, %%cr3" : : "r"(root) : "memory");
+}
+
+// Broadcast outside every klock. A CPU spinning on a klock has interrupts
+// off, so a sender that waited while holding one would wait for an ack from
+// a CPU that cannot see the request: the callers flush after they unlock.
+int smp64_tlb_shootdown(void) {
+    struct smp64_cpu *self = smp64_this();
+    u32 generation = ++smp64_tlb_generation;
+    u32 targets = 0;
+    for (u32 index = 0; index < smp64_online; index++) {
+        struct smp64_cpu *cpu = smp64_cpu(index);
+        if (!cpu || cpu == self) continue;
+        __atomic_store_n(&cpu->tlb_gen, generation, __ATOMIC_RELEASE);
+        if (smp64_ipi_cpu(index, SMP64_IPI_TLBSHOT)) return -1;
+        targets++;
+    }
+    smp64_tlb_flush_local();
+    if (!targets) return 0;
+    for (u32 index = 0; index < smp64_online; index++) {
+        struct smp64_cpu *cpu = smp64_cpu(index);
+        if (!cpu || cpu == self) continue;
+        while (__atomic_load_n(&cpu->tlb_done, __ATOMIC_ACQUIRE) < generation)
+            __builtin_ia32_pause();
+    }
+    return 0;
 }
 
 int smp64_ipi_cpu(u32 index, u32 vector) {
@@ -1068,6 +1104,11 @@ void smp64_ipi_dispatch(u32 vector) {
     } else if (vector == SMP64_IPI_STRESS) {
         smp64_stress_run(smp64_stress_turns);
         __atomic_store_n(&cpu->stress_done, 1, __ATOMIC_RELEASE);
+    } else if (vector == SMP64_IPI_TLBSHOT) {
+        smp64_tlb_flush_local();
+        __atomic_store_n(&cpu->tlb_done,
+                         __atomic_load_n(&cpu->tlb_gen, __ATOMIC_ACQUIRE),
+                         __ATOMIC_RELEASE);
     } else if (vector == SMP64_IPI_TIMER) {
         apic64_timer_enable();
     } else if (vector == SMP64_IPI_TIMER_OFF) {
