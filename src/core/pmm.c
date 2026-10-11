@@ -2,6 +2,7 @@
 #include "serial.h"
 #include "protos.h"
 #include "klock.h"
+#include "scheduler.h"
 
 #define PAGE_SIZE 4096
 #define BITMAP_SIZE 0x20000
@@ -11,6 +12,19 @@
 // S2's transitional cover for the allocator: the bitmap, the page refcounts
 // and the free count move together, and two CPUs reach them at once now.
 static struct klock pmm_klock = KLOCK_INIT(KLOCK_LEVEL_PMM);
+
+// The single page path used to rescan the bitmap on every call, and that
+// scan is what made the allocator lock queue up as CPUs were added. The
+// reserve turns a call into a pop and scans once per refill instead. A
+// cached page stays claimed, bitmap bit set and refcount one, so no scan
+// can hand it out twice and pmm_free_pages adds the reserve back: the
+// leak checks compare that count for exact equality.
+#define PMM_RESERVE_MAX 8u
+#define PMM_HIGH_START (0x1000000 / PAGE_SIZE)
+
+static u32 pmm_page_reserve[KLOCK_MAX_CPUS][PMM_RESERVE_MAX];
+static u32 pmm_reserve_count[KLOCK_MAX_CPUS];
+static u32 pmm_cached_pages;
 
 struct e820_entry {
     unsigned long long addr;
@@ -119,6 +133,27 @@ void pmm_set_alloc_limit(paddr_t end) {
     }
 }
 
+static u32 pmm_cpu(void) {
+    int cpu = scheduler_cpu_id();
+    return cpu > 0 && (u32)cpu < KLOCK_MAX_CPUS ? (u32)cpu : 0;
+}
+
+// Only high pages are cached. Handing a low page back from the reserve
+// would spend the memory pmm_alloc_page_low exists to keep available.
+static void pmm_refill_locked(u32 cpu, u32 limit) {
+    u32 count = 0;
+    for (u32 page = PMM_HIGH_START; page < limit && count < PMM_RESERVE_MAX;
+         page++) {
+        if (bitmap[page / 8] & (1u << (page % 8))) continue;
+        bitmap[page / 8] |= (u8)(1u << (page % 8));
+        page_refs[page] = 1;
+        free_pages--;
+        pmm_page_reserve[cpu][count++] = page;
+    }
+    pmm_reserve_count[cpu] = count;
+    pmm_cached_pages += count;
+}
+
 static paddr_t pmm_take_page(u32 page) {
     bitmap[page / 8] |= (u8)(1u << (page % 8));
     page_refs[page] = 1;
@@ -167,17 +202,20 @@ paddr_t pmm_alloc_page_range(paddr_t start, paddr_t end) {
 }
 
 paddr_t pmm_alloc_page(void) {
-    u32 high_start = 0x1000000 / PAGE_SIZE;
+    u32 high_start = PMM_HIGH_START;
     u32 limit = max_page + 1;
     if (limit > alloc_page_limit) limit = alloc_page_limit;
     klock_acquire(&pmm_klock);
-    for (u32 page = high_start; page < limit; page++) {
-        if (!(bitmap[page / 8] & (1u << (page % 8)))) {
-            paddr_t physical = pmm_take_page(page);
-            klock_release(&pmm_klock);
-            pmm_zero_page(physical);
-            return physical;
-        }
+    u32 cpu = pmm_cpu();
+    if (!pmm_reserve_count[cpu] && limit > high_start)
+        pmm_refill_locked(cpu, limit);
+    if (pmm_reserve_count[cpu]) {
+        u32 page = pmm_page_reserve[cpu][--pmm_reserve_count[cpu]];
+        pmm_cached_pages--;
+        paddr_t physical = (paddr_t)page * PAGE_SIZE;
+        klock_release(&pmm_klock);
+        pmm_zero_page(physical);
+        return physical;
     }
     for (u32 page = 1; page < high_start && page < limit; page++) {
         if (!(bitmap[page / 8] & (1u << (page % 8)))) {
@@ -258,8 +296,16 @@ void pmm_free_page(paddr_t addr) {
     if (!page_refs[page]) panic_str("PMM double free");
     page_refs[page]--;
     if (!page_refs[page]) {
-        bitmap[page / 8] &= (unsigned char)~(1u << (page % 8));
-        free_pages++;
+        u32 cpu = pmm_cpu();
+        if (page >= PMM_HIGH_START &&
+            pmm_reserve_count[cpu] < PMM_RESERVE_MAX) {
+            page_refs[page] = 1;
+            pmm_page_reserve[cpu][pmm_reserve_count[cpu]++] = page;
+            pmm_cached_pages++;
+        } else {
+            bitmap[page / 8] &= (unsigned char)~(1u << (page % 8));
+            free_pages++;
+        }
     }
     klock_release(&pmm_klock);
 }
@@ -290,7 +336,7 @@ u32 pmm_page_refs(paddr_t addr) {
 
 u32 pmm_free_pages(void) {
     klock_acquire(&pmm_klock);
-    u32 count = free_pages;
+    u32 count = free_pages + pmm_cached_pages;
     klock_release(&pmm_klock);
     return count;
 }
