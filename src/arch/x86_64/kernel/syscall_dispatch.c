@@ -443,6 +443,12 @@ u64 syscall64_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2) {
     if (number == 270)
         return task_pool[current_task_slot].capabilities & CAP_RESOURCE_ADMIN ?
             (u64)task_active_count() : (u64)(i64)EPERM;
+    if (number == 271)
+        return task_pool[current_task_slot].capabilities & CAP_RESOURCE_ADMIN ?
+            (u64)posix_fd_active_count() : (u64)(i64)EPERM;
+    if (number == 272)
+        return task_pool[current_task_slot].capabilities & CAP_RESOURCE_ADMIN ?
+            (u64)object_active_count() : (u64)(i64)EPERM;
     if (number == 33)
         return (u64)(i64)handle_close(&task_pool[current_task_slot],
                                       (u32)arg0);
