@@ -712,7 +712,7 @@ Mich Core does not include:
 - USB
 - Audio
 - A desktop or shell
-- POSIX pipes, `mmap`, polling, signals, or a complete POSIX runtime ABI
+- POSIX `mmap` or threads
 - POSIX certification, complete POSIX conformance, or Linux binary/syscall ABI
   compatibility
 - Independently written Linux Kernel API compatibility headers
