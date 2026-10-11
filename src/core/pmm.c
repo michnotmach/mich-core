@@ -123,7 +123,14 @@ static paddr_t pmm_take_page(u32 page) {
     bitmap[page / 8] |= (u8)(1u << (page % 8));
     page_refs[page] = 1;
     free_pages--;
-    paddr_t phys = (paddr_t)page * PAGE_SIZE;
+    return (paddr_t)page * PAGE_SIZE;
+}
+
+// The clear runs after the caller drops the lock, because the page is
+// claimed by then and nobody else can reach it. Zeroing 4096 bytes under
+// the allocator turns every other CPU's allocation into a wait, and the
+// wait count grows faster than the allocation count as CPUs are added.
+static void pmm_zero_page(paddr_t phys) {
 #if __SIZEOF_POINTER__ == 8
     u8 *pointer = (u8 *)(uptr_t)phys;
     for (u32 i = 0; i < PAGE_SIZE; i++) pointer[i] = 0;
@@ -133,7 +140,6 @@ static paddr_t pmm_take_page(u32 page) {
         for (u32 i = 0; i < PAGE_SIZE; i++) pointer[i] = 0;
     }
 #endif
-    return phys;
 }
 
 paddr_t pmm_alloc_page_range(paddr_t start, paddr_t end) {
@@ -152,6 +158,7 @@ paddr_t pmm_alloc_page_range(paddr_t start, paddr_t end) {
         if (!(bitmap[page / 8] & (1u << (page % 8)))) {
             paddr_t physical = pmm_take_page(page);
             klock_release(&pmm_klock);
+            pmm_zero_page(physical);
             return physical;
         }
     }
@@ -168,6 +175,7 @@ paddr_t pmm_alloc_page(void) {
         if (!(bitmap[page / 8] & (1u << (page % 8)))) {
             paddr_t physical = pmm_take_page(page);
             klock_release(&pmm_klock);
+            pmm_zero_page(physical);
             return physical;
         }
     }
@@ -175,6 +183,7 @@ paddr_t pmm_alloc_page(void) {
         if (!(bitmap[page / 8] & (1u << (page % 8)))) {
             paddr_t physical = pmm_take_page(page);
             klock_release(&pmm_klock);
+            pmm_zero_page(physical);
             return physical;
         }
     }
@@ -191,6 +200,7 @@ paddr_t pmm_alloc_page_low(void) {
         if (!(bitmap[page / 8] & (1u << (page % 8)))) {
             paddr_t physical = pmm_take_page(page);
             klock_release(&pmm_klock);
+            pmm_zero_page(physical);
             return physical;
         }
     }
