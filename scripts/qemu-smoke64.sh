@@ -994,6 +994,7 @@ if [ "$profile" = "smp" ]; then
         "Mich x86_64: SMP driver domain storm pass" \
         "Mich x86_64: SMP driver module storm pass" \
         "Mich x86_64: SMP vector storm pass" \
+        "Mich x86_64: SMP copy-on-write storm pass" \
         "Mich x86_64: SMP lock order pass" \
         "Mich x86_64: SMP lock contention report" \
         "Mich x86_64: SMP dual-core userspace pass"

@@ -998,6 +998,69 @@ static int test_smp64_lock_contention(void) {
     return total ? 0 : -1;
 }
 
+// Every CPU faults the same copy-on-write page at once. The arithmetic is
+// exact: each space drops its one reference to the shared page and takes a
+// page of its own, so the shared page is left holding only the parent's
+// reference and the free count comes back once the spaces go. The
+// generation checks are what a dropped shootdown fails: every clone has to
+// push each other CPU's completed flush past the point the clone happened.
+static int test_smp64_cow_storm(void) {
+    u32 n = smp64_cpu_count();
+    u64 before = pmm_free_pages();
+    u32 spaces[SMP64_MAX];
+    u32 created = 0;
+    u32 parent = 0;
+    int reason = 0;
+    for (u32 index = 0; index < SMP64_MAX; index++) spaces[index] = 0;
+    paddr_t shared = pmm_alloc_page();
+    if (!shared || vm64_create_space(&parent) ||
+        vm64_map(parent, VM64_USER_BASE, shared, 1, 0))
+        reason = 1;
+    u32 stamped = smp64_tlb_generation();
+    for (u32 index = 0; !reason && index < n; index++) {
+        if (vm64_clone_space(parent, &spaces[index])) {
+            reason = 2;
+            break;
+        }
+        created++;
+        smp64_cow_arm(index, spaces[index], VM64_USER_BASE);
+    }
+    u32 generation = smp64_tlb_generation();
+    if (!reason && generation - stamped != n) reason = 3;
+    if (!reason) {
+        smp64_stress_reset(1, 0, SMP64_STRESS_COW);
+        for (u32 index = 1; index < n; index++)
+            if (smp64_ipi_cpu(index, SMP64_IPI_STRESS)) reason = 4;
+        if (!reason) {
+            smp64_stress_run(1);
+            for (u32 index = 1; index < n; index++)
+                if (wait_rounds(smp64_stress_done, index,
+                                SMP64_BOOT_TIMEOUT_MS / 10 * 4))
+                    reason = 5;
+        }
+        if (!reason && smp64_stress_failed()) reason = 6;
+        if (!reason && pmm_page_refs(shared) != 1) reason = 7;
+        for (u32 index = 1; !reason && index < n; index++)
+            if (smp64_tlb_done(index) < generation) reason = 8;
+    }
+    for (u32 index = 0; index < created; index++)
+        vm64_destroy_space(spaces[index]);
+    if (parent) vm64_destroy_space(parent);
+    smp64_cow_disarm();
+    if (!reason && pmm_free_pages() != before) reason = 9;
+    if (reason) {
+        serial64_write("Mich x86_64: cow storm check failed: ");
+        serial64_hex(reason);
+        serial64_write(" cpus="); serial64_hex(n);
+        serial64_write(" refs="); serial64_hex(pmm_page_refs(shared));
+        serial64_write(" gen="); serial64_hex(generation - stamped);
+        serial64_write("\n");
+        return -1;
+    }
+    serial64_write("Mich x86_64: SMP copy-on-write storm pass\n");
+    return 0;
+}
+
 static int test_smp64_lockorder(void) {
     static struct klock outer = KLOCK_INIT(KLOCK_LEVEL_NET);
     static struct klock inner = KLOCK_INIT(KLOCK_LEVEL_PMM);
@@ -1372,6 +1435,10 @@ int tests64_run_smp(void) {
         return -1;
     }
     serial64_write("Mich x86_64: SMP vector storm pass\n");
+    if (test_report_record(TEST_ID_SMP_COW_STORM, test_smp64_cow_storm())) {
+        irq_restore(irq_state);
+        return -1;
+    }
     if (test_report_record(TEST_ID_SMP_LOCKORDER, test_smp64_lockorder())) {
         irq_restore(irq_state);
         return -1;

@@ -92,7 +92,7 @@ static struct smp64_cpu smp64_cpus[SMP64_MAX];
 static struct smp64_stack smp64_stacks[SMP64_MAX];
 static struct smp64_sysstack smp64_sysstacks[SMP64_MAX];
 static u32 smp64_online;
-static u32 smp64_tlb_generation;
+static u32 smp64_tlb_generation_count;
 static u8 smp64_bsp_id;
 static struct smp64_cpu *smp64_cpu_by_apic[256];
 static struct spinlock smp64_spin = SPINLOCK_INIT;
@@ -464,6 +464,27 @@ u8 smp64_cpu_apic_id(u32 index) {
     return cpu ? (u8)cpu->apic_id : 0;
 }
 
+static u32 smp64_cow_space[SMP64_MAX];
+static vaddr_t smp64_cow_virtual;
+
+void smp64_cow_arm(u32 index, u32 space, vaddr_t virtual) {
+    if (index < SMP64_MAX) smp64_cow_space[index] = space;
+    smp64_cow_virtual = virtual;
+}
+
+void smp64_cow_disarm(void) {
+    for (u32 index = 0; index < SMP64_MAX; index++) smp64_cow_space[index] = 0;
+}
+
+u32 smp64_tlb_generation(void) {
+    return smp64_tlb_generation_count;
+}
+
+u32 smp64_tlb_done(u32 index) {
+    struct smp64_cpu *cpu = smp64_cpu(index);
+    return cpu ? __atomic_load_n(&cpu->tlb_done, __ATOMIC_ACQUIRE) : 0;
+}
+
 static void smp64_tlb_flush_local(void) {
     u64 root;
     __asm__ volatile("mov %%cr3, %0" : "=r"(root));
@@ -475,7 +496,7 @@ static void smp64_tlb_flush_local(void) {
 // a CPU that cannot see the request: the callers flush after they unlock.
 int smp64_tlb_shootdown(void) {
     struct smp64_cpu *self = smp64_this();
-    u32 generation = ++smp64_tlb_generation;
+    u32 generation = ++smp64_tlb_generation_count;
     u32 targets = 0;
     for (u32 index = 0; index < smp64_online; index++) {
         struct smp64_cpu *cpu = smp64_cpu(index);
@@ -791,6 +812,15 @@ static void smp64_vector_turn(void) {
         __atomic_store_n(&smp64_stress_failure, 1, __ATOMIC_RELEASE);
 }
 
+// One turn per CPU: after the first fault the page is private, so the
+// storm arms a single turn and every CPU has to win its own copy.
+static void smp64_cow_turn(void) {
+    struct smp64_cpu *cpu = smp64_this();
+    u32 space = cpu ? smp64_cow_space[cpu->index] : 0;
+    if (!space || vm64_handle_cow(space, smp64_cow_virtual))
+        __atomic_store_n(&smp64_stress_failure, 1, __ATOMIC_RELEASE);
+}
+
 void smp64_stress_run(u32 turns) {
     for (u32 turn = 0; turn < turns; turn++) {
         paddr_t held[SMP64_STRESS_HOLD];
@@ -808,6 +838,10 @@ void smp64_stress_run(u32 turns) {
         }
         if (smp64_stress_mode == SMP64_STRESS_MODULE) {
             smp64_module_turn(turn);
+            continue;
+        }
+        if (smp64_stress_mode == SMP64_STRESS_COW) {
+            smp64_cow_turn();
             continue;
         }
         if (smp64_stress_mode == SMP64_STRESS_VECTOR) {

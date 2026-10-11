@@ -88,6 +88,10 @@ void smp64_syscall_prepare(void);
 void smp64_gs_user(void);
 void smp64_ipi_dispatch(u32 vector);
 int smp64_tlb_shootdown(void);
+u32 smp64_tlb_generation(void);
+u32 smp64_tlb_done(u32 index);
+void smp64_cow_arm(u32 index, u32 space, vaddr_t virtual);
+void smp64_cow_disarm(void);
 void smp64_set_current(u32 slot);
 u32 smp64_running_slot(void);
 void smp64_note_preempt(void);
@@ -127,6 +131,7 @@ struct kernel_object;
 #define SMP64_STRESS_VECTOR 5u
 #define SMP64_STRESS_DOMAIN 6u
 #define SMP64_STRESS_MODULE 7u
+#define SMP64_STRESS_COW 8u
 
 void smp64_stress_reset(u32 turns, struct kernel_object *shared, u32 mode);
 void smp64_net_storm_prepare(struct kernel_object *interface,
