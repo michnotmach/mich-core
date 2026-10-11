@@ -649,7 +649,7 @@ This prevents an MSI-X interrupt from corrupting a queue or causing a lost wakeu
 | Panic register dump | Yes |
 | FPU context switching | FXSAVE and FXRSTOR |
 | SMP | AP bring-up, per-CPU state, reschedule and TLB shootdown IPI, spinlocks, and tasks running concurrently on separate CPUs |
-| IOMMU | Intel VT-d and AMD-Vi coherent DMA |
+| IOMMU | Intel VT-d and AMD-Vi translation, coherent DMA mapping, fault quarantine |
 | AArch64 | Planned |
 | RISC-V 64 | Planned |
 
@@ -718,7 +718,7 @@ Mich Core does not include:
 - Independently written Linux Kernel API compatibility headers
 - CPU affinity controls or load balancing: a runnable task goes to whichever
   CPU asks for work first, and device interrupts stay on the boot CPU
-- IOMMU-backed DMA isolation
+- VT-d RMRR ownership, or a physical AMD-Vi event-log fault integration test
 - Power management
 - A higher-half kernel
 - Complete kernel W^X, SMEP, SMAP, or KASLR
