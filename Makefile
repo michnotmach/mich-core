@@ -575,6 +575,8 @@ release-check:
 	$(MAKE) all
 	$(MAKE) check-build
 	$(MAKE) test64
+	$(MAKE) test64-smp
+	$(MAKE) test64-smp4
 	$(MAKE) test64-prod
 	$(MAKE) test64-unit
 	$(MAKE) test64-highmem
