@@ -438,6 +438,11 @@ u64 syscall64_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2) {
         task_state_set(target, TASK_RUNNING);
         return 0;
     }
+    // Gated like the free page count: a resource total is admin surface, and
+    // the battery that reads it already holds the capability.
+    if (number == 270)
+        return task_pool[current_task_slot].capabilities & CAP_RESOURCE_ADMIN ?
+            (u64)task_active_count() : (u64)(i64)EPERM;
     if (number == 33)
         return (u64)(i64)handle_close(&task_pool[current_task_slot],
                                       (u32)arg0);

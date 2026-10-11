@@ -211,6 +211,18 @@ void task_cpu_release(struct task *t) {
     task_cpu_claim(t, TASK_CPU_NONE);
 }
 
+// Slots that are not free, which is what a spawn and reap section can assert
+// on: unlike the free page count it does not move when another task allocates,
+// so a capsule that stays alive shifts it once instead of every packet.
+u32 task_active_count(void) {
+    u32 live = 0;
+    task_pool_lock();
+    for (int i = 1; i < task_pool_count; i++)
+        if (task_pool[i].state != TASK_FREE) live++;
+    task_pool_unlock();
+    return live;
+}
+
 struct task *task_alloc_slot(void) {
     struct task *t = 0;
     task_pool_lock();

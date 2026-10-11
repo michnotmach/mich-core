@@ -146,6 +146,7 @@ struct task {
 
 extern struct task task_pool[MAX_TASKS];
 extern int task_pool_count;
+u32 task_active_count(void);
 
 static inline unsigned int task_full_pid(const struct task *t) {
     return PID_MAKE(t->gen, (unsigned int)(t - task_pool));
