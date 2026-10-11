@@ -975,6 +975,65 @@ because the hot path is in memory with no MMIO):
 TCG (emulated CPU) numbers run 5-9x higher on the same machine and are useful
 only for spotting relative regressions, never as a figure to quote.
 
+## Multiprocessor performance
+
+Every number here is QEMU under TCG on a two-core host, which time-shares the
+guest CPUs. These figures are for spotting regressions and for comparing one
+column against another inside the same table. They are not hardware results
+and they are not a scaling law.
+
+### Two CPU-bound tasks
+
+Two tasks run the same fixed turn count, and the wall time is guest TSC
+ticks. Each row is the median of eight runs.
+
+| Guest CPUs | Pair layout | Working CPUs | Wall, median of 8 | Speedup |
+|-----------:|-------------|-------------:|------------------:|--------:|
+| `-smp 2` | both on one AP | 1 | 311,983 us | 1.00x, the baseline |
+| `-smp 4` | both on the same AP | 1 | 319,745 us | 0.98x |
+| `-smp 4` | one task per AP | 2 | 144,199 us | 2.19x |
+
+The one-CPU rows are the control: two tasks sharing a CPU cost what they
+should cost, and adding CPUs that do no work does not change the number.
+
+### Aggregate netbench
+
+Each driving CPU runs its own loopback stream on its own benchmark NIC, so
+the streams share no ring, no packet pool, and no frame buffer. The window
+is read on the boot CPU and spans the whole concurrent phase, including the
+kick and the join. Each row is a single run of 512 echo packets at 512 bytes
+per driving CPU, inside one `-smp 4` guest.
+
+| Driving CPUs | Packets | Window, cycles | Cycles per packet |
+|-------------:|--------:|---------------:|------------------:|
+| 1 | 512 | 11,938,612 | 23,317 |
+| 2 | 1024 | 23,079,362 | 22,538 |
+| 4 | 2048 | 21,815,540 | 10,652 |
+
+The two-CPU row is the honest one to read first: aggregate throughput barely
+moves. The streams are independent above the driver, but underneath they
+still take the same coarse kernel locks for objects, pages, and network
+state, and that is what caps the gain. Those locks are the transitional net
+this release carries on purpose; removing them is what has to happen before
+this table is worth comparing against hardware.
+
+### Filesystem throughput
+
+One adytumfs file on a 256 KiB block object, 16 chunks of 4096 bytes, single
+CPU, timed per call with rdtsc. The flush is separate because a write that
+reached the cache and one that reached the block device are different claims.
+
+| Operation | Total cycles | Cycles per 4096 B |
+|-----------|-------------:|------------------:|
+| Write | 12,356,552 | 772,284 |
+| Flush | 15,990,590 | |
+| Read | 8,797,196 | 549,824 |
+
+Each chunk carries its own pattern and every read is compared against its
+own, so the read figure is for data that was really stored and read back.
+There is no matching "before" measurement: the block layer landed in the same
+release, so this is a baseline for later work rather than an improvement.
+
 ## Crypto policy
 
 The kernel keeps only the cryptography its own machinery needs, and nothing
