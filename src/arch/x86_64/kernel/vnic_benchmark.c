@@ -45,7 +45,6 @@ int vnic_benchmark_run(struct kernel_object *vnic,
     return request->cycles ? 0 : -1;
 }
 
-#define VNIC_BENCH64_FRAME_MAX (NET_PACKET_DATA_MAX - NET_PACKET_HEADROOM)
 #define VNIC_BENCH64_WARMUP 512
 static u8 bench_frame[VNIC_BENCH64_FRAME_MAX];
 static u64 bench_samples[VNIC_BENCH64_SAMPLE_COUNT];
@@ -85,13 +84,13 @@ static void bench_sort_range(u64 *a, u32 lo, u32 hi) {
     }
 }
 
-static int bench_one(struct kernel_object *vnic, u32 direction,
-                     u32 frame_size, u64 *cycles) {
+static int bench_one(struct kernel_object *vnic, const u8 *frame,
+                     u32 direction, u32 frame_size, u64 *cycles) {
     struct net_packet_descriptor descriptor;
     u64 rx_id = 0;
     u64 start = benchmark_cycles();
     if (direction == VNIC_BENCH64_RX || direction == VNIC_BENCH64_ECHO) {
-        if (vnic_inject(vnic, bench_frame, frame_size)) return -1;
+        if (vnic_inject(vnic, frame, frame_size)) return -1;
         if (vnic_receive(vnic, &descriptor)) return -1;
         rx_id = descriptor.buffer_id;
     }
@@ -101,7 +100,7 @@ static int bench_one(struct kernel_object *vnic, u32 direction,
             vnic_pool(vnic), id, NET_BUFFER_TX) : 0;
         if (!data) return -1;
         for (u32 index = 0; index < frame_size; index++)
-            data[NET_PACKET_HEADROOM + index] = bench_frame[index];
+            data[NET_PACKET_HEADROOM + index] = frame[index];
         if (vnic_submit_tx(vnic, id, NET_PACKET_HEADROOM, frame_size, 0) ||
             vnic_drain_tx(vnic, &descriptor))
             return -1;
@@ -121,11 +120,13 @@ int vnic_bench64_run(struct kernel_object *vnic, u32 direction,
     for (u32 index = 0; index < frame_size; index++)
         bench_frame[index] = (u8)index;
     for (u32 index = 0; index < VNIC_BENCH64_WARMUP; index++)
-        if (bench_one(vnic, direction, frame_size, 0)) return -1;
+        if (bench_one(vnic, bench_frame, direction, frame_size, 0))
+            return -1;
     u64 total = 0;
     for (u32 index = 0; index < VNIC_BENCH64_SAMPLE_COUNT; index++) {
         u64 elapsed;
-        if (bench_one(vnic, direction, frame_size, &elapsed)) return -1;
+        if (bench_one(vnic, bench_frame, direction, frame_size, &elapsed))
+            return -1;
         bench_samples[index] = elapsed;
         total += elapsed;
     }
@@ -135,4 +136,19 @@ int vnic_bench64_run(struct kernel_object *vnic, u32 direction,
     result->p50_cycles = bench_samples[VNIC_BENCH64_SAMPLE_COUNT / 2];
     result->p99_cycles = bench_samples[(VNIC_BENCH64_SAMPLE_COUNT * 99 + 99) / 100 - 1];
     return result->min_cycles ? 0 : -1;
+}
+
+int vnic_bench64_batch(struct kernel_object *vnic, u32 direction,
+                       u32 frame_size, u32 packets, u8 *frame, u64 *cycles) {
+    if (!vnic || !frame || !cycles || !packets ||
+        direction > VNIC_BENCH64_ECHO || !frame_size ||
+        frame_size > VNIC_BENCH64_FRAME_MAX)
+        return -1;
+    for (u32 index = 0; index < frame_size; index++)
+        frame[index] = (u8)index;
+    u64 start = benchmark_cycles();
+    for (u32 index = 0; index < packets; index++)
+        if (bench_one(vnic, frame, direction, frame_size, 0)) return -1;
+    *cycles = benchmark_cycles() - start;
+    return *cycles ? 0 : -1;
 }

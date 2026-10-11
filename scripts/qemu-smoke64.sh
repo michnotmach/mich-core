@@ -657,6 +657,7 @@ for marker in \
     "Mich test64: adytumfs path operations pass" \
     "Mich test64: adytumfs format and mount pass" \
     "Mich test64: adytumfs file io pass" \
+    "Mich x86_64: fsbench bytes=" \
     "Mich test64: adytumfs busy unmount lifetime pass" \
     "Mich test64: adytumfs stale vnode generation pass" \
     "Mich test64: resource object layer pass" \
@@ -968,6 +969,9 @@ if [ "$profile" = "smp" ]; then
     # The bring-up marker spells the CPU count it brought up, so the check
     # cannot pass on a log from a different -smp.
     expected_cpus=$(printf '%016X' "${MICH_SMP_CPUS:-2}")
+    bench_cpus_1=$(printf '%016X' 1)
+    bench_cpus_2=$(printf '%016X' 2)
+    bench_cpus_4=$(printf '%016X' 4)
     for marker in \
         "Mich x86_64: SMP MADT enumeration pass" \
         "Mich x86_64: SMP per-CPU storage pass" \
@@ -995,6 +999,8 @@ if [ "$profile" = "smp" ]; then
         "Mich x86_64: SMP driver module storm pass" \
         "Mich x86_64: SMP vector storm pass" \
         "Mich x86_64: SMP copy-on-write storm pass" \
+        "Mich x86_64: netbench-smp drivers=$bench_cpus_1" \
+        "Mich x86_64: netbench-smp drivers=$bench_cpus_2" \
         "Mich x86_64: SMP lock order pass" \
         "Mich x86_64: SMP lock contention report" \
         "Mich x86_64: SMP dual-core userspace pass"
@@ -1007,6 +1013,9 @@ if [ "$profile" = "smp" ]; then
     if [ "${MICH_SMP_CPUS:-2}" -ge 3 ]; then
         require_marker "Mich x86_64: SMP two-task parallel pass"
         require_marker "Mich x86_64: SMP speedup two-tasks two-cpu"
+    fi
+    if [ "${MICH_SMP_CPUS:-2}" -ge 4 ]; then
+        require_marker "Mich x86_64: netbench-smp drivers=$bench_cpus_4"
     fi
 fi
 if [ "$profile" = "dns" ]; then

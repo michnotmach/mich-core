@@ -2,17 +2,6 @@
 #include "serial64.h"
 #include "kernel64_internal.h"
 
-static void serial64_dec(u64 value) {
-    char digits[20];
-    u32 count = 0;
-    do {
-        digits[count++] = (char)('0' + value % 10);
-        value /= 10;
-    } while (value);
-    while (count)
-        serial64_putc(digits[--count]);
-}
-
 int test_net_bench(void) {
     u32 free_pages = pmm_free_pages();
     u32 objects = object_active_count();

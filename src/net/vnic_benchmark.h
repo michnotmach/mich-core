@@ -25,4 +25,12 @@ struct vnic_bench64_result {
 int vnic_bench64_run(struct kernel_object *vnic, u32 direction,
                      u32 frame_size, struct vnic_bench64_result *result);
 
+#define VNIC_BENCH64_FRAME_MAX (NET_PACKET_DATA_MAX - NET_PACKET_HEADROOM)
+
+// One CPU's own stream, timed end to end. The frame is the caller's because
+// the percentile path keeps its samples in one shared buffer, and CPUs
+// driving streams at the same time must not share the buffer they fill.
+int vnic_bench64_batch(struct kernel_object *vnic, u32 direction,
+                       u32 frame_size, u32 packets, u8 *frame, u64 *cycles);
+
 #endif

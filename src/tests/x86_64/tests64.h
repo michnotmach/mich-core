@@ -56,6 +56,7 @@ int test_adytumfs_diriter64(void);
 int test_adytumfs_file64(void);
 int test_adytumfs_ops64(void);
 int test_adytumfs64(void);
+int test_fs_bench(void);
 int test_adytumfs_pages64(void);
 int test_adytumfs_policy64(void);
 int test_adytumfs_reuse64(void);

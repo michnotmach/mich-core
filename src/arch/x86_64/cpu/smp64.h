@@ -132,6 +132,7 @@ struct kernel_object;
 #define SMP64_STRESS_DOMAIN 6u
 #define SMP64_STRESS_MODULE 7u
 #define SMP64_STRESS_COW 8u
+#define SMP64_STRESS_NETBENCH 9u
 
 void smp64_stress_reset(u32 turns, struct kernel_object *shared, u32 mode);
 void smp64_net_storm_prepare(struct kernel_object *interface,
@@ -148,6 +149,20 @@ u64 smp64_stress_pages(void);
 u64 smp64_stress_objects(void);
 u32 smp64_stress_failed(void);
 u32 smp64_stress_done(u32 index);
+// Multi-CPU netbench: every armed CPU drives its own VNIC stream, so the
+// aggregate window says what the CPUs move together and not what one moves
+// alone. The window is read on the BSP alone, because a TSC stamp taken on
+// two CPUs is only comparable if the host keeps them in step, which TCG
+// does not promise; one clock spanning the whole concurrent phase costs
+// the kick and the join, and that cost is part of running concurrently.
+#define SMP64_NETBENCH_FRAME 512u
+void smp64_netbench_reset(void);
+int smp64_netbench_arm(u32 index, struct kernel_object *vnic);
+int smp64_netbench_begin(u32 cpus, u32 packets, u32 frame_size);
+void smp64_netbench_finish(void);
+u64 smp64_netbench_window(void);
+u64 smp64_netbench_cycles(u32 index);
+u32 smp64_netbench_done(u32 index);
 int smp64_arm_user(u32 index, const u8 *stub, u32 size);
 int smp64_pin_user(u32 index, const u8 *stub, u32 size, u32 *slot_out);
 void smp64_disarm_user(u32 index);

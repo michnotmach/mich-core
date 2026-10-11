@@ -1061,6 +1061,106 @@ static int test_smp64_cow_storm(void) {
     return 0;
 }
 
+#define SMP64_NETBENCH_PACKETS 512u
+
+// Aggregate throughput with N CPUs driving their own loopback streams. The
+// driver count is what varies, not the guest CPU count, so one guest yields
+// every column of the table and the columns differ in nothing but how many
+// CPUs were asked to work. The window is asserted against the slowest single
+// stream rather than against a speedup: under TCG the host decides how much
+// of a guest CPU it runs, so a ratio is a measurement and an invariant is a
+// check, and only the second belongs in a test that has to pass.
+static int test_smp64_net_bench(void) {
+    u32 online = smp64_cpu_count();
+    u32 free_pages = pmm_free_pages();
+    u32 objects = object_active_count();
+    u32 pools = packet_pool_active_count();
+    u32 vnics = vnic_active_count();
+    u32 rings = ring_active_count();
+    struct kernel_object *vnic[SMP64_MAX];
+    u32 created = 0;
+    int reason = 0;
+    if (online < 2) {
+        serial64_write("Mich x86_64: SMP netbench skipped (");
+        serial64_hex(online);
+        serial64_write(" cpus)\n");
+        return 0;
+    }
+    for (u32 index = 0; index < SMP64_MAX; index++) vnic[index] = 0;
+    smp64_netbench_reset();
+    for (u32 index = 0; !reason && index < online; index++) {
+        vnic[index] = vnic_create(64, 32);
+        if (!vnic[index] || smp64_netbench_arm(index, vnic[index])) {
+            reason = 1;
+            break;
+        }
+        created = index + 1;
+    }
+    for (u32 drivers = 1; !reason && drivers <= online; drivers <<= 1) {
+        u64 moved = 0;
+        u64 slowest = 0;
+        if (smp64_netbench_begin(drivers, SMP64_NETBENCH_PACKETS,
+                                 SMP64_NETBENCH_FRAME)) {
+            reason = 2;
+            break;
+        }
+        smp64_stress_run(1);
+        for (u32 index = 1; index < drivers; index++)
+            if (wait_rounds(smp64_netbench_done, index,
+                            SMP64_BOOT_TIMEOUT_MS)) {
+                reason = 3;
+                break;
+            }
+        smp64_netbench_finish();
+        if (reason) break;
+        if (smp64_stress_failed()) {
+            reason = 4;
+            break;
+        }
+        for (u32 index = 0; index < drivers; index++) {
+            u64 own = smp64_netbench_cycles(index);
+            if (!smp64_netbench_done(index) || !own) {
+                reason = 5;
+                break;
+            }
+            if (own > slowest) slowest = own;
+            moved += SMP64_NETBENCH_PACKETS;
+        }
+        if (reason) break;
+        u64 window = smp64_netbench_window();
+        // The join cannot land before the slowest stream did.
+        if (!window || window < slowest) {
+            reason = 6;
+            break;
+        }
+        serial64_write("Mich x86_64: netbench-smp drivers=");
+        serial64_hex(drivers);
+        serial64_write(" packets=");
+        serial64_hex(moved);
+        serial64_write(" window=0x");
+        serial64_hex(window);
+        serial64_write(" cycles-per-packet=0x");
+        serial64_hex(window / moved);
+        serial64_write("\n");
+    }
+    smp64_netbench_reset();
+    for (u32 index = 0; index < created; index++)
+        if (vnic[index]) object_release(vnic[index]);
+    if (!reason && (pmm_free_pages() != free_pages ||
+                    object_active_count() != objects ||
+                    packet_pool_active_count() != pools ||
+                    vnic_active_count() != vnics ||
+                    ring_active_count() != rings))
+        reason = 7;
+    if (reason) {
+        serial64_write("Mich x86_64: SMP netbench check failed: ");
+        serial64_hex((u64)reason);
+        serial64_write("\n");
+        return -1;
+    }
+    return 0;
+}
+
 static int test_smp64_lockorder(void) {
     static struct klock outer = KLOCK_INIT(KLOCK_LEVEL_NET);
     static struct klock inner = KLOCK_INIT(KLOCK_LEVEL_PMM);
@@ -1436,6 +1536,12 @@ int tests64_run_smp(void) {
     }
     serial64_write("Mich x86_64: SMP vector storm pass\n");
     if (test_report_record(TEST_ID_SMP_COW_STORM, test_smp64_cow_storm())) {
+        irq_restore(irq_state);
+        return -1;
+    }
+    // Reports one line per driver count: the aggregate is the claim, and a
+    // pass line on its own would not carry the numbers the table needs.
+    if (test_report_record(TEST_ID_SMP_NET_BENCH, test_smp64_net_bench())) {
         irq_restore(irq_state);
         return -1;
     }

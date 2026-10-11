@@ -39,6 +39,19 @@ void serial64_hex(u64 value) {
         serial64_putc(digits[(value >> shift) & 0xF]);
 }
 
+// Decimal, for the numbers a reader compares against a table. Hex is the
+// right form for a bit pattern and the wrong one for a rate.
+void serial64_dec(u64 value) {
+    char digits[20];
+    u32 count = 0;
+    do {
+        digits[count++] = (char)('0' + value % 10);
+        value /= 10;
+    } while (value);
+    while (count)
+        serial64_putc(digits[--count]);
+}
+
 void serial_write(const char *text) {
     serial64_write(text);
 }

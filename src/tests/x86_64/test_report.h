@@ -110,6 +110,8 @@
 #define TEST_ID_SMP_MODULE_STORM 116
 #define TEST_ID_SMP_LOCK_CONTEND 117
 #define TEST_ID_SMP_COW_STORM 118
+#define TEST_ID_SMP_NET_BENCH 119
+#define TEST_ID_FS_BENCH 120
 
 struct test_result64 {
     u32 id;

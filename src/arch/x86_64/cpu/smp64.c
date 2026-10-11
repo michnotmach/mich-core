@@ -16,6 +16,7 @@
 #include "posix_pipe.h"
 #include "net_rx.h"
 #include "net_interface.h"
+#include "vnic_benchmark.h"
 #include "object.h"
 #include "resource.h"
 #include "driver.h"
@@ -112,6 +113,14 @@ static volatile u64 smp64_stress_detail;
 static struct kernel_object *smp64_net_storm_interface;
 static const u8 *smp64_net_storm_frame;
 static u32 smp64_net_storm_length;
+static struct kernel_object *smp64_netbench_vnic[SMP64_MAX];
+static u8 smp64_netbench_frame[SMP64_MAX][SMP64_NETBENCH_FRAME];
+static volatile u64 smp64_netbench_own[SMP64_MAX];
+static volatile u32 smp64_netbench_ready[SMP64_MAX];
+static u32 smp64_netbench_packets;
+static u32 smp64_netbench_size;
+static u64 smp64_netbench_opened;
+static u64 smp64_netbench_span;
 static volatile u32 smp64_spawn_held[MAX_TASKS];
 static u64 smp64_kernel_cr3;
 static u64 smp64_kernel_cr4;
@@ -821,6 +830,25 @@ static void smp64_cow_turn(void) {
         __atomic_store_n(&smp64_stress_failure, 1, __ATOMIC_RELEASE);
 }
 
+// Each CPU drives the VNIC it was armed with, so the streams share no ring,
+// no packet pool, and no frame buffer: a shared one is what the aggregate
+// would otherwise end up measuring.
+static void smp64_netbench_turn(void) {
+    struct smp64_cpu *cpu = smp64_this();
+    u32 index = cpu ? cpu->index : 0;
+    struct kernel_object *vnic = smp64_netbench_vnic[index];
+    u64 cycles = 0;
+    if (!vnic ||
+        vnic_bench64_batch(vnic, VNIC_BENCH64_ECHO, smp64_netbench_size,
+                           smp64_netbench_packets,
+                           smp64_netbench_frame[index], &cycles)) {
+        __atomic_store_n(&smp64_stress_failure, 1, __ATOMIC_RELEASE);
+        return;
+    }
+    __atomic_store_n(&smp64_netbench_own[index], cycles, __ATOMIC_RELEASE);
+    __atomic_store_n(&smp64_netbench_ready[index], 1, __ATOMIC_RELEASE);
+}
+
 void smp64_stress_run(u32 turns) {
     for (u32 turn = 0; turn < turns; turn++) {
         paddr_t held[SMP64_STRESS_HOLD];
@@ -842,6 +870,10 @@ void smp64_stress_run(u32 turns) {
         }
         if (smp64_stress_mode == SMP64_STRESS_COW) {
             smp64_cow_turn();
+            continue;
+        }
+        if (smp64_stress_mode == SMP64_STRESS_NETBENCH) {
+            smp64_netbench_turn();
             continue;
         }
         if (smp64_stress_mode == SMP64_STRESS_VECTOR) {
@@ -881,6 +913,63 @@ void smp64_stress_run(u32 turns) {
         object_release(smp64_stress_object);
         __atomic_fetch_add(&smp64_stress_object_count, 1, __ATOMIC_RELAXED);
     }
+}
+
+void smp64_netbench_reset(void) {
+    for (u32 index = 0; index < SMP64_MAX; index++) {
+        smp64_netbench_vnic[index] = 0;
+        smp64_netbench_own[index] = 0;
+        smp64_netbench_ready[index] = 0;
+    }
+    smp64_netbench_packets = 0;
+    smp64_netbench_size = 0;
+    smp64_netbench_opened = 0;
+    smp64_netbench_span = 0;
+}
+
+int smp64_netbench_arm(u32 index, struct kernel_object *vnic) {
+    if (index >= SMP64_MAX || !vnic) return -1;
+    smp64_netbench_vnic[index] = vnic;
+    return 0;
+}
+
+int smp64_netbench_begin(u32 cpus, u32 packets, u32 frame_size) {
+    u32 online = smp64_cpu_count();
+    if (!cpus || cpus > online || cpus > SMP64_MAX || !packets ||
+        !frame_size || frame_size > SMP64_NETBENCH_FRAME)
+        return -1;
+    for (u32 index = 0; index < SMP64_MAX; index++) {
+        smp64_netbench_own[index] = 0;
+        smp64_netbench_ready[index] = 0;
+        if (index < cpus && !smp64_netbench_vnic[index]) return -1;
+    }
+    smp64_netbench_packets = packets;
+    smp64_netbench_size = frame_size;
+    smp64_netbench_span = 0;
+    smp64_stress_reset(1, 0, SMP64_STRESS_NETBENCH);
+    // Stamped before the kicks, not after: an AP is running the moment its
+    // IPI lands, and a window opened later than that can be shorter than
+    // the stream it is supposed to bound.
+    smp64_netbench_opened = apic64_tsc_now();
+    for (u32 index = 1; index < cpus; index++)
+        if (smp64_ipi_cpu(index, SMP64_IPI_STRESS)) return -1;
+    return 0;
+}
+
+void smp64_netbench_finish(void) {
+    smp64_netbench_span = apic64_tsc_now() - smp64_netbench_opened;
+}
+
+u64 smp64_netbench_window(void) {
+    return smp64_netbench_span;
+}
+
+u64 smp64_netbench_cycles(u32 index) {
+    return index < SMP64_MAX ? smp64_netbench_own[index] : 0;
+}
+
+u32 smp64_netbench_done(u32 index) {
+    return index < SMP64_MAX ? smp64_netbench_ready[index] : 0;
 }
 
 void smp64_stress_reset(u32 turns, struct kernel_object *shared, u32 mode) {
