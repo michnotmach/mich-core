@@ -4,7 +4,7 @@
 #include "scheduler.h"
 #include "serial.h"
 
-#define KLOCK_DEPTH_MAX 14
+#define KLOCK_DEPTH_MAX 15
 
 // One record per CPU, because the only CPU that can take a lock it already
 // holds is the one running the code. The boot CPU answers before the arch

@@ -952,6 +952,30 @@ static int test_smp64_vector_storm(void) {
 // the battery has to show it rejects the pairs the order forbids and that
 // the record follows real nesting. The locks here are the test's own: the
 // point is the checker, not the subsystems it guards.
+// The level numbers move whenever a subsystem is inserted into the order,
+// so the report carries the name next to the number and two runs taken
+// either side of such a change still line up.
+static const char *klock_level_name(u32 level) {
+    switch (level) {
+    case KLOCK_LEVEL_MANAGER: return "manager";
+    case KLOCK_LEVEL_SUPERVISOR: return "supervisor";
+    case KLOCK_LEVEL_MODULE: return "module";
+    case KLOCK_LEVEL_WAIT: return "wait";
+    case KLOCK_LEVEL_NET: return "net";
+    case KLOCK_LEVEL_FD: return "fd";
+    case KLOCK_LEVEL_VM: return "vm";
+    case KLOCK_LEVEL_VFS: return "vfs";
+    case KLOCK_LEVEL_MSI: return "msi";
+    case KLOCK_LEVEL_IOMMU: return "iommu";
+    case KLOCK_LEVEL_RESOURCE: return "resource";
+    case KLOCK_LEVEL_OBJECT: return "object";
+    case KLOCK_LEVEL_PIPE: return "pipe";
+    case KLOCK_LEVEL_POOL: return "pool";
+    case KLOCK_LEVEL_PMM: return "pmm";
+    default: return "unknown";
+    }
+}
+
 static int test_smp64_lock_contention(void) {
     u64 total = 0;
     serial64_write("Mich x86_64: SMP lock contention report\n");
@@ -967,6 +991,8 @@ static int test_smp64_lock_contention(void) {
         serial64_hex(acquires);
         serial64_write(" waits=");
         serial64_hex(waits);
+        serial64_write(" name=");
+        serial64_write(klock_level_name(level));
         serial64_write("\n");
     }
     return total ? 0 : -1;

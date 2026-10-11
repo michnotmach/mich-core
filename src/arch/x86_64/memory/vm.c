@@ -2,6 +2,13 @@
 #include "pmm.h"
 #include "object.h"
 #include "resource.h"
+#include "klock.h"
+
+// One lock over the whole address-space table: a fork marks the
+// parent pages copy-on-write and a revoke unmaps mappings that
+// belong to other spaces, so both write page tables another CPU
+// is executing from.
+static struct klock vm_klock = KLOCK_INIT(KLOCK_LEVEL_VM);
 
 #define PAGE_HUGE 0x80ULL
 #define PAGE_OWNED 0x200ULL
@@ -103,7 +110,7 @@ static int allocate_space_tables(struct vm64_space *space) {
     return 0;
 }
 
-int vm64_create_space(u32 *space_out) {
+static int vm64_create_space_locked(u32 *space_out) {
     if (!space_out) return -1;
     for (u32 index = 0; index < VM64_MAX_SPACES; index++) {
         struct vm64_space *space = &spaces[index];
@@ -202,7 +209,7 @@ static void release_empty_pt(struct vm64_space *space, u32 pd_index) {
     table(space->user_pd)[pd_index] = 0;
 }
 
-void vm64_destroy_space(u32 index) {
+static void vm64_destroy_space_locked(u32 index) {
     if (index >= VM64_MAX_SPACES || !spaces[index].pml4) return;
     struct vm64_space *space = &spaces[index];
     for (u32 pd_index = 0; pd_index < 512; pd_index++) {
@@ -236,7 +243,7 @@ void vm64_destroy_space(u32 index) {
     space->user_pd = 0;
 }
 
-int vm64_handle_cow(u32 index, vaddr_t virtual) {
+static int vm64_handle_cow_locked(u32 index, vaddr_t virtual) {
     if (index >= VM64_MAX_SPACES || !spaces[index].pml4) return -1;
     u64 *pte = user_pte(&spaces[index], virtual, 0);
     if (!pte) return -1;
@@ -262,11 +269,11 @@ int vm64_handle_cow(u32 index, vaddr_t virtual) {
     return 0;
 }
 
-int vm64_clone_space(u32 source, u32 *destination) {
+static int vm64_clone_space_locked(u32 source, u32 *destination) {
     if (source >= VM64_MAX_SPACES || !spaces[source].pml4 || !destination)
         return -1;
     u32 copy_index;
-    if (vm64_create_space(&copy_index)) return -1;
+    if (vm64_create_space_locked(&copy_index)) return -1;
     struct vm64_space *src = &spaces[source];
     struct vm64_space *copy = &spaces[copy_index];
     for (u32 pd_index = 0; pd_index < 512; pd_index++) {
@@ -287,13 +294,13 @@ int vm64_clone_space(u32 source, u32 *destination) {
                 invlpg(virtual);
             }
             if (pmm_retain_page(phys)) {
-                vm64_destroy_space(copy_index);
+                vm64_destroy_space_locked(copy_index);
                 return -1;
             }
             u64 *dpt = ensure_user_pt(copy, pd_index);
             if (!dpt || (dpt[entry] & VM64_PAGE_PRESENT)) {
                 pmm_free_page(phys);
-                vm64_destroy_space(copy_index);
+                vm64_destroy_space_locked(copy_index);
                 return -1;
             }
             dpt[entry] = phys | flags;
@@ -311,8 +318,8 @@ static int map_page(struct vm64_space *space, vaddr_t virtual,
     return 0;
 }
 
-int vm64_map(u32 index, vaddr_t virtual, paddr_t physical,
-             int writable, int executable) {
+static int vm64_map_locked(u32 index, vaddr_t virtual, paddr_t physical,
+                           int writable, int executable) {
     if (index >= VM64_MAX_SPACES || !spaces[index].pml4 ||
         (virtual & 0xFFF) || (physical & 0xFFF) ||
         !pmm_page_refs(physical))
@@ -323,7 +330,7 @@ int vm64_map(u32 index, vaddr_t virtual, paddr_t physical,
     return map_page(&spaces[index], virtual, physical, flags);
 }
 
-int vm64_unmap(u32 index, vaddr_t virtual) {
+static int vm64_unmap_locked(u32 index, vaddr_t virtual) {
     if (index >= VM64_MAX_SPACES || !spaces[index].pml4 || (virtual & 0xFFF))
         return -1;
     u64 *pte = user_pte(&spaces[index], virtual, 0);
@@ -466,9 +473,10 @@ int vm64_copy_to(paddr_t root, vaddr_t user_dst, const void *kernel_src,
     return vm64_copy(root, 0, kernel_src, user_dst, length, 1);
 }
 
-int vm64_map_object(u32 index, vaddr_t virtual,
-                    struct kernel_object *object, paddr_t physical,
-                    usize_t length, int writable, u32 cache_mode) {
+static int vm64_map_object_locked(u32 index, vaddr_t virtual,
+                                  struct kernel_object *object,
+                                  paddr_t physical, usize_t length,
+                                  int writable, u32 cache_mode) {
     if (index >= VM64_MAX_SPACES || !spaces[index].pml4 || !object ||
         !object->active || virtual < VM64_DRIVER_BASE ||
         virtual >= VM64_DRIVER_LIMIT || !length || (virtual & 0xFFF) ||
@@ -510,8 +518,9 @@ int vm64_map_object(u32 index, vaddr_t virtual,
     return 0;
 }
 
-int vm64_map_page_object(u32 index, vaddr_t virtual,
-                         struct kernel_object *object, int writable) {
+static int vm64_map_page_object_locked(u32 index, vaddr_t virtual,
+                                       struct kernel_object *object,
+                                       int writable) {
     struct page_resource *resource = page_resource_get(object);
     usize_t length = resource ? (usize_t)resource->pages * 4096 : 0;
     if (index >= VM64_MAX_SPACES || !spaces[index].pml4 || !resource ||
@@ -558,7 +567,8 @@ int vm64_map_page_object(u32 index, vaddr_t virtual,
     return 0;
 }
 
-int vm64_unmap_object(u32 index, vaddr_t virtual, usize_t length) {
+static int vm64_unmap_object_locked(u32 index, vaddr_t virtual,
+                                    usize_t length) {
     if (index >= VM64_MAX_SPACES || !spaces[index].pml4) return -1;
     struct vm64_space *space = &spaces[index];
     u32 mapping_index = VM64_MAPPING_MAX;
@@ -592,7 +602,9 @@ int vm64_unmap_object(u32 index, vaddr_t virtual, usize_t length) {
     return 0;
 }
 
-u32 vm64_revoke_objects(u32 index, struct kernel_object **objects, u32 count) {
+static u32 vm64_revoke_objects_locked(u32 index,
+                                      struct kernel_object **objects,
+                                      u32 count) {
     if (index >= VM64_MAX_SPACES || !spaces[index].pml4 ||
         (!objects && count))
         return 0;
@@ -607,12 +619,12 @@ u32 vm64_revoke_objects(u32 index, struct kernel_object **objects, u32 count) {
         if (!match) continue;
         vaddr_t virtual = space->mappings[map].virtual;
         usize_t length = space->mappings[map].length;
-        if (!vm64_unmap_object(index, virtual, length)) revoked++;
+        if (!vm64_unmap_object_locked(index, virtual, length)) revoked++;
     }
     return revoked;
 }
 
-int vm64_revoke_object_all(struct kernel_object *object) {
+static int vm64_revoke_object_all_locked(struct kernel_object *object) {
     if (!object) return -1;
     int result = 0;
     for (u32 index = 0; index < VM64_MAX_SPACES; index++) {
@@ -622,7 +634,7 @@ int vm64_revoke_object_all(struct kernel_object *object) {
             if (space->mappings[map].object != object) continue;
             vaddr_t virtual = space->mappings[map].virtual;
             usize_t length = space->mappings[map].length;
-            if (vm64_unmap_object(index, virtual, length)) result = -1;
+            if (vm64_unmap_object_locked(index, virtual, length)) result = -1;
         }
     }
     return result;
@@ -636,7 +648,8 @@ u32 vm64_object_mapping_count(u32 index) {
     return count;
 }
 
-void *vm64_ioremap(paddr_t physical, usize_t length, u32 cache_mode) {
+static void *vm64_ioremap_locked(paddr_t physical, usize_t length,
+                                 u32 cache_mode) {
     if (!length || (physical & 0xFFF) || (length & 0xFFF) ||
         length > VM64_KERNEL_MMIO_SIZE || length > ~(paddr_t)0 - physical)
         return 0;
@@ -667,7 +680,7 @@ void *vm64_ioremap(paddr_t physical, usize_t length, u32 cache_mode) {
     return (void *)(uptr_t)(VM64_KERNEL_MMIO_BASE + (u64)start * 4096);
 }
 
-int vm64_iounmap(void *address, usize_t length) {
+static int vm64_iounmap_locked(void *address, usize_t length) {
     vaddr_t virtual = (vaddr_t)(uptr_t)address;
     if (!address || !length || (virtual & 0xFFF) || (length & 0xFFF) ||
         virtual < VM64_KERNEL_MMIO_BASE ||
@@ -689,3 +702,102 @@ int vm64_iounmap(void *address, usize_t length) {
     }
     return 0;
 }
+
+// The locked bodies above are the implementation; these are the only
+// entries the rest of the kernel reaches, so the lock has one place.
+int vm64_revoke_object_all(struct kernel_object *object) {
+    klock_acquire(&vm_klock);
+    int result = vm64_revoke_object_all_locked(object);
+    klock_release(&vm_klock);
+    return result;
+}
+
+int vm64_map_page_object(u32 index, vaddr_t virtual,
+                         struct kernel_object *object, int writable) {
+    klock_acquire(&vm_klock);
+    int result = vm64_map_page_object_locked(index, virtual, object, writable);
+    klock_release(&vm_klock);
+    return result;
+}
+
+u32 vm64_revoke_objects(u32 index, struct kernel_object **objects, u32 count) {
+    klock_acquire(&vm_klock);
+    u32 revoked = vm64_revoke_objects_locked(index, objects, count);
+    klock_release(&vm_klock);
+    return revoked;
+}
+
+void vm64_destroy_space(u32 index) {
+    klock_acquire(&vm_klock);
+    vm64_destroy_space_locked(index);
+    klock_release(&vm_klock);
+}
+
+int vm64_create_space(u32 *space_out) {
+    klock_acquire(&vm_klock);
+    int result = vm64_create_space_locked(space_out);
+    klock_release(&vm_klock);
+    return result;
+}
+
+int vm64_unmap_object(u32 index, vaddr_t virtual, usize_t length) {
+    klock_acquire(&vm_klock);
+    int result = vm64_unmap_object_locked(index, virtual, length);
+    klock_release(&vm_klock);
+    return result;
+}
+
+int vm64_clone_space(u32 source, u32 *destination) {
+    klock_acquire(&vm_klock);
+    int result = vm64_clone_space_locked(source, destination);
+    klock_release(&vm_klock);
+    return result;
+}
+
+int vm64_handle_cow(u32 index, vaddr_t virtual) {
+    klock_acquire(&vm_klock);
+    int result = vm64_handle_cow_locked(index, virtual);
+    klock_release(&vm_klock);
+    return result;
+}
+
+int vm64_map_object(u32 index, vaddr_t virtual, struct kernel_object *object,
+                    paddr_t physical, usize_t length, int writable,
+                    u32 cache_mode) {
+    klock_acquire(&vm_klock);
+    int result = vm64_map_object_locked(index, virtual, object, physical,
+                                        length, writable, cache_mode);
+    klock_release(&vm_klock);
+    return result;
+}
+
+void *vm64_ioremap(paddr_t physical, usize_t length, u32 cache_mode) {
+    klock_acquire(&vm_klock);
+    void *address = vm64_ioremap_locked(physical, length, cache_mode);
+    klock_release(&vm_klock);
+    return address;
+}
+
+int vm64_iounmap(void *address, usize_t length) {
+    klock_acquire(&vm_klock);
+    int result = vm64_iounmap_locked(address, length);
+    klock_release(&vm_klock);
+    return result;
+}
+
+int vm64_unmap(u32 index, vaddr_t virtual) {
+    klock_acquire(&vm_klock);
+    int result = vm64_unmap_locked(index, virtual);
+    klock_release(&vm_klock);
+    return result;
+}
+
+int vm64_map(u32 index, vaddr_t virtual, paddr_t physical, int writable,
+             int executable) {
+    klock_acquire(&vm_klock);
+    int result = vm64_map_locked(index, virtual, physical, writable,
+                                 executable);
+    klock_release(&vm_klock);
+    return result;
+}
+

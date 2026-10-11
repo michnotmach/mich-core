@@ -22,11 +22,16 @@
 #define KLOCK_LEVEL_VFS 7u
 #define KLOCK_LEVEL_MSI 8u
 #define KLOCK_LEVEL_IOMMU 9u
-#define KLOCK_LEVEL_RESOURCE 10u
-#define KLOCK_LEVEL_OBJECT 11u
-#define KLOCK_LEVEL_PIPE 12u
-#define KLOCK_LEVEL_POOL 13u
-#define KLOCK_LEVEL_PMM 14u
+// The page tables sit inside the posix and interrupt-controller locks, which
+// reach them for user copies and for mapping a device register window, and
+// outside the resource, object and page allocators, which a mapping teardown
+// reaches on the way out.
+#define KLOCK_LEVEL_VM 10u
+#define KLOCK_LEVEL_RESOURCE 11u
+#define KLOCK_LEVEL_OBJECT 12u
+#define KLOCK_LEVEL_PIPE 13u
+#define KLOCK_LEVEL_POOL 14u
+#define KLOCK_LEVEL_PMM 15u
 
 // The same ceiling as the CPU target, SMP64_MAX in the arch record.
 #define KLOCK_MAX_CPUS 16
