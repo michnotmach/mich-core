@@ -661,6 +661,7 @@ for marker in \
     "Mich x86_64: fsbench bytes=" \
     "Mich test64: calibrated time base pass" \
     "Mich test64: task runtime accounting pass" \
+    "Mich test64: eevdf policy pass" \
     "Mich test64: adytumfs busy unmount lifetime pass" \
     "Mich test64: adytumfs stale vnode generation pass" \
     "Mich test64: resource object layer pass" \

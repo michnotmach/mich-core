@@ -121,6 +121,8 @@ int tests64_run(const struct test64_env *env) {
     if (test_report_record(TEST_ID_TASK_RUNTIME, test_task_runtime()))
         return -1;
     serial64_write("Mich test64: task runtime accounting pass\n");
+    if (test_report_record(TEST_ID_EEVDF, test_eevdf())) return -1;
+    serial64_write("Mich test64: eevdf policy pass\n");
     serial64_write("Mich test64: adytumfs format and mount pass\n");
     serial64_write("Mich test64: adytumfs file io pass\n");
     serial64_write("Mich test64: adytumfs busy unmount lifetime pass\n");

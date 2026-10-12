@@ -39,3 +39,39 @@ int test_task_runtime(void) {
     task_free_slot(t);
     return 0;
 }
+
+// The policy is asserted through the pure scaling rather than by watching a
+// schedule, because the clock advance depends on every runnable task in the
+// system and a test running inside the kernel cannot fix that. What is
+// checked here is the arithmetic and the eligibility relation it implies.
+int test_eevdf(void) {
+    u64 slice = TASK_SLICE_NS;
+
+    if (task_vruntime_delta(4000u, TASK_WEIGHT_DEFAULT) != 4000u) return -1;
+    if (task_vruntime_delta(4000u, TASK_WEIGHT_DEFAULT * 2u) != 2000u)
+        return -2;
+    // A zero share is the default rather than a division by zero.
+    if (task_vruntime_delta(4000u, 0) != 4000u) return -3;
+
+    if (task_deadline_from(0, TASK_WEIGHT_DEFAULT) != slice) return -4;
+    if (task_deadline_from(0, TASK_WEIGHT_DEFAULT * 2u) != slice / 2u)
+        return -5;
+    // A larger share has to buy an earlier deadline at equal vruntime, or
+    // weight would mean nothing to the pick.
+    if (task_deadline_from(1000u, TASK_WEIGHT_DEFAULT) <=
+        task_deadline_from(1000u, TASK_WEIGHT_DEFAULT * 4u))
+        return -6;
+
+    // Two equal tasks, one of which ran for 2s. The clock advances by the
+    // service divided by the total share, so it lands on s: the runner is
+    // now ahead of the clock and ineligible, the waiter is behind it and
+    // eligible. That inversion is the whole point of the policy.
+    u64 step = 3000u;
+    u64 vtime = task_vruntime_delta(step * 2u, TASK_WEIGHT_DEFAULT * 2u);
+    u64 runner = task_vruntime_delta(step * 2u, TASK_WEIGHT_DEFAULT);
+    u64 waiter = 0;
+    if (vtime != step) return -7;
+    if (runner <= vtime) return -8;
+    if (waiter > vtime) return -9;
+    return 0;
+}

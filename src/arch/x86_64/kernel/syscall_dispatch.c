@@ -12,6 +12,7 @@
 #include "ipc64.h"
 #include "protos.h"
 #include "runtime64.h"
+#include "time64.h"
 #include "gdt64.h"
 #include "idt64.h"
 #include "serial64.h"
@@ -407,6 +408,7 @@ u64 syscall64_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2) {
         return 0;
     }
     if (number == 23) {
+        task_yield_charge(&task_pool[current_task_slot], time64_ns());
         return (u64)task64_block_switch();
     }
     if (number == 32) {

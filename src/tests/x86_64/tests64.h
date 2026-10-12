@@ -59,6 +59,7 @@ int test_adytumfs64(void);
 int test_fs_bench(void);
 int test_time64(void);
 int test_task_runtime(void);
+int test_eevdf(void);
 int test_adytumfs_pages64(void);
 int test_adytumfs_policy64(void);
 int test_adytumfs_reuse64(void);

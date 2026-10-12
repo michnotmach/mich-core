@@ -25,9 +25,28 @@ void task_pool_unlock(void) {
     klock_release(&task_pool_klock);
 }
 
+// Weighted mean virtual time. It advances in proportion to the service the
+// running task received divided by everything runnable, so a task that runs
+// alone stays exactly on the boundary instead of banking lag it never earned.
+static u64 task_vtime_ns;
+
+static u64 task_share(const struct task *t) {
+    return t->weight ? t->weight : TASK_WEIGHT_DEFAULT;
+}
+
+u64 task_vruntime_delta(u64 elapsed_ns, u32 share) {
+    u64 w = share ? share : TASK_WEIGHT_DEFAULT;
+    return (elapsed_ns * TASK_WEIGHT_DEFAULT) / w;
+}
+
+u64 task_deadline_from(u64 vruntime_ns, u32 share) {
+    u64 w = share ? share : TASK_WEIGHT_DEFAULT;
+    return vruntime_ns + (TASK_SLICE_NS * TASK_WEIGHT_DEFAULT) / w;
+}
+
 static void task_clear_dynamic(struct task *t) {
     t->runtime_ns = 0;
-    t->vruntime_ns = 0;
+    t->vruntime_ns = task_vtime_ns;
     t->cpu_started_ns = 0;
     t->weight = TASK_WEIGHT_DEFAULT;
     t->page_dir = 0;
@@ -211,17 +230,35 @@ void task_runtime_arm(struct task *t, u64 now_ns) {
     task_pool_unlock();
 }
 
+static void task_runtime_charge_locked(struct task *t, u64 now_ns) {
+    u64 elapsed, weight, total = 0;
+    if (!t->cpu_started_ns || now_ns < t->cpu_started_ns) return;
+    elapsed = now_ns - t->cpu_started_ns;
+    weight = task_share(t);
+    t->runtime_ns += elapsed;
+    t->vruntime_ns += task_vruntime_delta(elapsed, weight);
+    t->cpu_started_ns = 0;
+    for (int i = 1; i < task_pool_count; i++)
+        if (task_pool[i].state == TASK_RUNNING && !task_pool[i].is_idle)
+            total += task_share(&task_pool[i]);
+    if (total) task_vtime_ns += task_vruntime_delta(elapsed, (u32)total);
+}
+
 void task_runtime_charge(struct task *t, u64 now_ns) {
-    u64 elapsed, weight;
     if (!t) return;
     task_pool_lock();
-    if (t->cpu_started_ns && now_ns >= t->cpu_started_ns) {
-        elapsed = now_ns - t->cpu_started_ns;
-        weight = t->weight ? t->weight : TASK_WEIGHT_DEFAULT;
-        t->runtime_ns += elapsed;
-        t->vruntime_ns += (elapsed * TASK_WEIGHT_DEFAULT) / weight;
-        t->cpu_started_ns = 0;
-    }
+    task_runtime_charge_locked(t, now_ns);
+    task_pool_unlock();
+}
+
+// Yield has to cost eligibility. A caller still ahead of the clock is picked
+// straight back, so the yield never admits the task it was waiting for, and
+// the clock only moves when somebody else runs.
+void task_yield_charge(struct task *t, u64 now_ns) {
+    if (!t || t->state != TASK_RUNNING) return;
+    task_pool_lock();
+    task_runtime_charge_locked(t, now_ns);
+    t->vruntime_ns = task_vtime_ns + 1u;
     task_pool_unlock();
 }
 
@@ -345,27 +382,57 @@ int task_reap_zombie(struct task *parent, int pid, int *code) {
 // between, and the shared run queue makes that the normal case, not a
 // corner. The read-only form serves the callers that only ask whether
 // anything is runnable at all.
+static u64 task_vdeadline(const struct task *t) {
+    return task_deadline_from(t->vruntime_ns, t->weight);
+}
+
 static int task_pick_locked(int current, int cpu, int claim) {
     int idle = -1;
-    int pick = -1;
+    int eligible = -1;
+    int waiting = -1;
+    u64 best_deadline = 0;
+    u64 best_vruntime = 0;
     if (task_pool_count <= 0) return -1;
+    // Scanning from current + 1 only breaks ties now that the deadline
+    // decides the winner, and keeping a stable order stops two equal tasks
+    // from starving each other.
     for (int offset = 1; offset <= task_pool_count; offset++) {
         int candidate = (current + offset) % task_pool_count;
-        if (task_pool[candidate].state != TASK_RUNNING) continue;
-        int owner = task_pool[candidate].on_cpu;
+        struct task *t = &task_pool[candidate];
+        if (t->state != TASK_RUNNING) continue;
+        int owner = t->on_cpu;
         if (owner != TASK_CPU_NONE && owner != cpu) continue;
         // The idle task is always runnable and does no useful work: remember
         // it and keep scanning, so a freshly woken task is not passed over.
-        if (task_pool[candidate].is_idle) {
+        if (t->is_idle) {
             if (idle < 0) idle = candidate;
             continue;
         }
-        pick = candidate;
-        break;
+        if (t->vruntime_ns <= task_vtime_ns) {
+            u64 deadline = task_vdeadline(t);
+            if (eligible < 0 || deadline < best_deadline) {
+                eligible = candidate;
+                best_deadline = deadline;
+            }
+        } else if (waiting < 0 || t->vruntime_ns < best_vruntime) {
+            // Nothing eligible means everyone ran ahead of the clock, so
+            // take whoever is closest to crossing back.
+            waiting = candidate;
+            best_vruntime = t->vruntime_ns;
+        }
     }
+    int pick = eligible >= 0 ? eligible : waiting;
     if (pick < 0) pick = idle;
     if (claim && pick >= 0) task_pool[pick].on_cpu = cpu;
     return pick;
+}
+
+u64 task_vtime_read(void) {
+    u64 vtime;
+    task_pool_lock();
+    vtime = task_vtime_ns;
+    task_pool_unlock();
+    return vtime;
 }
 
 int task_pick_next(int current, int cpu) {

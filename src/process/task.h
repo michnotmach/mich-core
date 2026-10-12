@@ -23,6 +23,11 @@ struct mmio_grant {
 // every other task's vruntime advance by rounding alone.
 #define TASK_WEIGHT_MAX 1048576u
 
+// The service a task asks for in one round. It sets the virtual deadline
+// spacing, so a smaller request buys an earlier deadline at the cost of
+// being picked more often.
+#define TASK_SLICE_NS 1000000u
+
 #define TASK_RUNNING 0
 #define TASK_BLOCKED_SEND 1
 #define TASK_BLOCKED_RECV 2
@@ -181,6 +186,13 @@ int task_sleep_wake_claim(struct task *t, u32 *deadline, uptr_t *request);
 // arch specific and this file is portable.
 void task_runtime_arm(struct task *t, u64 now_ns);
 void task_runtime_charge(struct task *t, u64 now_ns);
+void task_yield_charge(struct task *t, u64 now_ns);
+u64 task_vtime_read(void);
+// Pure scaling, exposed so the policy can be asserted exactly. Passing the
+// total runnable weight as the share is what turns the same formula into the
+// advance of the shared clock.
+u64 task_vruntime_delta(u64 elapsed_ns, u32 share);
+u64 task_deadline_from(u64 vruntime_ns, u32 share);
 
 int task_state_wake_locked(struct task *t, int from_state);
 void task_sleep_block(struct task *t, u32 deadline);
