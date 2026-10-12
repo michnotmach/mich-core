@@ -6,7 +6,7 @@
 // Sixteen CPUs whose APs each host a capsule and an idle task, next to the
 // BSP chain, do not fit in sixteen slots. The PID slot field is 16 bits, so
 // the pool can grow without changing the encoded ids.
-#define MAX_TASKS 32
+#define MAX_TASKS 1024
 #define MAX_MMIO_GRANTS 4
 
 struct mmio_grant {
