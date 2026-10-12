@@ -998,24 +998,35 @@ should cost, and adding CPUs that do no work does not change the number.
 
 ### Aggregate netbench
 
-Each driving CPU runs its own loopback stream on its own benchmark NIC, so
-the streams share no ring, no packet pool, and no frame buffer. The window
-is read on the boot CPU and spans the whole concurrent phase, including the
-kick and the join. Each row is a single run of 512 echo packets at 512 bytes
-per driving CPU, inside one `-smp 4` guest.
+One loopback `vnic64` in a single `-smp 4` guest. Every row drives that one
+interface: one task per driving CPU pushes 512 echo frames of 512 bytes, and
+the window covers only the looped push and its drain. A worker drains the
+driver queue on every CPU, and a driver hands a full queue to one worker
+through a generation-checked mailbox, so the rows differ only in how many
+drivers push at once. Each row is the median of three runs; the range is
+shown because it matters.
 
-| Driving CPUs | Packets | Window, cycles | Cycles per packet |
-|-------------:|--------:|---------------:|------------------:|
-| 1 | 512 | 11,938,612 | 23,317 |
-| 2 | 1024 | 23,079,362 | 22,538 |
-| 4 | 2048 | 21,815,540 | 10,652 |
+| Driving CPUs | Frames | Cycles per frame (median) | Range over 3 runs |
+|-------------:|-------:|--------------------------:|------------------:|
+| 1 | 512 | 11,572 | 10,625 - 19,606 |
+| 2 | 1,024 | 14,822 | 14,740 - 29,448 |
+| 4 | 2,048 | 9,712 | 9,296 - 9,879 |
 
-The two-CPU row is the honest one to read first: aggregate throughput barely
-moves. The streams are independent above the driver, but underneath they
-still take the same coarse kernel locks for objects, pages, and network
-state, and that is what caps the gain. Those locks are the transitional net
-this release carries on purpose; removing them is what has to happen before
-this table is worth comparing against hardware.
+**These rows do not demonstrate scaling in either direction, and that is the
+finding.** Doubling the driving CPUs from one to two made the per-frame cost
+*worse*, not better. Going to four drivers recovered to about 1.19x the
+single-driver aggregate. Meanwhile the run-to-run spread at one and two
+drivers is 1.85x and 2.00x, which is larger than the 1.19x effect being
+measured, so those two rows cannot resolve anything. Only the four-driver
+row is stable, at 1.06x.
+
+The mechanism is visible in the code rather than in the benchmark: streams
+are independent above the driver but share the same coarse object, page and
+network locks, so extra drivers add contention without adding throughput.
+Whether that is the ceiling or an artifact of measuring on a two-core host
+with four vCPUs is not settled by this data. The honest summary is that this
+path needs a measurement environment with more host cores than guest CPUs
+before any scaling claim is worth printing.
 
 ### Filesystem throughput
 
