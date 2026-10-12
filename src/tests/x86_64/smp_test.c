@@ -2,6 +2,7 @@
 #include "test_report.h"
 #include "smp64.h"
 #include "apic64.h"
+#include "time64.h"
 #include "gdt64.h"
 #include "irq.h"
 #include "scheduler.h"
@@ -1325,7 +1326,8 @@ static int test_smp64_parallel(void) {
 // touching a task context, so this waits in hlt between ticks and leaves
 // the caller's interrupt state alone.
 static void speedup_wait_ms(u64 milliseconds) {
-    u64 deadline = apic64_tsc_now() + milliseconds * 1000000u;
+    u64 deadline = apic64_tsc_now() +
+                   time64_ticks_from_ns((u64)milliseconds * 1000000u);
     while (apic64_tsc_now() < deadline)
         __asm__ volatile("sti; hlt; cli" ::: "memory");
 }

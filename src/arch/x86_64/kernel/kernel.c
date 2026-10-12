@@ -32,6 +32,7 @@
 #include "iommu.h"
 #include "acpi64.h"
 #include "rtc64.h"
+#include "time64.h"
 #include "vtd64.h"
 #include "amd_iommu64.h"
 #include "pci64.h"
@@ -2255,6 +2256,9 @@ void kernel64_main(u32 magic, struct bd_info *info) {
     // After ACPI because the century register index lives in the FADT, and
     // before anything that may want a wall clock.
     if (rtc64_init()) KERNEL_PANIC("CMOS clock");
+    // Ahead of the APIC timer calibration, which delays by wall time, and
+    // ahead of the test suite, which asserts the calibration.
+    if (time64_init()) KERNEL_PANIC("time base calibration");
     if (platform_resource_init()) KERNEL_PANIC("platform resources");
     serial64_write("Mich x86_64: ACPI tables pass\n");
     serial64_write("Mich x86_64: wall clock anchored\n");

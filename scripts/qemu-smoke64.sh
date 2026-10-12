@@ -658,6 +658,7 @@ for marker in \
     "Mich test64: adytumfs format and mount pass" \
     "Mich test64: adytumfs file io pass" \
     "Mich x86_64: fsbench bytes=" \
+    "Mich test64: calibrated time base pass" \
     "Mich test64: adytumfs busy unmount lifetime pass" \
     "Mich test64: adytumfs stale vnode generation pass" \
     "Mich test64: resource object layer pass" \

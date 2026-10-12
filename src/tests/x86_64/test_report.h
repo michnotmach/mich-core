@@ -112,6 +112,7 @@
 #define TEST_ID_SMP_COW_STORM 118
 #define TEST_ID_SMP_NET_BENCH 119
 #define TEST_ID_FS_BENCH 120
+#define TEST_ID_TIME64 121
 
 struct test_result64 {
     u32 id;

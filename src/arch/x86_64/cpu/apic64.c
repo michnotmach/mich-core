@@ -1,4 +1,5 @@
 #include "apic64.h"
+#include "time64.h"
 #include "vm64.h"
 
 #define MSR_APIC_BASE 0x1B
@@ -108,7 +109,7 @@ u64 apic64_tsc_now(void) {
 static volatile u32 apic64_spin_pad;
 
 static int delay_10ms(void) {
-    u64 deadline = rdtsc64() + 10000000ULL;
+    u64 deadline = rdtsc64() + time64_ticks_from_ns(10000000ULL);
     for (u32 spin = 0; spin < 100000000u; spin++) {
         apic64_spin_pad = spin;
         if (rdtsc64() >= deadline) return 0;
@@ -130,7 +131,7 @@ int apic64_delay_ms(u32 milliseconds) {
 // (measured >6ms per read). Real hardware clears the busy bit in microseconds, so a
 // short TSC spacing delay is the portable replacement.
 static int icr_send(u32 icr1, u32 icr2) {
-    u64 deadline = rdtsc64() + 100000ULL;
+    u64 deadline = rdtsc64() + time64_ticks_from_ns(100000ULL);
     write_register(APIC_ICR2, (icr2 & 0xFFu) << 24);
     write_register(APIC_ICR1, icr1);
     for (u32 spin = 0; spin < 1000000u; spin++) {
