@@ -4,11 +4,7 @@
 
 ## License
 
-Mich Core is available under the [GNU General Public License v3.0](LICENSE).
-
-Commercial dual licensing is also available under terms discussed separately by email: [mich-licensing@protonmail.com](mailto:mich-licensing@protonmail.com) or [shiftluckyxd@mail.ru](mailto:shiftluckyxd@mail.ru).
-
-See [LICENSE](LICENSE) for the GPLv3 terms.
+Mich Core is released under the [BSD 2-Clause License](LICENSE).
 
 ## Overview
 
@@ -1084,4 +1080,4 @@ Bug reports, test results, design discussion, and documentation fixes are welcom
 
 Discuss large changes before opening a pull request. Do not submit proprietary code, leaked material, or code with an incompatible license.
 
-Contributions are accepted under GPLv3.
+Contributions are accepted under the BSD 2-Clause License.
