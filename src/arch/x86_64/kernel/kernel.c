@@ -867,6 +867,16 @@ static int driver_live_recovery_arm(void) {
 }
 
 static void driver_live_recovery_fail(void) {
+    // A bare reason string cannot say which of the fourteen call sites
+    // fired, and the phases are what distinguish a slow driver from a
+    // broken handshake.
+    serial64_write("Mich x86_64: live recovery failed phase=0x");
+    serial64_hex(driver_live_recovery.phase);
+    serial64_write(" ticks=0x");
+    serial64_hex(timer_ticks);
+    serial64_write(" deadline=0x");
+    serial64_hex(driver_live_recovery.deadline);
+    serial64_write("\n");
     KERNEL_PANIC("driver live recovery");
 }
 
@@ -921,7 +931,12 @@ static __attribute__((cold, noinline, optimize("Os,no-jump-tables"))) void drive
             test->rebind_gap = 1;
             return;
         }
-        if (!test->rebind_gap || owner != status.pid ||
+        // Observing the gap used to be mandatory, but it is a sampling
+        // artifact: whether it is visible depends on the tick rate, and a
+        // slower tick lets the restarted driver register before the first
+        // sample. What has to hold is that the service now belongs to the
+        // restarted driver and not to the one that was stopped.
+        if (owner != status.pid || status.pid == test->primary_pid ||
             endpoint_signal(test->restarted_bridge, DRIVER_CONTROL_STOP))
             driver_live_recovery_fail();
         test->phase = DRIVER_LIVE_RECOVERY_WAIT_FALLBACK;
