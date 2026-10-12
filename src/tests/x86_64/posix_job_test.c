@@ -41,15 +41,21 @@ int test_posix_job64(struct task *owner) {
     valid = valid && posix_pgroup_set(peer, own) == 0 &&
         posix_pgroup_get(peer) == own &&
         posix_pgroup_live(own) == 1;
-    struct task *members[MAX_TASKS];
-    u32 count = posix_pgroup_members(own, members, MAX_TASKS);
-    valid = valid && count >= 2;
+    struct task *batch[POSIX_PGROUP_BATCH];
+    u32 from = 0;
+    u32 count = 0;
+    u32 found;
     int saw_probe = 0;
     int saw_peer = 0;
-    for (u32 index = 0; index < count; index++) {
-        if (members[index] == probe) saw_probe = 1;
-        if (members[index] == peer) saw_peer = 1;
+    while ((found = posix_pgroup_members_from(own, from, batch,
+                                              POSIX_PGROUP_BATCH, &from))) {
+        count += found;
+        for (u32 index = 0; index < found; index++) {
+            if (batch[index] == probe) saw_probe = 1;
+            if (batch[index] == peer) saw_peer = 1;
+        }
     }
+    valid = valid && count >= 2;
     valid = valid && saw_probe && saw_peer;
 
     // A default SIGTSTP stops the target: the state leaves the runnable

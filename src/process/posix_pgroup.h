@@ -31,6 +31,17 @@ int posix_pgroup_live(u32 pgid);
 // cannot break the walk.
 u32 posix_pgroup_members(u32 pgid, struct task **members, u32 capacity);
 
+// Resumable form of the walk above. Pass the slot it reports in *next back
+// in to continue, so a caller can drain a group through a small fixed
+// buffer instead of one array element per possible task. Start at zero.
+u32 posix_pgroup_members_from(u32 pgid, u32 from, struct task **members,
+                              u32 capacity, u32 *next);
+
+// How many members one resumable step collects. The walk holds no lock, so
+// a batch this size keeps the stack frame small without making the number
+// of steps matter.
+#define POSIX_PGROUP_BATCH 32u
+
 // The group a caller joins when it names nobody: its own.
 u32 posix_pgroup_id_of(struct task *task);
 

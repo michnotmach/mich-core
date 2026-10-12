@@ -239,6 +239,25 @@ static u64 exit64_dispatch(u64 code) {
     return task_contexts[current_task_slot].rax;
 }
 
+// One target of a kill. Zero carries the walk on, one means the caller
+// signalled itself fatally and has to leave through the exit dance rather
+// than return, and a negative value is the errno that aborts the call. A
+// stop is reported through self_stop because it abandons the frame and is
+// answered on the resume, not here.
+static int kill_deliver_one(struct task *caller, struct task *target,
+                            u32 signo, int *self_stop) {
+    int result = posix_signal_one(caller, target, signo);
+    if (result == 1) {
+        if (target == caller) return 1;
+        target->exit_signal = signo;
+        terminate64((u32)(target - task_pool), 128 + (int)signo);
+        return 0;
+    }
+    if (result == 2) *self_stop = 1;
+    if (result < 0) return result;
+    return 0;
+}
+
 // The pledge gate's loud denial. A violation outside the error promise
 // kills the caller with SIGABRT: posix_signal_kill answers 1 when the
 // default disposition terminates on the spot, which records the termsig
@@ -2446,33 +2465,41 @@ u64 syscall64_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2) {
             // no bounded answer in a profile without sessions; it is
             // refused rather than widened into a group.
             if (pid == -1) return (u64)(i64)POSIX_SIGNAL_EINVAL;
-            struct task *targets[MAX_TASKS];
-            u32 count = 0;
+            struct task *batch[POSIX_PGROUP_BATCH];
+            u32 group = 0;
+            u32 from = 0;
+            u32 pending = 0;
             if (pid > 0) {
                 struct task *target = posix_signal_target(pid);
                 if (!target) return (u64)(i64)POSIX_SIGNAL_ESRCH;
-                targets[count++] = target;
+                batch[pending++] = target;
             } else {
-                u32 group = pid == 0 ? posix_pgroup_get(task) : (u32)(-pid);
-                count = posix_pgroup_members(group, targets, MAX_TASKS);
-                if (!count) return (u64)(i64)POSIX_SIGNAL_ESRCH;
+                group = pid == 0 ? posix_pgroup_get(task) : (u32)(-pid);
+                if (!posix_pgroup_live(group))
+                    return (u64)(i64)POSIX_SIGNAL_ESRCH;
             }
+            // A group is drained a batch at a time so the frame stays small
+            // however many members it carries; a single pid is a batch of
+            // one and simply skips the resumable walk.
             int self_stop = 0;
-            for (u32 index = 0; index < count; index++) {
-                struct task *target = targets[index];
-                int result = posix_signal_one(task, target, signo);
-                if (result == 1) {
-                    int code = 128 + (int)signo;
+            int code = 128 + (int)signo;
+            for (;;) {
+                u32 count = pending;
+                pending = 0;
+                if (!count && group)
+                    count = posix_pgroup_members_from(group, from, batch,
+                                                      POSIX_PGROUP_BATCH,
+                                                      &from);
+                if (!count) break;
+                for (u32 index = 0; index < count; index++) {
+                    int outcome = kill_deliver_one(task, batch[index], signo,
+                                                   &self_stop);
                     // Self termination cannot return through the normal
                     // path: the frame is already dying, so it takes the
                     // exit dance.
-                    if (target == task) return exit64_dispatch((u64)code);
-                    target->exit_signal = signo;
-                    terminate64((u32)(target - task_pool), code);
-                    continue;
+                    if (outcome == 1) return exit64_dispatch((u64)code);
+                    if (outcome < 0) return (u64)(i64)outcome;
                 }
-                if (result == 2) self_stop = 1;
-                else if (result < 0) return (u64)(i64)result;
             }
             // The stop already landed on the task table; the syscall
             // frame is abandoned and answered on the resume.

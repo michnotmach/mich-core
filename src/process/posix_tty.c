@@ -229,12 +229,16 @@ void posix_tty_deliver(u32 index, u32 event) {
     else if (event & POSIX_TTY_EVENT_QUIT) signo = POSIX_SIG_QUIT;
     else if (event & POSIX_TTY_EVENT_SUSP) signo = POSIX_SIG_TSTP;
     if (!signo) return;
-    struct task *targets[MAX_TASKS];
-    u32 count = posix_pgroup_members(tty->foreground, targets, MAX_TASKS);
-    for (u32 member = 0; member < count; member++) {
-        struct task *target = targets[member];
-        if (posix_signal_one(target, target, signo) == 1)
-            task64_terminate((u32)(target - task_pool), signo);
+    struct task *batch[POSIX_PGROUP_BATCH];
+    u32 from = 0;
+    u32 count;
+    while ((count = posix_pgroup_members_from(tty->foreground, from, batch,
+                                              POSIX_PGROUP_BATCH, &from))) {
+        for (u32 member = 0; member < count; member++) {
+            struct task *target = batch[member];
+            if (posix_signal_one(target, target, signo) == 1)
+                task64_terminate((u32)(target - task_pool), signo);
+        }
     }
 }
 

@@ -57,17 +57,26 @@ int posix_pgroup_live(u32 pgid) {
     return 0;
 }
 
-u32 posix_pgroup_members(u32 pgid, struct task **members, u32 capacity) {
+u32 posix_pgroup_members_from(u32 pgid, u32 from, struct task **members,
+                              u32 capacity, u32 *next) {
     u32 count = 0;
-    if (!pgid || !members) return 0;
-    for (u32 slot = 1; slot < (u32)task_pool_count && count < capacity; slot++) {
+    if (!pgid || !members || !next) return 0;
+    u32 slot = from < 1 ? 1 : from;
+    u32 limit = (u32)task_pool_count;
+    for (; slot < limit && count < capacity; slot++) {
         struct task *candidate = &task_pool[slot];
         if (candidate->state == TASK_FREE) continue;
         if (candidate->state == TASK_ZOMBIE) continue;
         if (posix_pgroup_get(candidate) != pgid) continue;
         members[count++] = candidate;
     }
+    *next = slot;
     return count;
+}
+
+u32 posix_pgroup_members(u32 pgid, struct task **members, u32 capacity) {
+    u32 next = 0;
+    return posix_pgroup_members_from(pgid, 0, members, capacity, &next);
 }
 
 u32 posix_pgroup_id_of(struct task *task) {
