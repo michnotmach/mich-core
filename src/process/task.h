@@ -15,6 +15,11 @@ struct mmio_grant {
     vaddr_t mapped_va;
 };
 
+// Neutral share for a task whose creator asked for none. Scaling against a
+// fixed reference keeps vruntime comparable across weights without any of
+// them having to know the others.
+#define TASK_WEIGHT_DEFAULT 1024u
+
 #define TASK_RUNNING 0
 #define TASK_BLOCKED_SEND 1
 #define TASK_BLOCKED_RECV 2
@@ -105,6 +110,14 @@ struct task {
     // publishes this instead.
     i64 stop_answer;
     u32 stop_answer_set;
+    // Scheduler accounting. runtime_ns is wall time spent on a CPU and
+    // vruntime_ns is the same time scaled by weight, which is what a
+    // proportional-share policy compares. cpu_started_ns is nonzero only
+    // while the task is on a CPU, so a double charge is impossible.
+    u64 runtime_ns;
+    u64 vruntime_ns;
+    u64 cpu_started_ns;
+    u32 weight;
     paddr_t kstack_phys;
     u32 exec_gate;
     u32 recv_expect;
@@ -161,6 +174,11 @@ void task_state_set(struct task *t, int state);
 void task_state_set_locked(struct task *t, int state);
 int task_state_wake(struct task *t, int from_state);
 int task_sleep_wake_claim(struct task *t, u32 *deadline, uptr_t *request);
+// Bookkeeping only: the caller supplies the timestamp, because the clock is
+// arch specific and this file is portable.
+void task_runtime_arm(struct task *t, u64 now_ns);
+void task_runtime_charge(struct task *t, u64 now_ns);
+
 int task_state_wake_locked(struct task *t, int from_state);
 void task_sleep_block(struct task *t, u32 deadline);
 void task_sleep_block_locked(struct task *t, u32 deadline);

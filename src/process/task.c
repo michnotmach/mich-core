@@ -26,6 +26,10 @@ void task_pool_unlock(void) {
 }
 
 static void task_clear_dynamic(struct task *t) {
+    t->runtime_ns = 0;
+    t->vruntime_ns = 0;
+    t->cpu_started_ns = 0;
+    t->weight = TASK_WEIGHT_DEFAULT;
     t->page_dir = 0;
     t->recv_buf = 0;
     t->pending_msg = 0;
@@ -197,6 +201,27 @@ void task_wait_clear(struct task *t) {
     t->wait_options = 0;
     t->wait_status_address = 0;
     t->state = TASK_RUNNING;
+    task_pool_unlock();
+}
+
+void task_runtime_arm(struct task *t, u64 now_ns) {
+    if (!t) return;
+    task_pool_lock();
+    t->cpu_started_ns = now_ns;
+    task_pool_unlock();
+}
+
+void task_runtime_charge(struct task *t, u64 now_ns) {
+    u64 elapsed, weight;
+    if (!t) return;
+    task_pool_lock();
+    if (t->cpu_started_ns && now_ns >= t->cpu_started_ns) {
+        elapsed = now_ns - t->cpu_started_ns;
+        weight = t->weight ? t->weight : TASK_WEIGHT_DEFAULT;
+        t->runtime_ns += elapsed;
+        t->vruntime_ns += (elapsed * TASK_WEIGHT_DEFAULT) / weight;
+        t->cpu_started_ns = 0;
+    }
     task_pool_unlock();
 }
 

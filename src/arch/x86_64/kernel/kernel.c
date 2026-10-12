@@ -1561,6 +1561,16 @@ u32 scheduler64_next_slot(void) {
     return next < 0 ? here : (u32)next;
 }
 
+// One helper for all three switch paths. The voluntary switch and the two AP
+// rotations deliberately differ in what else they touch, but not in the fact
+// that one task stopped running and another started. The clock is read here
+// and handed down, because the bookkeeping is portable and the clock is not.
+static void task_account_switch(u32 outgoing, u32 incoming) {
+    u64 now = time64_ns();
+    if (outgoing < MAX_TASKS) task_runtime_charge(&task_pool[outgoing], now);
+    if (incoming < MAX_TASKS) task_runtime_arm(&task_pool[incoming], now);
+}
+
 void scheduler64_set_running(u32 slot) {
     // The task to unpark is the one this CPU ran, not the shared slot's: off
     // this CPU the shared slot belongs to whoever switched last, and
@@ -1569,6 +1579,7 @@ void scheduler64_set_running(u32 slot) {
     int cpu = (int)smp64_cpu_index();
     if (old < MAX_TASKS && old != slot)
         task_cpu_release(&task_pool[old]);
+    task_account_switch(old, slot);
     current_task_slot = slot;
     scheduler_set_current((int)slot);
     smp64_set_current(slot);
@@ -1959,6 +1970,7 @@ static void ap64_timer_preempt(struct interrupt_frame64 *frame) {
     smp64_note_preempt();
     next = smp64_pick_next(slot);
     if (next < 0 || (u32)next == slot) return;
+    task_account_switch(slot, (u32)next);
     smp64_set_current((u32)next);
     fpu64_load(&task_contexts[next]);
     interrupt_load(frame, &task_contexts[next]);
@@ -1982,6 +1994,7 @@ static void ap64_resched(struct exception_frame64 *frame) {
     smp64_note_preempt();
     next = smp64_pick_next(slot);
     if (next < 0 || (u32)next == slot) return;
+    task_account_switch(slot, (u32)next);
     smp64_set_current((u32)next);
     fpu64_load(&task_contexts[next]);
     frame64_load_user(frame, &task_contexts[next]);
