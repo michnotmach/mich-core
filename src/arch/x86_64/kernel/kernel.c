@@ -1160,12 +1160,13 @@ static void fpu64_init_context(struct task_context64 *context) {
 
 
 static int spawn64_image(u32 image_id, int parent_id, u32 capabilities,
-                         const char *name, u64 argument) {
+                         const char *name, u64 argument, u32 weight) {
     if (image_id >= SPAWN_IMAGE_MAX || image_id >= spawn_image_count ||
         (capabilities & ~spawn_image_capabilities[image_id]))
         return -1;
     struct task *task = task_alloc_slot();
     if (!task) return -1;
+    if (weight) task->weight = weight;
     u32 slot = (u32)(task - task_pool);
     struct task_context64 *context = &task_contexts[slot];
     u32 space;
@@ -1227,7 +1228,7 @@ static int spawn64_image(u32 image_id, int parent_id, u32 capabilities,
 
 int spawn64(int parent_id, u32 capabilities,
                    const char *name, u64 argument) {
-    return spawn64_image(0, parent_id, capabilities, name, argument);
+    return spawn64_image(0, parent_id, capabilities, name, argument, 0);
 }
 
 int fork64(void) {
@@ -1788,7 +1789,7 @@ static int supervisor64_spawn(const struct driver_domain *domain) {
         if (iommu_domain_resume(domain->id)) return -1;
     }
     return spawn64_image(domain->image_id, 0, domain->capabilities,
-                         domain->name, domain->argument);
+                         domain->name, domain->argument, domain->weight);
 }
 
 static int supervisor64_quiesce(struct kernel_object *device) {
@@ -2492,7 +2493,7 @@ void kernel64_main(u32 magic, struct bd_info *info) {
             !module_name_is(&modules[index], "netbench") &&
             !module_name_is(&modules[index], "tcpwire")) continue;
         if (spawn64_image(index, 0, spawn_image_capabilities[index],
-                          "probe", 0) < 0)
+                          "probe", 0, 0) < 0)
             KERNEL_PANIC("probe spawn");
         break;
     }

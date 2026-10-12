@@ -1170,6 +1170,40 @@ static int graceful_stop64_self_test(struct kernel_object *dev) {
 }
 
 // Keep the test-only supervisor matrix within the fixed boot blob.
+// The share travels manifest -> domain -> spawn, and this covers the first
+// two hops plus the validation guarding the boundary. The spawn hop is not
+// reached here because the supervisor runs against a stub spawn backend
+// inside this function; the real backend is only installed once it returns.
+static int driver_weight_self_test(struct kernel_object *device,
+                                   const struct driver_user_manifest *source) {
+    struct driver_user_manifest manifest = *source;
+    manifest.weight = TASK_WEIGHT_DEFAULT * 4u;
+    struct driver_domain *domain =
+        driver_passport_domain(device, &manifest, 0, 0, 0, 0, 8);
+    if (!domain) return -1;
+    int scaled = domain->weight == TASK_WEIGHT_DEFAULT * 4u;
+    driver_domain_destroy(domain);
+    if (!scaled) return -2;
+
+    // Zero has to mean the default, because every manifest written before
+    // the field existed zeroes that word.
+    manifest.weight = 0;
+    domain = driver_passport_domain(device, &manifest, 0, 0, 0, 0, 8);
+    if (!domain) return -3;
+    int defaulted = domain->weight == 0;
+    driver_domain_destroy(domain);
+    if (!defaulted) return -4;
+
+    // The bound is what stops one manifest from taking the whole machine,
+    // and the still-reserved word keeps the ABI honest for the next field.
+    manifest.weight = TASK_WEIGHT_MAX + 1u;
+    if (!driver_user_manifest_validate(&manifest)) return -5;
+    manifest.weight = 0;
+    manifest.reserved3 = 1u;
+    if (!driver_user_manifest_validate(&manifest)) return -6;
+    return 0;
+}
+
 static __attribute__((cold, noinline, optimize("Os"))) int driver_supervisor(
     const struct test64_env *env) {
     test_env = env;
@@ -1485,10 +1519,11 @@ static __attribute__((cold, noinline, optimize("Os"))) int driver_supervisor(
     int selector_test = driver_recovery_selector_self_test(device, &manifest);
     int stress_test = driver_crash_stress_self_test(device);
     int graceful_test = graceful_stop64_self_test(device);
+    int weight_test = driver_weight_self_test(device, &manifest);
     valid = valid && !manager_register_test && !manager_fallback_test &&
         !passport_test && !policy_test && !launch_test &&
         !teardown_audit_test && !fallback_test && !selector_test &&
-        !stress_test && !graceful_test;
+        !stress_test && !graceful_test && !weight_test;
     object_release(dependent_device);
     object_release(device);
     driver_supervisor_init(test_env->spawn, test_env->quiesce,
@@ -1527,6 +1562,7 @@ int tests64_run_driver(const struct test64_env *env) {
     serial64_write("Mich test64: driver bootstrap ABI pass\n");
     serial64_write("Mich test64: IRQ bootstrap source pass\n");
     serial64_write("Mich test64: userspace driver manager pass\n");
+    serial64_write("Mich test64: driver scheduler weight pass\n");
     serial64_write("Mich test64: driver manifest priority pass\n");
     serial64_write("Mich test64: driver manifest fallback pass\n");
     serial64_write("Mich test64: driver dependency graph pass\n");

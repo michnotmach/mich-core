@@ -433,6 +433,7 @@ static struct driver_domain *driver_domain_create_locked(
         domain->backoff_ticks = manifest->backoff_ticks;
         domain->image_id = manifest->image_id;
         domain->reset_policy = manifest->reset_policy;
+        domain->weight = manifest->weight;
         domain->argument = manifest->argument;
         domain->firmware_count = 0;
         for (u32 firmware = 0; firmware < DRIVER_USER_FIRMWARE_MAX; firmware++)
@@ -468,7 +469,7 @@ int driver_user_manifest_validate(const struct driver_user_manifest *manifest) {
         manifest->dependency_count > DRIVER_USER_DEPENDENCY_MAX ||
         manifest->firmware_count > DRIVER_USER_FIRMWARE_MAX ||
         manifest->image_id >= DRIVER_USER_IMAGE_MAX ||
-        manifest->reserved2[0] || manifest->reserved2[1])
+        manifest->weight > TASK_WEIGHT_MAX || manifest->reserved3)
         return -1;
     for (u32 index = 0; index < manifest->dependency_count; index++) {
         const char *dependency = manifest->dependencies[index];
@@ -553,6 +554,7 @@ static struct driver_domain *driver_domain_create_user_locked(
     base.backoff_ticks = manifest->backoff_ticks;
     base.image_id = manifest->image_id;
     base.reset_policy = manifest->reset_policy;
+    base.weight = manifest->weight;
     base.argument = manifest->argument;
     struct driver_domain *domain = driver_domain_create_locked(&base, device);
     if (domain) {

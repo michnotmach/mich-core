@@ -590,6 +590,7 @@ for marker in \
     "Mich x86_64: driver bootstrap access pass" \
     "Mich x86_64: firmware domain isolation pass" \
     "Mich test64: userspace driver manager pass" \
+    "Mich test64: driver scheduler weight pass" \
     "Mich test64: driver manifest priority pass" \
     "Mich test64: driver manifest fallback pass" \
     "Mich test64: driver dependency graph pass" \

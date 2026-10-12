@@ -19,6 +19,9 @@ struct mmio_grant {
 // fixed reference keeps vruntime comparable across weights without any of
 // them having to know the others.
 #define TASK_WEIGHT_DEFAULT 1024u
+// A ceiling on the share one task may ask for, so a manifest cannot make
+// every other task's vruntime advance by rounding alone.
+#define TASK_WEIGHT_MAX 1048576u
 
 #define TASK_RUNNING 0
 #define TASK_BLOCKED_SEND 1

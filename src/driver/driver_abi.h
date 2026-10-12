@@ -66,7 +66,10 @@ struct driver_user_manifest {
     u32 request_count;
     u32 dependency_count;
     u32 firmware_count;
-    u32 reserved2[2];
+    // Scheduler share, or 0 for the default. Was reserved2[0]; the word
+    // after it is still required to be zero.
+    u32 weight;
+    u32 reserved3;
     char dependencies[DRIVER_USER_DEPENDENCY_MAX][DRIVER_USER_NAME_MAX];
     char firmware[DRIVER_USER_FIRMWARE_MAX][DRIVER_USER_NAME_MAX];
     struct driver_user_match matches[DRIVER_USER_MATCH_MAX];

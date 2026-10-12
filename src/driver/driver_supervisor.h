@@ -115,6 +115,9 @@ struct driver_crash_circuit_policy {
 
 struct driver_domain_manifest {
     const char *name;
+    // Scheduler share, or 0 for the default. Every caller builds this on the
+    // stack field by field, so a new member has to be set at each site.
+    u32 weight;
     u32 capabilities;
     u32 restart_policy;
     u32 max_restarts;
@@ -160,6 +163,7 @@ struct driver_domain {
     u32 image_id;
     u32 reset_policy;
     u64 argument;
+    u32 weight;
     struct driver_recovery_profile fallback;
     struct driver_recovery_selector fallback_selector;
     struct driver_recovery_audit recovery_audit;

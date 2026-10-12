@@ -723,6 +723,7 @@ static void smp64_domain_turn(u32 turn) {
     manifest.backoff_ticks = 0;
     manifest.image_id = 0;
     manifest.reset_policy = DRIVER_RESET_NONE;
+    manifest.weight = 0;
     manifest.argument = 0;
     struct driver_domain *domain = driver_domain_create(&manifest, device);
     if (!domain) return;
