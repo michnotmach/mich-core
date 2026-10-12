@@ -21,12 +21,45 @@ struct adytumfs_slot {
     char name[VFS_NAME_MAX + 1];
 };
 
+// One bit per cached page. A single u64 word capped a file at 64 pages even
+// though the on-disk format has no such limit: an extent length is a free
+// u32 and a contiguous grow extends the last extent, so the array is what
+// lets a file reach what the device can actually hold.
+#define ADYTUMFS_PAGE_WORD_BITS 64u
+#define ADYTUMFS_PAGE_WORDS (ADYTUMFS_FILE_PAGES / ADYTUMFS_PAGE_WORD_BITS)
+
 struct adytumfs_cache {
     struct kernel_object *pages;
-    u64 present;
-    u64 dirty;
+    u64 present[ADYTUMFS_PAGE_WORDS];
+    u64 dirty[ADYTUMFS_PAGE_WORDS];
     u32 active;
 };
+
+static int cache_test(const u64 *mask, u32 page) {
+    return (int)((mask[page / ADYTUMFS_PAGE_WORD_BITS] >>
+                  (page % ADYTUMFS_PAGE_WORD_BITS)) & 1u);
+}
+
+static void cache_mark(u64 *mask, u32 page) {
+    mask[page / ADYTUMFS_PAGE_WORD_BITS] |=
+        1ull << (page % ADYTUMFS_PAGE_WORD_BITS);
+}
+
+static void cache_unmark(u64 *mask, u32 page) {
+    mask[page / ADYTUMFS_PAGE_WORD_BITS] &=
+        ~(1ull << (page % ADYTUMFS_PAGE_WORD_BITS));
+}
+
+static void cache_clear_all(u64 *mask) {
+    for (u32 index = 0; index < ADYTUMFS_PAGE_WORDS; index++)
+        mask[index] = 0;
+}
+
+static int cache_any(const u64 *mask) {
+    for (u32 index = 0; index < ADYTUMFS_PAGE_WORDS; index++)
+        if (mask[index]) return 1;
+    return 0;
+}
 
 struct adytumfs_mount {
     struct kernel_object *device;
@@ -184,8 +217,8 @@ static struct adytumfs_cache *cache_slot(struct adytumfs_mount *m,
         slot->pages ? page_resource_get(slot->pages) : 0;
     if (!resource || resource->revoked) {
         slot->pages = 0;
-        slot->present = 0;
-        slot->dirty = 0;
+        cache_clear_all(slot->present);
+        cache_clear_all(slot->dirty);
         slot->active = 0;
         return 0;
     }
@@ -277,8 +310,8 @@ int adytumfs_pages_attach(u32 mount, u32 inode, u64 generation,
     if (!resource || resource->pages > ADYTUMFS_FILE_PAGES) return -1;
     struct adytumfs_cache *slot = &m->cache[inode];
     slot->pages = pages;
-    slot->present = 0;
-    slot->dirty = 0;
+    cache_clear_all(slot->present);
+    cache_clear_all(slot->dirty);
     slot->active = 1;
     return 0;
 }
@@ -290,7 +323,7 @@ int adytumfs_pages_fault(u32 mount, u32 inode, u64 generation, u32 page) {
     if (!slot || page >= ADYTUMFS_FILE_PAGES ||
         slot_inode_read(m, inode, &in) || (in.mode & ADYTUMFS_MODE_REG) == 0)
         return -1;
-    if (slot->present & (1ull << page)) return 0;
+    if (cache_test(slot->present, page)) return 0;
     struct page_resource *resource = page_resource_get(slot->pages);
     if (!resource || page >= resource->pages) return -1;
     u8 *bytes = (u8 *)(uptr_t)resource->physical[page];
@@ -301,7 +334,7 @@ int adytumfs_pages_fault(u32 mount, u32 inode, u64 generation, u32 page) {
     if (page * 4096u >= in.size ||
         adytumfs_inode_map(&in, page, &physical)) {
         for (u32 index = 0; index < 4096; index++) bytes[index] = 0;
-        slot->present |= 1ull << page;
+        cache_mark(slot->present, page);
         return 0;
     }
     if (page_transfer(m, slot, (u32)(physical * ADYTUMFS_SECTORS_PER_BLOCK),
@@ -310,7 +343,7 @@ int adytumfs_pages_fault(u32 mount, u32 inode, u64 generation, u32 page) {
     // The transfer filled the page from the device, so the region must vouch
     // for those bytes exactly like the read path demands.
     if (adytumfs_data_check(m->device, &m->super, physical, bytes)) return -1;
-    slot->present |= 1ull << page;
+    cache_mark(slot->present, page);
     return 0;
 }
 
@@ -322,8 +355,8 @@ int adytumfs_pages_dirty(u32 mount, u32 inode, u64 generation, u32 page,
     if (!slot || page >= ADYTUMFS_FILE_PAGES || size > ADYTUMFS_FILE_SIZE_MAX ||
         slot_inode_read(m, inode, &in) || (in.mode & ADYTUMFS_MODE_REG) == 0)
         return -1;
-    slot->present |= 1ull << page;
-    slot->dirty |= 1ull << page;
+    cache_mark(slot->present, page);
+    cache_mark(slot->dirty, page);
     if (size > in.size) {
         in.size = size;
         if (adytumfs_inode_write(m->device, &m->super, m->slots[inode].inode,
@@ -341,7 +374,7 @@ int adytumfs_pages_sync(u32 mount, u32 inode, u64 generation) {
     struct adytumfs_inode in;
     if (slot_inode_read(m, inode, &in) || (in.mode & ADYTUMFS_MODE_REG) == 0)
         return -1;
-    if (!slot->dirty) return 0;
+    if (!cache_any(slot->dirty)) return 0;
     // Grow to the write-back size, not only over the dirty pages: a write
     // that skipped pages leaves holes whose blocks must exist and read as
     // zeroes. Growth only appends, so attached pages stay valid.
@@ -359,7 +392,7 @@ int adytumfs_pages_sync(u32 mount, u32 inode, u64 generation) {
     }
     u32 page = 0;
     while (page < ADYTUMFS_FILE_PAGES) {
-        if (!(slot->dirty & (1ull << page))) {
+        if (!(cache_test(slot->dirty, page))) {
             page++;
             continue;
         }
@@ -390,7 +423,7 @@ int adytumfs_pages_sync(u32 mount, u32 inode, u64 generation) {
                                          m->slots[inode].inode, page, stale,
                                          fresh))
                 return -1;
-            slot->dirty &= ~(1ull << page);
+            cache_unmark(slot->dirty, page);
             page++;
             continue;
         }
@@ -399,7 +432,7 @@ int adytumfs_pages_sync(u32 mount, u32 inode, u64 generation) {
         // ends where the next dirty page maps to a non-adjacent block.
         while (count < ADYTUMFS_SG_PAGES &&
                page + count < ADYTUMFS_FILE_PAGES &&
-               (slot->dirty & (1ull << (page + count)))) {
+               (cache_test(slot->dirty, page + count))) {
             u64 next = 0;
             if (adytumfs_inode_map(&in, page + count, &next) ||
                 next != physical + count)
@@ -423,7 +456,7 @@ int adytumfs_pages_sync(u32 mount, u32 inode, u64 generation) {
                 return -1;
         }
         for (u32 index = 0; index < count; index++)
-            slot->dirty &= ~(1ull << (page + index));
+            cache_unmark(slot->dirty, page + index);
         page += count;
     }
     // Sync is the agreed commit boundary: the redirected pages and the
@@ -436,8 +469,8 @@ void adytumfs_pages_detach(u32 mount, u32 inode, u64 generation) {
     if (!m) return;
     struct adytumfs_cache *slot = &m->cache[inode];
     slot->pages = 0;
-    slot->present = 0;
-    slot->dirty = 0;
+    cache_clear_all(slot->present);
+    cache_clear_all(slot->dirty);
     slot->active = 0;
 }
 
@@ -481,8 +514,8 @@ int adytumfs_attach(u32 mount, struct kernel_object *device,
         for (u32 byte = 0; byte <= VFS_NAME_MAX; byte++)
             m->slots[slot].name[byte] = 0;
         m->cache[slot].pages = 0;
-        m->cache[slot].present = 0;
-        m->cache[slot].dirty = 0;
+        cache_clear_all(m->cache[slot].present);
+        cache_clear_all(m->cache[slot].dirty);
         m->cache[slot].active = 0;
     }
     m->super = super;

@@ -1019,20 +1019,25 @@ this table is worth comparing against hardware.
 
 ### Filesystem throughput
 
-One adytumfs file on a 256 KiB block object, 16 chunks of 4096 bytes, single
+One adytumfs file on a 2 MiB block object, 32 chunks of 4096 bytes, single
 CPU, timed per call with rdtsc. The flush is separate because a write that
 reached the cache and one that reached the block device are different claims.
 
 | Operation | Total cycles | Cycles per 4096 B |
 |-----------|-------------:|------------------:|
-| Write | 12,356,552 | 772,284 |
-| Flush | 15,990,590 | |
-| Read | 8,797,196 | 549,824 |
+| Write | 50,522,220 | 1,578,819 |
+| Flush | 34,790,650 | 1,087,207 |
+| Read | 39,504,474 | 1,234,514 |
 
 Each chunk carries its own pattern and every read is compared against its
 own, so the read figure is for data that was really stored and read back.
 There is no matching "before" measurement: the block layer landed in the same
 release, so this is a baseline for later work rather than an improvement.
+
+The per-chunk cost roughly doubles when the device grows from 256 KiB to
+2 MiB, which says the allocator walks free space in proportion to the device
+rather than to the file. That is the first thing to fix if this path ever
+has to be fast.
 
 ## Crypto policy
 

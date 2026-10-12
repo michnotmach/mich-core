@@ -5,7 +5,7 @@
 #include "object.h"
 
 #define ADYTUMFS_INODE_MAX 16
-#define ADYTUMFS_FILE_PAGES 16
+#define ADYTUMFS_FILE_PAGES 256
 #define ADYTUMFS_FILE_SIZE_MAX (ADYTUMFS_FILE_PAGES * 4096u)
 
 int adytumfs_format(struct kernel_object *device);

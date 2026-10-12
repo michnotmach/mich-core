@@ -7,9 +7,11 @@
 #include "serial64.h"
 #include "apic64.h"
 
-#define FS_BENCH_SECTORS 512u
+// The device has to hold the throughput file and then the capacity check at
+// ADYTUMFS_FILE_SIZE_MAX, so it is sized for the larger of the two.
+#define FS_BENCH_SECTORS 4096u
 #define FS_BENCH_CHUNK 4096u
-#define FS_BENCH_CHUNKS 16u
+#define FS_BENCH_CHUNKS 32u
 #define FS_BENCH_NAME "throughput"
 
 static u8 fs_bench_buffer[FS_BENCH_CHUNK];
@@ -94,6 +96,19 @@ int test_fs_bench(void) {
         serial64_write("/");
         serial64_dec(read_at / FS_BENCH_CHUNKS);
         serial64_write("\n");
+    }
+    // Grow to the ceiling and read the size back. Truncating moves no data,
+    // so this proves the file can reach the limit without spending the
+    // guest budget on a megabyte of copies; the grow and the reclaim both
+    // run, because the truncate back down frees what it just took.
+    if (!reason) {
+        struct vfs_node_info grown;
+        if (vfs_truncate(file, ADYTUMFS_FILE_SIZE_MAX)) reason = 12;
+        if (!reason && (vfs_stat(file, &grown) ||
+                        grown.size != ADYTUMFS_FILE_SIZE_MAX))
+            reason = 13;
+        if (!reason && vfs_truncate(file, 0)) reason = 14;
+        if (!reason && (vfs_stat(file, &grown) || grown.size)) reason = 15;
     }
     if (file) object_release(file);
     if (node) object_release(node);

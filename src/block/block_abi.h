@@ -4,7 +4,7 @@
 #include "types.h"
 
 #define BLOCK_SECTOR_SIZE 512
-#define BLOCK_SECTOR_MAX 512
+#define BLOCK_SECTOR_MAX 4096
 #define BLOCK_IO_SECTORS_MAX 1
 
 #define BLOCK_OP_READ 1
