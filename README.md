@@ -1020,13 +1020,17 @@ drivers is 1.85x and 2.00x, which is larger than the 1.19x effect being
 measured, so those two rows cannot resolve anything. Only the four-driver
 row is stable, at 1.06x.
 
-The mechanism is visible in the code rather than in the benchmark: streams
-are independent above the driver but share the same coarse object, page and
-network locks, so extra drivers add contention without adding throughput.
-Whether that is the ceiling or an artifact of measuring on a two-core host
-with four vCPUs is not settled by this data. The honest summary is that this
-path needs a measurement environment with more host cores than guest CPUs
-before any scaling claim is worth printing.
+The cause is not lock contention, and that is measured rather than assumed.
+The kernel keeps per-level acquire and wait counters and dumps them at the
+end of the SMP battery, after the netbench has run. Across the same three
+runs the network lock took 4,529 acquisitions with zero waits, the object
+lock 179,990 with 59 (0.03%), and the scheduler pool lock 445 with 4. Nothing
+on this path contends.
+
+That leaves the measurement itself as the explanation: four vCPUs on a
+two-core host have no real parallelism to expose, so these rows are mostly
+measuring how the emulator schedules threads. This path needs a host with
+more cores than guest CPUs before any scaling claim is worth printing.
 
 ### Filesystem throughput
 
