@@ -3,6 +3,7 @@
 #include "protos.h"
 #include "klock.h"
 #include "scheduler.h"
+#include "irq.h"
 
 #define PAGE_SIZE 4096
 #define BITMAP_SIZE 0x20000
@@ -19,12 +20,16 @@ static struct klock pmm_klock = KLOCK_INIT(KLOCK_LEVEL_PMM);
 // cached page stays claimed, bitmap bit set and refcount one, so no scan
 // can hand it out twice and pmm_free_pages adds the reserve back: the
 // leak checks compare that count for exact equality.
+//
+// Each slot belongs to one CPU, so a pop takes no allocator lock at all.
+// Pmm was the largest single source of lock waits measured, and the pop
+// was most of its acquisitions. Nothing on the interrupt path allocates,
+// which is what makes irqs off sufficient here instead of a lock.
 #define PMM_RESERVE_MAX 8u
 #define PMM_HIGH_START (0x1000000 / PAGE_SIZE)
 
 static u32 pmm_page_reserve[KLOCK_MAX_CPUS][PMM_RESERVE_MAX];
 static u32 pmm_reserve_count[KLOCK_MAX_CPUS];
-static u32 pmm_cached_pages;
 
 struct e820_entry {
     unsigned long long addr;
@@ -151,7 +156,14 @@ static void pmm_refill_locked(u32 cpu, u32 limit) {
         pmm_page_reserve[cpu][count++] = page;
     }
     pmm_reserve_count[cpu] = count;
-    pmm_cached_pages += count;
+}
+
+// Caller holds the allocator lock or has irqs off; either keeps this
+// CPU's reserve private to it.
+static paddr_t pmm_pop(u32 cpu) {
+    if (!pmm_reserve_count[cpu]) return 0;
+    u32 page = pmm_page_reserve[cpu][--pmm_reserve_count[cpu]];
+    return (paddr_t)page * PAGE_SIZE;
 }
 
 static paddr_t pmm_take_page(u32 page) {
@@ -205,21 +217,29 @@ paddr_t pmm_alloc_page(void) {
     u32 high_start = PMM_HIGH_START;
     u32 limit = max_page + 1;
     if (limit > alloc_page_limit) limit = alloc_page_limit;
+    irq_state_t state = irq_save();
+    paddr_t physical = pmm_pop(pmm_cpu());
+    irq_restore(state);
+    if (physical) {
+        pmm_zero_page(physical);
+        return physical;
+    }
     klock_acquire(&pmm_klock);
+    // The cpu is re-read under the lock: a tick between the two sections
+    // can move this task, and refilling a slot that already holds pages
+    // would orphan them, still claimed but no longer counted.
     u32 cpu = pmm_cpu();
     if (!pmm_reserve_count[cpu] && limit > high_start)
         pmm_refill_locked(cpu, limit);
-    if (pmm_reserve_count[cpu]) {
-        u32 page = pmm_page_reserve[cpu][--pmm_reserve_count[cpu]];
-        pmm_cached_pages--;
-        paddr_t physical = (paddr_t)page * PAGE_SIZE;
+    physical = pmm_pop(cpu);
+    if (physical) {
         klock_release(&pmm_klock);
         pmm_zero_page(physical);
         return physical;
     }
     for (u32 page = 1; page < high_start && page < limit; page++) {
         if (!(bitmap[page / 8] & (1u << (page % 8)))) {
-            paddr_t physical = pmm_take_page(page);
+            physical = pmm_take_page(page);
             klock_release(&pmm_klock);
             pmm_zero_page(physical);
             return physical;
@@ -301,7 +321,6 @@ void pmm_free_page(paddr_t addr) {
             pmm_reserve_count[cpu] < PMM_RESERVE_MAX) {
             page_refs[page] = 1;
             pmm_page_reserve[cpu][pmm_reserve_count[cpu]++] = page;
-            pmm_cached_pages++;
         } else {
             bitmap[page / 8] &= (unsigned char)~(1u << (page % 8));
             free_pages++;
@@ -335,9 +354,16 @@ u32 pmm_page_refs(paddr_t addr) {
 }
 
 u32 pmm_free_pages(void) {
+    u32 cached = 0;
     klock_acquire(&pmm_klock);
-    u32 count = free_pages + pmm_cached_pages;
+    for (u32 cpu = 0; cpu < KLOCK_MAX_CPUS; cpu++)
+        cached += pmm_reserve_count[cpu];
+    u32 count = free_pages + cached;
     klock_release(&pmm_klock);
+    // A lock-free pop on another CPU can land between the two reads, so
+    // the total is a snapshot rather than an exact instant. Refills are
+    // excluded by the lock, and a pop only moves a page out of the
+    // reserve, so the drift is at most the in-flight pop count.
     return count;
 }
 
