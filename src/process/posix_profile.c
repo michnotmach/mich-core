@@ -154,37 +154,27 @@ int posix_mode_allows(const struct vfs_node_info *info,
 
 // Splice a symlink target into the walk: an absolute target restarts the
 // walk at the root, a relative one takes the place of the component the
-// link was found under. The spliced string can outgrow the path bound
-// before normalization shrinks it, so the working buffer is twice as wide.
+// link was found under. The hop budget is the POSIX symloop bound.
+//
+// The splice happens in place rather than through follow_link. That shape
+// recursed, and the recursion was not one the compiler collapsed into a
+// jump, so every hop stacked four path buffers; at the real path bound a
+// symloop chain ran past the syscall stack instead of returning ELOOP.
 static int walk_path(struct task *task, const char *path,
-                     struct kernel_object **node, u32 depth);
-
-static int follow_link(struct task *task, const char *base,
-                       const char *target, const char *rest,
-                       struct kernel_object **node, u32 depth) {
-    char input[VFS_PATH_MAX * 2];
-    u32 used = 0;
-    while (target[used] && used < sizeof(input)) {
-        input[used] = target[used];
-        used++;
+                     struct kernel_object **node) {
+    char work[VFS_PATH_MAX];
+    char base[VFS_PATH_MAX];
+    // The spliced string can outgrow the path bound before normalization
+    // shrinks it back, so the splice buffer is twice as wide.
+    char splice[VFS_PATH_MAX * 2];
+    u32 length = 0;
+    while (path[length] && length + 1u < sizeof(work)) {
+        work[length] = path[length];
+        length++;
     }
-    if (used >= sizeof(input)) return POSIX_PROFILE_ENAMETOOLONG;
-    while (*rest == '/') rest++;
-    if (rest[0] && used + 1u < sizeof(input)) {
-        input[used++] = '/';
-        while (*rest && used < sizeof(input)) input[used++] = *rest++;
-    }
-    if (used >= sizeof(input)) return POSIX_PROFILE_ENAMETOOLONG;
-    input[used] = 0;
-    char normalized[VFS_PATH_MAX];
-    int result = normalize_path(target[0] == '/' ? "/" : base, input,
-                                normalized);
-    if (result) return result;
-    return walk_path(task, normalized, node, depth + 1u);
-}
-
-static int walk_path(struct task *task, const char *path,
-                     struct kernel_object **node, u32 depth) {
+    if (path[length]) return POSIX_PROFILE_ENAMETOOLONG;
+    work[length] = 0;
+    u32 depth = 0;
     struct kernel_object *current = vfs_root();
     if (!current) return POSIX_PROFILE_ENOMEM;
     u32 offset = 1;
@@ -194,7 +184,7 @@ static int walk_path(struct task *task, const char *path,
             object_release(current);
             return POSIX_PROFILE_ENOENT;
         }
-        if (!path[offset]) {
+        if (!work[offset]) {
             *node = current;
             return 0;
         }
@@ -207,45 +197,55 @@ static int walk_path(struct task *task, const char *path,
             return POSIX_PROFILE_EACCES;
         }
         char component[VFS_NAME_MAX + 1];
-        u32 length = 0;
+        u32 component_length = 0;
         u32 start = offset;
-        while (path[offset] && path[offset] != '/') {
-            if (length >= VFS_NAME_MAX) {
+        while (work[offset] && work[offset] != '/') {
+            if (component_length >= VFS_NAME_MAX) {
                 object_release(current);
                 return POSIX_PROFILE_ENAMETOOLONG;
             }
-            component[length++] = path[offset++];
+            component[component_length++] = work[offset++];
         }
-        component[length] = 0;
+        component[component_length] = 0;
         struct kernel_object *next = vfs_lookup(current, component);
         object_release(current);
         if (!next) return POSIX_PROFILE_ENOENT;
-        // A symlink hands the rest of the walk to its target, whether it
-        // was met as a component or as the final one. The hop budget is
-        // the POSIX symloop bound; every further hop is ELOOP.
         struct vfs_node_info link_info;
         if (vfs_stat(next, &link_info)) {
             object_release(next);
             return POSIX_PROFILE_EIO;
         }
-        if (link_info.type == VFS_NODE_SYMLINK) {
-            char target[VFS_PATH_MAX];
-            u32 target_length = 0;
-            int broken = vfs_readlink(next, target, sizeof(target),
-                                      &target_length);
-            object_release(next);
-            if (broken) return POSIX_PROFILE_EIO;
-            if (depth >= 8u) return POSIX_PROFILE_ELOOP;
-            char base[VFS_PATH_MAX];
-            u32 kept = start > 1u ? start - 1u : 1u;
-            for (u32 index = 0; index < kept; index++)
-                base[index] = path[index];
-            base[kept] = 0;
-            return follow_link(task, base, target, path + offset, node,
-                               depth);
+        if (link_info.type != VFS_NODE_SYMLINK) {
+            current = next;
+            if (work[offset] == '/') offset++;
+            continue;
         }
-        current = next;
-        if (path[offset] == '/') offset++;
+        // The target lands at the front of the splice buffer, then the
+        // unconsumed tail of the walk is appended after it. Both reads
+        // finish before work is overwritten with the normalized result.
+        u32 used = 0;
+        int broken = vfs_readlink(next, splice, sizeof(splice), &used);
+        object_release(next);
+        if (broken) return POSIX_PROFILE_EIO;
+        if (depth >= 8u) return POSIX_PROFILE_ELOOP;
+        u32 kept = start > 1u ? start - 1u : 1u;
+        for (u32 index = 0; index < kept; index++) base[index] = work[index];
+        base[kept] = 0;
+        const char *rest = work + offset;
+        while (*rest == '/') rest++;
+        if (rest[0] && used + 1u < sizeof(splice)) {
+            splice[used++] = '/';
+            while (*rest && used < sizeof(splice)) splice[used++] = *rest++;
+        }
+        if (used >= sizeof(splice)) return POSIX_PROFILE_ENAMETOOLONG;
+        splice[used] = 0;
+        int result = normalize_path(splice[0] == '/' ? "/" : base, splice,
+                                    work);
+        if (result) return result;
+        depth++;
+        offset = 1;
+        current = vfs_root();
+        if (!current) return POSIX_PROFILE_ENOMEM;
     }
 }
 
@@ -261,7 +261,7 @@ static int resolve_path(struct task *task, const char *path,
     result = normalize_path(relative ? cwd_path : "/", path, normalized);
     if (cwd) object_release(cwd);
     if (result) return result;
-    return walk_path(task, normalized, node, 0u);
+    return walk_path(task, normalized, node);
 }
 
 void posix_profile_init(void) {
@@ -398,7 +398,7 @@ int posix_profile_parent(struct task *task, const char *path,
         for (u32 index = 0; index < leaf - 1; index++)
             parent_path[index] = normalized[index];
     }
-    return walk_path(task, parent_path, parent, 0u);
+    return walk_path(task, parent_path, parent);
 }
 
 int posix_profile_chdir(struct task *task, const char *path) {
