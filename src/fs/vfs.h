@@ -16,7 +16,7 @@
 #define VFS_NAME_MAX 255
 // Ramfs regular files are page-backed, so the bound is the page resource.
 #define VFS_FILE_SIZE_MAX (RESOURCE_PAGE_PAGES_MAX * 4096u)
-#define VFS_PATH_MAX 256
+#define VFS_PATH_MAX 4096
 #define VFS_PATH_COMPONENT_MAX 32
 
 #define VFS_NODE_REGULAR 1

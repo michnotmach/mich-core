@@ -169,7 +169,7 @@ static u32 resched_pending;
 // Stack pages for a spawned user image. One page overflows a TLS client that
 // verifies an RSA-4096 anchor; eight leaves headroom, and the unmapped page above
 // the top still guards overflow.
-#define SPAWN_STACK_PAGES 8u
+#define SPAWN_STACK_PAGES 16u
 static const u8 *spawn_images[SPAWN_IMAGE_MAX];
 static u32 spawn_image_sizes[SPAWN_IMAGE_MAX];
 static u32 spawn_image_capabilities[SPAWN_IMAGE_MAX];
