@@ -165,7 +165,9 @@ int test_sg64(void) {
     u32 page_indices[3] = {0, 0, 1};
     u32 offsets[3] = {100, 0, 50};
     u32 lengths[3] = {1000, 4096, 200};
-    struct kernel_object *fillers[KOBJECT_MAX];
+    // The exhaustion case holds every object at once, which is far too much
+    // for a syscall stack. The battery is single-CPU, so the reuse is safe.
+    static struct kernel_object *fillers[KOBJECT_MAX];
     u32 filler_count = 0;
     while (filler_count < KOBJECT_MAX) {
         struct kernel_object *filler = object_create(
