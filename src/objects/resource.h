@@ -78,7 +78,10 @@ struct msix_table_resource {
 };
 
 struct page_resource {
-    paddr_t physical[RESOURCE_PAGE_PAGES_MAX];
+    // The page map is allocated rather than inline. Inline, it sized every
+    // slot for the largest possible resource while most hold a handful of
+    // pages, and it is what kept the slot count pinned at 64.
+    paddr_t *physical;
     u32 pages;
     u32 pin_count;
     u32 map_count;

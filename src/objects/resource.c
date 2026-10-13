@@ -192,6 +192,28 @@ static void msix_destroy(struct kernel_object *object) {
     if (pci) object_release(pci);
 }
 
+// The map is one page because 512 addresses at 8 bytes fill exactly that.
+// Raising the ceiling past it needs a wider map, which is a compile error
+// here rather than a silent overrun of the slot behind it.
+_Static_assert(RESOURCE_PAGE_PAGES_MAX * sizeof(paddr_t) <= PMM_PAGE_SIZE,
+               "the page resource map must fit inside one page");
+
+static int page_map_open(struct page_resource *resource) {
+    if (resource->physical) return 0;
+    paddr_t page = pmm_alloc_page();
+    if (!page) return -1;
+    resource->physical = (paddr_t *)(uptr_t)page;
+    for (u32 index = 0; index < RESOURCE_PAGE_PAGES_MAX; index++)
+        resource->physical[index] = 0;
+    return 0;
+}
+
+static void page_map_close(struct page_resource *resource) {
+    if (!resource->physical) return;
+    pmm_free_page((paddr_t)(uptr_t)resource->physical);
+    resource->physical = 0;
+}
+
 static void page_destroy(struct kernel_object *object) {
     klock_acquire(&resource_klock);
     u64 value = object->value;
@@ -210,6 +232,7 @@ static void page_destroy(struct kernel_object *object) {
         if (resource->physical[page]) pmm_free_page(resource->physical[page]);
         resource->physical[page] = 0;
     }
+    page_map_close(resource);
     resource->pages = 0;
     resource->pin_count = 0;
     resource->map_count = 0;
@@ -286,8 +309,10 @@ void resource_init(void) {
         pci_resources[index].active = 0;
     for (u32 index = 0; index < RESOURCE_MSIX_MAX; index++)
         msix_resources[index].active = 0;
-    for (u32 index = 0; index < RESOURCE_PAGE_MAX; index++)
+    for (u32 index = 0; index < RESOURCE_PAGE_MAX; index++) {
+        page_resources[index].physical = 0;
         page_resources[index].active = 0;
+    }
     for (u32 index = 0; index < RESOURCE_SG_MAX; index++)
         sg_resources[index].active = 0;
 }
@@ -668,8 +693,7 @@ static struct kernel_object *page_allocate_locked(u32 pages, int shared) {
     for (u32 index = 0; index < RESOURCE_PAGE_MAX; index++) {
         struct page_resource *resource = &page_resources[index];
         if (resource->active) continue;
-        for (u32 page = 0; page < RESOURCE_PAGE_PAGES_MAX; page++)
-            resource->physical[page] = 0;
+        if (page_map_open(resource)) return 0;
         u32 allocated = 0;
         while (allocated < pages) {
             paddr_t physical = pmm_alloc_page();
@@ -678,6 +702,7 @@ static struct kernel_object *page_allocate_locked(u32 pages, int shared) {
         }
         if (allocated != pages) {
             while (allocated) pmm_free_page(resource->physical[--allocated]);
+            page_map_close(resource);
             return 0;
         }
         resource->pages = pages;
@@ -692,6 +717,7 @@ static struct kernel_object *page_allocate_locked(u32 pages, int shared) {
         if (!object) {
             for (u32 page = 0; page < pages; page++)
                 pmm_free_page(resource->physical[page]);
+            page_map_close(resource);
             resource->active = 0;
             resource->pages = 0;
         }
