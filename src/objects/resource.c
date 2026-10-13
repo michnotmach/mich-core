@@ -11,6 +11,8 @@ static struct dma_resource dma_resources[RESOURCE_DMA_MAX];
 static struct pci_resource pci_resources[RESOURCE_PCI_MAX];
 static struct msix_table_resource msix_resources[RESOURCE_MSIX_MAX];
 static struct page_resource page_resources[RESOURCE_PAGE_MAX];
+// Where the next page slot search starts. Guarded by resource_klock.
+static u32 page_scan;
 static struct sg_resource sg_resources[RESOURCE_SG_MAX];
 static irq_mask_backend_fn irq_mask_backends[IRQ_CONTROLLER_MAX];
 static irq_release_backend_fn irq_release_backends[IRQ_CONTROLLER_MAX];
@@ -309,6 +311,7 @@ void resource_init(void) {
         pci_resources[index].active = 0;
     for (u32 index = 0; index < RESOURCE_MSIX_MAX; index++)
         msix_resources[index].active = 0;
+    page_scan = 0;
     for (u32 index = 0; index < RESOURCE_PAGE_MAX; index++) {
         page_resources[index].physical = 0;
         page_resources[index].active = 0;
@@ -690,9 +693,19 @@ int page_resource_set_revoke_backend(page_revoke_backend_fn revoke) {
 
 static struct kernel_object *page_allocate_locked(u32 pages, int shared) {
     if (!pages || pages > RESOURCE_PAGE_PAGES_MAX) return 0;
-    for (u32 index = 0; index < RESOURCE_PAGE_MAX; index++) {
+    u32 index = page_scan;
+    for (u32 step = 0; step < RESOURCE_PAGE_MAX; step++) {
         struct page_resource *resource = &page_resources[index];
-        if (resource->active) continue;
+        u32 next = index + 1;
+        if (next == RESOURCE_PAGE_MAX) next = 0;
+        // Resuming where the last search stopped keeps allocation off the
+        // occupied prefix. A scan pinned to slot zero walks all of it on
+        // every call, which is free at 64 slots and costly at 4096.
+        page_scan = next;
+        if (resource->active) {
+            index = next;
+            continue;
+        }
         if (page_map_open(resource)) return 0;
         u32 allocated = 0;
         while (allocated < pages) {

@@ -9,7 +9,10 @@
 #define RESOURCE_DMA_MAX 32
 #define RESOURCE_PCI_MAX 64
 #define RESOURCE_MSIX_MAX 32
-#define RESOURCE_PAGE_MAX 64
+// Segments, not pages: 4096 matches what Linux defaults shmmni to, and the
+// slot is 32 bytes now that the page map is allocated, so the table costs
+// 128 KiB rather than the 16 MiB an inline map would have needed.
+#define RESOURCE_PAGE_MAX 4096
 #define RESOURCE_PAGE_PAGES_MAX 512
 #define RESOURCE_SG_MAX 32
 #define RESOURCE_SG_ENTRY_MAX 32
