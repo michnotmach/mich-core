@@ -12,7 +12,9 @@ if [ "$profile" = "dns" ]; then qemu_timeout=150; fi
 if [ "$profile" = "netbench" ]; then qemu_timeout=300; fi
 if [ "$profile" = "tcpwire" ]; then qemu_timeout=300; fi
 if [ "$profile" = "virtio-blk" ]; then qemu_timeout=120; fi
-if [ "$profile" = "tty" ]; then qemu_timeout=60; fi
+# The tty profile's passing run lands close to the old 60 second budget, which
+# truncated good runs on slower hosts mid-log rather than failing them.
+if [ "$profile" = "tty" ]; then qemu_timeout=120; fi
 if [ "$profile" = "nvme" ]; then qemu_timeout=300; fi
 if [ "$profile" = "msi-restart" ] || [ "$profile" = "msi-circuit" ] ||
    [ "$profile" = "msi-recovery" ]; then
