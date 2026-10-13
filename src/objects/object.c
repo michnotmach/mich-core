@@ -2,6 +2,7 @@
 #include "task.h"
 #include "posix_fd.h"
 #include "klock.h"
+#include "pmm.h"
 
 struct handle_slot {
     struct kernel_object *object;
@@ -9,8 +10,41 @@ struct handle_slot {
     u32 generation;
 };
 
-static struct kernel_object objects[KOBJECT_MAX];
+// One slab is one page. The free chain is per slab rather than global so an
+// emptied slab can be unlinked and its page handed back without walking any
+// other slab's free slots: the tree asserts that a test leaves the page
+// allocator exactly as it found it, so slabs are borrowed, not claimed.
+struct object_slab {
+    struct object_slab *next;
+    struct object_slab *prev;
+    struct kernel_object *free;
+    u32 live;
+    struct kernel_object slots[OBJECT_SLAB_SLOTS];
+};
+
+_Static_assert(sizeof(struct object_slab) <= PMM_PAGE_SIZE,
+               "an object slab must fit inside one page");
+
+static struct object_slab *object_slabs;
+static struct object_slab *object_room;
+static u32 object_slab_count;
 static struct handle_slot handles[MAX_TASKS][KHANDLE_MAX];
+
+// A slab is page aligned and exactly one page long, so the header is found by
+// masking rather than by a search. The mask is widened before the complement:
+// inverting a 32-bit constant would zero every address bit above 4 GiB.
+static struct object_slab *object_slab_of(const struct kernel_object *object) {
+    return (struct object_slab *)((uptr_t)object &
+                                   ~((uptr_t)PMM_PAGE_SIZE - 1u));
+}
+
+static void object_slab_unlink(struct object_slab *slab) {
+    if (slab->prev) slab->prev->next = slab->next;
+    else object_slabs = slab->next;
+    if (slab->next) slab->next->prev = slab->prev;
+    slab->next = 0;
+    slab->prev = 0;
+}
 
 // S2's transitional cover for the object table, the handle tables and the
 // refcounts. A destroy callback runs outside it: releasing a vfs file
@@ -44,14 +78,37 @@ static struct handle_slot *handle_slot_for(struct task *task, u32 handle) {
     return slot;
 }
 
-void object_init(void) {
-    for (u32 index = 0; index < KOBJECT_MAX; index++) {
-        objects[index].type = KOBJECT_NONE;
-        objects[index].references = 0;
-        objects[index].value = 0;
-        objects[index].destroy = 0;
-        objects[index].active = 0;
+static int object_slab_grow(void) {
+    if (object_slab_count == OBJECT_SLAB_MAX) return -1;
+    paddr_t page = pmm_alloc_page();
+    if (!page) return -1;
+    struct object_slab *slab = (struct object_slab *)(uptr_t)page;
+    slab->free = 0;
+    slab->live = 0;
+    for (u32 index = 0; index < OBJECT_SLAB_SLOTS; index++) {
+        struct kernel_object *object = &slab->slots[index];
+        object->type = KOBJECT_NONE;
+        object->references = 0;
+        object->destroy = 0;
+        object->active = 0;
+        // An inactive slot has no owner to read value, so the free link rides
+        // there; object_create overwrites it before handing the slot out.
+        object->value = (u64)(uptr_t)slab->free;
+        slab->free = object;
     }
+    slab->next = object_slabs;
+    slab->prev = 0;
+    if (object_slabs) object_slabs->prev = slab;
+    object_slabs = slab;
+    object_room = slab;
+    object_slab_count++;
+    return 0;
+}
+
+void object_init(void) {
+    object_slabs = 0;
+    object_room = 0;
+    object_slab_count = 0;
     for (u32 owner = 0; owner < MAX_TASKS; owner++) {
         for (u32 index = 0; index < KHANDLE_MAX; index++) {
             handles[owner][index].object = 0;
@@ -65,19 +122,37 @@ struct kernel_object *object_create(u32 type, u64 value,
                                     object_destroy_fn destroy) {
     if (type == KOBJECT_NONE) return 0;
     klock_acquire(&object_klock);
-    for (u32 index = 0; index < KOBJECT_MAX; index++) {
-        struct kernel_object *object = &objects[index];
-        if (object->active) continue;
-        object->type = type;
-        object->references = 1;
-        object->value = value;
-        object->destroy = destroy;
-        object->active = 1;
-        klock_release(&object_klock);
-        return object;
+    struct object_slab *slab = object_room;
+    if (!slab || !slab->free) {
+        slab = 0;
+        for (struct object_slab *scan = object_slabs; scan; scan = scan->next)
+            if (scan->free) {
+                slab = scan;
+                break;
+            }
+        // Growing reaches the page allocator from inside the object lock,
+        // which the lock order allows: the allocator sits at the deeper level.
+        if (!slab && object_slab_grow()) {
+            klock_release(&object_klock);
+            return 0;
+        }
+        if (!slab) slab = object_room;
     }
+    struct kernel_object *object = slab->free;
+    if (!object) {
+        klock_release(&object_klock);
+        return 0;
+    }
+    slab->free = (struct kernel_object *)(uptr_t)object->value;
+    slab->live++;
+    object_room = slab->free ? slab : 0;
+    object->type = type;
+    object->references = 1;
+    object->value = value;
+    object->destroy = destroy;
+    object->active = 1;
     klock_release(&object_klock);
-    return 0;
+    return object;
 }
 
 static int object_retain_locked(struct kernel_object *object) {
@@ -119,8 +194,19 @@ void object_release(struct kernel_object *object) {
     if (destroy) destroy(object);
     klock_acquire(&object_klock);
     object->type = KOBJECT_NONE;
-    object->value = 0;
     object->active = 0;
+    struct object_slab *slab = object_slab_of(object);
+    object->value = (u64)(uptr_t)slab->free;
+    slab->free = object;
+    // A slab whose last object just died holds nothing but free slots, so its
+    // page goes back. The destroy callback above is the only holder of a
+    // pointer into the slab and it has already returned.
+    if (!--slab->live) {
+        object_slab_unlink(slab);
+        object_slab_count--;
+        if (object_room == slab) object_room = 0;
+        pmm_free_page((paddr_t)(uptr_t)slab);
+    }
     klock_release(&object_klock);
 }
 
@@ -248,8 +334,9 @@ void handle_close_all(struct task *task) {
 u32 object_active_count(void) {
     u32 count = 0;
     klock_acquire(&object_klock);
-    for (u32 index = 0; index < KOBJECT_MAX; index++)
-        if (objects[index].active) count++;
+    for (struct object_slab *slab = object_slabs; slab; slab = slab->next)
+        for (u32 index = 0; index < OBJECT_SLAB_SLOTS; index++)
+            if (slab->slots[index].active) count++;
     klock_release(&object_klock);
     return count;
 }

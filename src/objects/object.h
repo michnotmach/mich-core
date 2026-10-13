@@ -3,7 +3,14 @@
 
 #include "types.h"
 
-#define KOBJECT_MAX 128
+// The object table grows a slab at a time out of the page allocator, so the
+// bound is a ceiling on memory rather than a fixed table. An object's address
+// is its identity for every holder, so a slab that has ever backed one can
+// never move or be returned; the ceiling is what keeps a runaway create loop
+// from taking the whole machine's pages.
+#define OBJECT_SLAB_SLOTS 127u
+#define OBJECT_SLAB_MAX 64u
+#define KOBJECT_MAX (OBJECT_SLAB_MAX * OBJECT_SLAB_SLOTS)
 #define KHANDLE_MAX 32
 
 #define KOBJECT_NONE 0
