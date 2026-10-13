@@ -5,7 +5,7 @@
 #include "scheduler.h"
 #include "irq.h"
 
-#define PAGE_SIZE 4096
+#define PAGE_SIZE PMM_PAGE_SIZE
 #define BITMAP_SIZE 0x20000
 #define BITMAP_BITS (BITMAP_SIZE * 8)
 #define E820_USABLE 1

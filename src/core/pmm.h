@@ -3,6 +3,10 @@
 
 #include "types.h"
 
+// The unit every pmm_alloc_* call hands out. A caller that sizes a structure
+// to a page needs the allocator's own number rather than a second copy of it.
+#define PMM_PAGE_SIZE 4096u
+
 void pmm_init(uptr_t mmap_addr, usize_t mmap_length, u32 entry_size,
               paddr_t kernel_end);
 void pmm_reserve(paddr_t addr, usize_t len);
