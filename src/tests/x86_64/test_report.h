@@ -115,6 +115,7 @@
 #define TEST_ID_TIME64 121
 #define TEST_ID_TASK_RUNTIME 122
 #define TEST_ID_EEVDF 123
+#define TEST_ID_BLAKE2B 124
 
 struct test_result64 {
     u32 id;

@@ -649,6 +649,7 @@ for marker in \
     "Mich test64: RTC civil date conversion pass" \
     "Mich x86_64: wall clock anchored" \
     "Mich test64: crc32c and little-endian helpers pass" \
+    "Mich test64: BLAKE2b pass" \
     "Mich test64: adytumfs superblock pass" \
     "Mich test64: adytumfs format pass" \
     "Mich test64: adytumfs block allocator pass" \

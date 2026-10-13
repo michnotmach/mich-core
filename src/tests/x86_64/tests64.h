@@ -46,6 +46,7 @@ int test_entropy64(void);
 int test_rtc64(void);
 int test_siphash64(void);
 int test_crc32c64(void);
+int test_blake2b64(void);
 int test_adytumfs_super64(void);
 int test_adytumfs_volume64(void);
 int test_adytumfs_alloc64(void);

@@ -87,6 +87,8 @@ int tests64_run(const struct test64_env *env) {
     serial64_write("Mich test64: SipHash-2-4 pass\n");
     if (test_report_record(TEST_ID_CRC32C, test_crc32c64())) return -1;
     serial64_write("Mich test64: crc32c and little-endian helpers pass\n");
+    if (test_report_record(TEST_ID_BLAKE2B, test_blake2b64())) return -1;
+    serial64_write("Mich test64: BLAKE2b pass\n");
     if (test_report_record(TEST_ID_ADYTUMFS_SUPER, test_adytumfs_super64()))
         return -1;
     serial64_write("Mich test64: adytumfs superblock pass\n");
