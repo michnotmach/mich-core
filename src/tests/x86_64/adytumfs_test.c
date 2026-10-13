@@ -792,22 +792,24 @@ int test_adytumfs_policy64(void) {
 
     // More reachable inodes than the mount's slot bound must fail the mount,
     // so the volume cannot silently drop files. Slot 0 of the table is
-    // unused, so a 512-sector volume carries 32 on-disk inodes, double the
-    // VFS bound, and the 17th reachable inode is placed by the format layer
-    // itself.
+    // unused, so the volume has to carry more on-disk inodes than the slot
+    // bound to make the overrun reachable at all: a 2304-sector volume gets
+    // nine table blocks and so outnumbers the bound, and the last reachable
+    // inode is placed by the format layer itself.
     {
-        struct kernel_object *dev = block_create(512, 0);
+        struct kernel_object *dev = block_create(2304, 0);
         struct kernel_object *point = root ?
             vfs_create(root, "policy", VFS_NODE_DIRECTORY) : 0;
         int ok = dev && point && !adytumfs_format(dev) &&
             !vfs_mount_adytumfs(point, dev);
         struct kernel_object *disk = ok ? vfs_lookup(root, "policy") : 0;
-        for (u32 index = 0; index < 15 && ok; index++) {
-            char label[4];
+        for (u32 index = 0; index < 127 && ok; index++) {
+            char label[5];
             label[0] = 'f';
-            label[1] = (char)('0' + index / 10);
-            label[2] = (char)('0' + index % 10);
-            label[3] = 0;
+            label[1] = (char)('0' + index / 100);
+            label[2] = (char)('0' + (index / 10) % 10);
+            label[3] = (char)('0' + index % 10);
+            label[4] = 0;
             struct kernel_object *node = disk ?
                 vfs_create(disk, label, VFS_NODE_REGULAR) : 0;
             ok = node != 0;

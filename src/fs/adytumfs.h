@@ -4,7 +4,7 @@
 #include "types.h"
 #include "object.h"
 
-#define ADYTUMFS_INODE_MAX 16
+#define ADYTUMFS_INODE_MAX 128
 #define ADYTUMFS_FILE_PAGES 256
 #define ADYTUMFS_FILE_SIZE_MAX (ADYTUMFS_FILE_PAGES * 4096u)
 

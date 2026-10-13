@@ -5,7 +5,7 @@
 #include "object.h"
 #include "resource.h"
 
-#define VFS_NODE_MAX 64
+#define VFS_NODE_MAX 512
 // Hard-link names beyond the primary dentry: one alias table entry per extra
 // name, shared by every filesystem the VFS fronts.
 #define VFS_ALIAS_MAX 16u
