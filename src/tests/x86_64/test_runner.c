@@ -98,6 +98,9 @@ int tests64_run(const struct test64_env *env) {
     if (test_report_record(TEST_ID_ADYTUMFS_ALLOC, test_adytumfs_alloc64()))
         return -1;
     serial64_write("Mich test64: adytumfs block allocator pass\n");
+    if (test_report_record(TEST_ID_ADYTUMFS_CAS, test_adytumfs_cas64()))
+        return -1;
+    serial64_write("Mich test64: adytumfs content addressed blocks pass\n");
     if (test_report_record(TEST_ID_ADYTUMFS_INODE, test_adytumfs_inode64()))
         return -1;
     serial64_write("Mich test64: adytumfs inode table pass\n");

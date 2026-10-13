@@ -653,6 +653,7 @@ for marker in \
     "Mich test64: adytumfs superblock pass" \
     "Mich test64: adytumfs format pass" \
     "Mich test64: adytumfs block allocator pass" \
+    "Mich test64: adytumfs content addressed blocks pass" \
     "Mich test64: adytumfs inode table pass" \
     "Mich test64: adytumfs extents pass" \
     "Mich test64: adytumfs directories pass" \
