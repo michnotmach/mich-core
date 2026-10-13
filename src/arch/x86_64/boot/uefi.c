@@ -33,9 +33,12 @@
 #define BLOB_BASE 0x6000000ULL
 // Kernel plus modules must fit below this. The task pool and the network test
 // arenas live in the kernel bss, so the ceiling has to leave room for both
-// while RAM above the bss stays allocatable; the same number sits in
-// mkuefi64.py, which refuses an oversized layout at build time.
-#define MODULE_LIMIT 0x4800000ULL
+// while RAM above the bss stays allocatable. Raising it costs no RAM: the
+// window it opens is allocator memory either way. It must stay clear of
+// BLOB_BASE or the module copy would overwrite the staging blob, so the gap
+// above it is what bounds the choice. The same number sits in mkuefi64.py,
+// which refuses an oversized layout at build time.
+#define MODULE_LIMIT 0x5800000ULL
 
 typedef u64 efi_status;
 typedef void *efi_handle;

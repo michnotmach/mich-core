@@ -8,7 +8,7 @@ BLOB_MAGIC = 0x424F4C42
 BASE = 0x100000
 # The loader lays the kernel and then the modules into low RAM; the ceiling
 # below is the loader's own (MODULE_LIMIT in src/arch/x86_64/boot/uefi.c).
-MODULE_LIMIT = 0x4800000
+MODULE_LIMIT = 0x5800000
 MAX_MODULES = 8
 
 ESP_TYPE = bytes.fromhex("28732ac11ff8d211ba4b00a0c93ec93b")
