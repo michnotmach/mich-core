@@ -400,6 +400,15 @@ static int wait_counter(volatile u64 *counter, u64 above) {
 // An ordinary task pinned to an AP: with the AP parked in ring 0 and its
 // tick masked, only the reschedule IPI can start it, and the AP picks it
 // out of the pool on its own.
+// Every branch of the pinned test is a separate timing assertion, so a bare
+// -1 says nothing about which one slipped. The marker names the branch.
+static int pinned_fail(u32 where) {
+    char buf[] = "Mich x86_64: SMP AP pinned fail at 0\n";
+    buf[sizeof(buf) - 3] = (char)('0' + where);
+    serial64_write(buf);
+    return -1;
+}
+
 static int test_smp64_pinned(void) {
     volatile u64 *counter = 0;
     u64 turns;
@@ -407,19 +416,19 @@ static int test_smp64_pinned(void) {
     u32 slot;
     if (smp64_pin_task(SMP64_AP, smp64_spin_stub, sizeof(smp64_spin_stub),
                        &slot, (u64 **)&counter))
-        return -1;
+        return pinned_fail(1);
     counter[0] = 0;
     apic64_delay_ms(20);
     if (counter[0] || smp64_cpu_current(SMP64_AP) != SMP64_CURRENT_NONE) {
         drop_pinned(slot, SMP64_AP);
-        return -1;
+        return pinned_fail(2);
     }
     if (smp64_resched_cpu(SMP64_AP) ||
         wait_counter(counter, 0) ||
         smp64_cpu_current(SMP64_AP) != slot ||
         task_pool[slot].state != TASK_RUNNING) {
         drop_pinned(slot, SMP64_AP);
-        return -1;
+        return pinned_fail(3);
     }
     // A second kick lands in ring 3: the frame is rewritten the way the
     // tick rewrites it and the same task keeps the CPU.
@@ -430,10 +439,10 @@ static int test_smp64_pinned(void) {
         counter[0] <= turns ||
         smp64_cpu_current(SMP64_AP) != slot) {
         drop_pinned(slot, SMP64_AP);
-        return -1;
+        return pinned_fail(4);
     }
-    if (drop_pinned(slot, SMP64_AP)) return -1;
-    if (smp64_cpu_current(SMP64_AP) != SMP64_CURRENT_NONE) return -1;
+    if (drop_pinned(slot, SMP64_AP)) return pinned_fail(5);
+    if (smp64_cpu_current(SMP64_AP) != SMP64_CURRENT_NONE) return pinned_fail(6);
     return 0;
 }
 
