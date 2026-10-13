@@ -156,6 +156,9 @@ $(BIN_DIR) $(BIN64) $(OBJ64) $(PORTABLE64_DIR) $(USER64_DIR) $(USER64_OBJ_DIR) $
 $(PORTABLE64_DIR)/%.o: $(CORE)/%.c | $(PORTABLE64_DIR)
 	$(CC) $(CFLAGS64) -Werror -c $< -o $@
 
+$(PORTABLE64_DIR)/%.o: $(CRYPTO)/%.c | $(PORTABLE64_DIR)
+	$(CC) $(CFLAGS64) -Werror -c $< -o $@
+
 $(PORTABLE64_DIR)/%.o: $(PROCESS)/%.c | $(PORTABLE64_DIR)
 	$(CC) $(CFLAGS64) -Werror -c $< -o $@
 
