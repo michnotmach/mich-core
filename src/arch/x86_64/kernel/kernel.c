@@ -1275,6 +1275,25 @@ int fork64(void) {
     return child->id;
 }
 
+// Both exec paths used to hand the new image a single stack page while spawn
+// handed out SPAWN_STACK_PAGES, so a frame that fit a spawned task walked off
+// the bottom of an exec'd one. The stack a task runs on must not depend on how
+// the task came to exist. Pages mapped here are owned by the space, so a caller
+// that destroys the space reclaims them; only a page that failed to map is
+// still ours to free.
+static int exec_stack_map(u32 space) {
+    for (u32 index = 0; index < SPAWN_STACK_PAGES; index++) {
+        paddr_t page = vm64_alloc_page();
+        if (!page) return -1;
+        if (vm64_map(space, VM64_STACK_TOP - (vaddr_t)(index + 1u) * 4096u,
+                     page, 1, 0)) {
+            vm64_free_page(page);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 int exec64(u64 path_address, u64 argument) {
     struct task *task = &task_pool[current_task_slot];
     struct task_context64 *context = &task_contexts[current_task_slot];
@@ -1310,9 +1329,7 @@ int exec64(u64 path_address, u64 argument) {
         object_release(node);
         return EINVAL;
     }
-    paddr_t stack = vm64_alloc_page();
-    if (!stack || vm64_map(space, VM64_STACK_TOP - 4096, stack, 1, 0)) {
-        if (stack) vm64_free_page(stack);
+    if (exec_stack_map(space)) {
         vm64_destroy_space(space);
         object_release(node);
         return ENOMEM;
@@ -1491,9 +1508,7 @@ int posix_execve64(u64 path_address, u64 argv_address, u64 envp_address) {
         spin_unlock(&posix_exec_stage.lock);
         return POSIX_PROCESS_EINVAL;
     }
-    paddr_t stack = vm64_alloc_page();
-    if (!stack || vm64_map(space, VM64_STACK_TOP - 4096, stack, 1, 0)) {
-        if (stack) vm64_free_page(stack);
+    if (exec_stack_map(space)) {
         vm64_destroy_space(space);
         object_release(node);
         spin_unlock(&posix_exec_stage.lock);
