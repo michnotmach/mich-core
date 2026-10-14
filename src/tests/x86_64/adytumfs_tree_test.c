@@ -552,3 +552,207 @@ int test_adytumfs_tree_gc64(void) {
         block_active_count() == devices;
     return valid ? 0 : -1;
 }
+
+// Read the level and entry count of whatever node a root names, so a test can
+// see the shape of the tree and not only its contents.
+static int root_shape(struct kernel_object *device,
+                      const struct adytumfs_superblock *super,
+                      struct adytumfs_cas *store,
+                      const u8 root[ADYTUMFS_CAS_HASH_SIZE], u8 *scratch,
+                      u32 *level, u32 *count) {
+    u64 number = 0;
+    if (adytumfs_cas_lookup(device, super, store, root, &number)) return -1;
+    if (adytumfs_data_read(device, super, number, scratch)) return -1;
+    *level = adytumfs_read_le32(scratch + 4);
+    *count = adytumfs_read_le32(scratch + 8);
+    return 0;
+}
+
+// Check the invariant the format states: every separator in a branch is
+// exactly the greatest key of the child below it. Routing survives a stale
+// separator, so only reading the nodes back can tell whether it was kept.
+static int separators_exact(struct kernel_object *device,
+                            const struct adytumfs_superblock *super,
+                            struct adytumfs_cas *store,
+                            const u8 root[ADYTUMFS_CAS_HASH_SIZE],
+                            u8 *scratch, u8 *child) {
+    u64 number = 0;
+    if (adytumfs_cas_lookup(device, super, store, root, &number)) return -1;
+    if (adytumfs_data_read(device, super, number, scratch)) return -1;
+    if (adytumfs_read_le32(scratch + 4) != 1u) return 1;
+    u32 count = adytumfs_read_le32(scratch + 8);
+    for (u32 index = 0; index < count; index++) {
+        const u8 *entry = scratch + ADYTUMFS_TREE_HEADER_SIZE +
+            index * ADYTUMFS_TREE_BRANCH_ENTRY_SIZE;
+        u64 at = 0;
+        if (adytumfs_cas_lookup(device, super, store,
+                                entry + ADYTUMFS_TREE_KEY_SIZE, &at))
+            return -1;
+        if (adytumfs_data_read(device, super, at, child)) return -1;
+        u32 entries = adytumfs_read_le32(child + 8);
+        if (!entries) return 0;
+        u32 stride = adytumfs_read_le32(child + 4)
+            ? ADYTUMFS_TREE_BRANCH_ENTRY_SIZE
+            : ADYTUMFS_TREE_LEAF_ENTRY_SIZE;
+        const u8 *last = child + ADYTUMFS_TREE_HEADER_SIZE +
+            (entries - 1u) * stride;
+        if (adytumfs_read_le64(last) != adytumfs_read_le64(entry) ||
+            adytumfs_read_le64(last + 8) != adytumfs_read_le64(entry + 8))
+            return 0;
+    }
+    return 1;
+}
+
+int test_adytumfs_tree_remove64(void) {
+    static struct adytumfs_cas store;
+    static u8 scratch[ADYTUMFS_BLOCK_SIZE];
+    struct adytumfs_superblock super;
+    struct adytumfs_tree_key key;
+    struct adytumfs_tree_value value;
+    struct adytumfs_tree_value found;
+    u32 objects = object_active_count();
+    u32 devices = block_active_count();
+    struct kernel_object *dev = block_create(4096, 0);
+    int valid = dev && adytumfs_make(dev) == 0 &&
+        adytumfs_block_read(dev, 0, scratch) == 0 &&
+        adytumfs_super_unpack(&super, scratch) == 0;
+    valid = valid && tree_index_empty(dev, &super, &store) == 0;
+
+    u8 root[ADYTUMFS_CAS_HASH_SIZE];
+    u8 next[ADYTUMFS_CAS_HASH_SIZE];
+    crypto_zero(root, ADYTUMFS_CAS_HASH_SIZE);
+
+    // Nothing to remove is a refusal, not a success: a caller removing an
+    // extent it believes is there has to hear that the tree disagrees.
+    key = key_at(1, 0);
+    valid = valid &&
+        adytumfs_tree_remove(dev, &super, &store, root, &key, next) != 0;
+
+    // One key in, one key out, and the tree is empty again rather than holding
+    // a node nothing can reach.
+    value_at(0, &value);
+    valid = valid &&
+        adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
+                             next) == 0;
+    for (u32 byte = 0; byte < ADYTUMFS_CAS_HASH_SIZE; byte++)
+        root[byte] = next[byte];
+    valid = valid &&
+        adytumfs_tree_remove(dev, &super, &store, root, &key, next) == 0 &&
+        adytumfs_tree_root_empty(next) == 1 &&
+        adytumfs_tree_lookup(dev, &super, &store, next, &key, &found) != 0;
+
+    // The empty root still takes an insert, so removing everything is not a
+    // one way trip.
+    valid = valid &&
+        adytumfs_tree_remove(dev, &super, &store, next, &key, root) != 0 &&
+        adytumfs_tree_insert(dev, &super, &store, next, &key, &value,
+                             root) == 0;
+
+    // Past leaf capacity, so the tree has a branch root and the removals below
+    // have separators to get wrong.
+    const u32 keys_total = ADYTUMFS_TREE_LEAF_MAX + 1u;
+    for (u32 byte = 0; byte < ADYTUMFS_CAS_HASH_SIZE; byte++)
+        next[byte] = root[byte];
+    for (u32 index = 1; index < keys_total; index++) {
+        for (u32 byte = 0; byte < ADYTUMFS_CAS_HASH_SIZE; byte++)
+            root[byte] = next[byte];
+        key = key_at(1, (u64)index * 4096u);
+        value_at(index, &value);
+        valid = valid &&
+            adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
+                                 next) == 0;
+    }
+    u32 level = 0;
+    u32 entries = 0;
+    valid = valid &&
+        root_shape(dev, &super, &store, next, scratch, &level, &entries) == 0 &&
+        level == 1u && entries == 2u;
+
+    // Removing the greatest key is the case that moves a separator: the parent
+    // stores the largest key of each subtree, so the entry above the one that
+    // went has to be rewritten or later lookups route into the wrong child.
+    u32 live = keys_total;
+    for (u32 byte = 0; byte < ADYTUMFS_CAS_HASH_SIZE; byte++)
+        root[byte] = next[byte];
+    key = key_at(1, (u64)(keys_total - 1u) * 4096u);
+    valid = valid &&
+        adytumfs_tree_remove(dev, &super, &store, root, &key, next) == 0;
+    live--;
+    // That key was the greatest in its subtree, so its parent's separator is
+    // the one entry a removal can leave behind stale.
+    static u8 child_node[ADYTUMFS_BLOCK_SIZE];
+    valid = valid &&
+        separators_exact(dev, &super, &store, next, scratch, child_node) == 1;
+    for (u32 index = 0; index < keys_total; index++) {
+        int gone = index == keys_total - 1u;
+        key = key_at(1, (u64)index * 4096u);
+        value_at(index, &value);
+        int hit = adytumfs_tree_lookup(dev, &super, &store, next, &key,
+                                       &found);
+        valid = valid && (gone ? hit != 0 : hit == 0) &&
+            (gone || (found.length == value.length &&
+                      found.flags == value.flags &&
+                      crypto_equal(found.hash, value.hash,
+                                   ADYTUMFS_CAS_HASH_SIZE)));
+    }
+
+    // A key that was never there is still refused now that the tree has depth,
+    // and the refusal leaves the root alone.
+    u8 before[ADYTUMFS_CAS_HASH_SIZE];
+    for (u32 byte = 0; byte < ADYTUMFS_CAS_HASH_SIZE; byte++)
+        before[byte] = next[byte];
+    key = key_at(1, 7u * 4096u + 1u);
+    valid = valid &&
+        adytumfs_tree_remove(dev, &super, &store, next, &key, root) != 0 &&
+        crypto_equal(root, before, ADYTUMFS_CAS_HASH_SIZE) == 0;
+
+    // Empty the whole of one subtree. The branch loses an entry, and a root
+    // left with a single child drops the level instead of keeping a branch
+    // that names one thing.
+    for (u32 byte = 0; byte < ADYTUMFS_CAS_HASH_SIZE; byte++)
+        root[byte] = next[byte];
+    for (u32 index = 0; index + 1u < live; index++) {
+        key = key_at(1, (u64)index * 4096u);
+        for (u32 byte = 0; byte < ADYTUMFS_CAS_HASH_SIZE; byte++)
+            next[byte] = root[byte];
+        valid = valid &&
+            adytumfs_tree_remove(dev, &super, &store, root, &key, next) == 0;
+        for (u32 byte = 0; byte < ADYTUMFS_CAS_HASH_SIZE; byte++)
+            root[byte] = next[byte];
+        valid = valid &&
+            separators_exact(dev, &super, &store, next, scratch,
+                             child_node) == 1;
+    }
+    live = 1;
+    key = key_at(1, (u64)(keys_total - 2u) * 4096u);
+    valid = valid &&
+        adytumfs_tree_lookup(dev, &super, &store, root, &key, &found) == 0 &&
+        root_shape(dev, &super, &store, root, scratch, &level, &entries) == 0 &&
+        level == 0u;
+
+    // The last key goes and the tree is empty, which is what a truncate to
+    // zero leaves behind.
+    valid = valid &&
+        adytumfs_tree_remove(dev, &super, &store, root, &key, next) == 0 &&
+        adytumfs_tree_root_empty(next) == 1;
+
+    // Dropping the superseded roots has to give every block back: nothing in a
+    // removed tree is reachable any more.
+    u64 held = tree_count(dev, &super, &store);
+    u32 remaining = 0;
+    valid = valid && held != (u64)-1 &&
+        adytumfs_tree_discard(dev, &super, &store, before, 512u,
+                              &remaining) == 0 &&
+        remaining == 0;
+    while (!remaining && held) {
+        u64 now = tree_count(dev, &super, &store);
+        if (now == held || now == (u64)-1) break;
+        held = now;
+    }
+
+    adytumfs_window_discard(dev);
+    if (dev) object_release(dev);
+    valid = valid && object_active_count() == objects &&
+        block_active_count() == devices;
+    return valid ? 0 : -1;
+}

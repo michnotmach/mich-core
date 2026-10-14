@@ -112,6 +112,10 @@ int tests64_run(const struct test64_env *env) {
                            test_adytumfs_tree_gc64()))
         return -1;
     serial64_write("Mich test64: adytumfs tree gc pass\n");
+    if (test_report_record(TEST_ID_ADYTUMFS_TREE_REMOVE,
+                           test_adytumfs_tree_remove64()))
+        return -1;
+    serial64_write("Mich test64: adytumfs tree remove pass\n");
     if (test_report_record(TEST_ID_ADYTUMFS_INDEX, test_adytumfs_index64()))
         return -1;
     serial64_write("Mich test64: adytumfs disk index pass\n");
