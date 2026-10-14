@@ -124,6 +124,14 @@ int tests64_run(const struct test64_env *env) {
                            test_adytumfs_tree_truncate64()))
         return -1;
     serial64_write("Mich test64: adytumfs tree truncate pass\n");
+    if (test_report_record(TEST_ID_ADYTUMFS_TREE_RECLAIM,
+                           test_adytumfs_tree_reclaim64()))
+        return -1;
+    serial64_write("Mich test64: adytumfs tree reclaim pass\n");
+    if (test_report_record(TEST_ID_ADYTUMFS_TREE_BUDGET,
+                           test_adytumfs_tree_budget64()))
+        return -1;
+    serial64_write("Mich test64: adytumfs tree budget pass\n");
     if (test_report_record(TEST_ID_ADYTUMFS_INDEX, test_adytumfs_index64()))
         return -1;
     serial64_write("Mich test64: adytumfs disk index pass\n");

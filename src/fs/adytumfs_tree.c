@@ -284,20 +284,22 @@ static int tree_store(struct kernel_object *device,
     if (adytumfs_tree_node_hash(block, hash)) return -1;
     u64 number = 0;
     if (adytumfs_cas_place(device, super, store, hash, &number)) return -1;
-    // A branch holds a reference on every child it names, taken here rather
-    // than at each pack site so that no new store can forget it. Without this
-    // the count says how often a node was written rather than how many parents
+    // A node holds a reference on everything it names, taken here rather than
+    // at each pack site so that no new store can forget it. Without this the
+    // count says how often a node was written rather than how many parents
     // reach it, and a discard frees subtrees the committed root still uses.
-    if (adytumfs_read_le32(block + 4) == 1u) {
-        u32 count = adytumfs_read_le32(block + 8);
-        for (u32 index = 0; index < count; index++)
-            if (adytumfs_cas_retain(device, super, store,
-                                    block + ADYTUMFS_TREE_HEADER_SIZE +
-                                        index *
-                                            ADYTUMFS_TREE_BRANCH_ENTRY_SIZE +
-                                        ADYTUMFS_TREE_KEY_SIZE))
-                return -1;
-    }
+    // For a leaf the things named are the contents its entries point at, and
+    // the rule is the same: an entry that names content is a reason to keep
+    // it, so dropping the last entry has to be what lets the content go.
+    u32 level = adytumfs_read_le32(block + 4);
+    u32 count = adytumfs_read_le32(block + 8);
+    u32 stride = level ? ADYTUMFS_TREE_BRANCH_ENTRY_SIZE
+                       : ADYTUMFS_TREE_LEAF_ENTRY_SIZE;
+    for (u32 index = 0; index < count; index++)
+        if (adytumfs_cas_retain(device, super, store,
+                                block + ADYTUMFS_TREE_HEADER_SIZE +
+                                    index * stride + ADYTUMFS_TREE_KEY_SIZE))
+            return -1;
     return adytumfs_data_write(device, super, number, block);
 }
 
@@ -903,22 +905,33 @@ static int discard_run(struct kernel_object *device,
         if (level > 1u) return -1;
         if (adytumfs_tree_node_check(tree_node, level)) return -1;
         u32 count = adytumfs_read_le32(tree_node + 8);
-        // Children are copied out before the release, because dropping the
-        // last reference hands the block back to the allocator and the next
-        // allocation is free to overwrite it.
-        if (level) {
-            for (u32 index = 0; index < count; index++)
-                hash_copy(children[index],
-                          tree_node + ADYTUMFS_TREE_HEADER_SIZE +
-                              index * ADYTUMFS_TREE_BRANCH_ENTRY_SIZE +
-                              ADYTUMFS_TREE_KEY_SIZE);
-        }
+        // Whatever the node names is copied out before the release, because
+        // dropping the last reference hands the block back to the allocator
+        // and the next allocation is free to overwrite it.
+        for (u32 index = 0; index < count; index++)
+            hash_copy(children[index],
+                      tree_node + ADYTUMFS_TREE_HEADER_SIZE +
+                          index * (level ? ADYTUMFS_TREE_BRANCH_ENTRY_SIZE
+                                         : ADYTUMFS_TREE_LEAF_ENTRY_SIZE) +
+                          ADYTUMFS_TREE_KEY_SIZE);
         if (adytumfs_cas_release(device, super, store, hash)) return -1;
         spent++;
-        // Only a node whose last reference just went takes its children with
+        // Only a node whose last reference just went takes what it named with
         // it. One still held elsewhere belongs to that holder, and a later
         // pass over it will see refs reach one and descend then.
-        if (refs != 1u || !level) continue;
+        if (refs != 1u) continue;
+        // A leaf names contents rather than children, and the release is the
+        // same act: this was the last entry pointing at them, so the blocks
+        // go back to the pool. Skipping this would leak every block a file
+        // ever overwrote or truncated away, which is most of them.
+        if (!level) {
+            for (u32 index = 0; index < count; index++) {
+                if (adytumfs_cas_release(device, super, store, children[index]))
+                    return -1;
+                spent++;
+            }
+            continue;
+        }
         for (u32 index = 0; index < count; index++) {
             if (discard_top >= ADYTUMFS_TREE_DISCARD_STACK) return -1;
             if (depth + 1u > ADYTUMFS_TREE_DEPTH_MAX) return -1;

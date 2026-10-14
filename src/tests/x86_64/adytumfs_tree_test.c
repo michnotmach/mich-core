@@ -25,13 +25,45 @@ static struct adytumfs_tree_key key_end(u64 end) {
 }
 
 // Deterministic filler so a round trip that drops or reorders a byte shows up
-// as a mismatch rather than as two matching zero pages.
+// as a mismatch rather than as two matching zero pages. For the tests that
+// only pack and unpack a node in memory this is enough, because nothing there
+// resolves the hash.
 static void value_at(u32 index, struct adytumfs_tree_value *value) {
     u8 seed[4];
     for (u32 byte = 0; byte < 4; byte++)
         seed[byte] = (u8)(index >> (byte * 8));
     blake2b(value->hash, ADYTUMFS_CAS_HASH_SIZE, seed, 4);
     value->length = ADYTUMFS_BLOCK_SIZE;
+}
+
+// The same, but the content is really written and the mapping really exists.
+// A leaf holds a reference on every content its entries name, so an entry
+// pointing at a hash nobody placed makes the insert fail at the retain. That
+// is the rule working: before the tree carried real extents nothing checked
+// that a value named anything at all.
+static int value_place(struct kernel_object *dev,
+                       struct adytumfs_superblock *super,
+                       struct adytumfs_cas *store, u32 seed,
+                       struct adytumfs_tree_value *value) {
+    // The seed goes in whole, in its own bytes. A filler of seed * 31 + index
+    // truncated to a byte repeats every 256 seeds, and two entries that hash
+    // alike are one block, which quietly changes what a count assertion
+    // expects. Deduplication working is not a reason for the test to be
+    // ambiguous about it.
+    static u8 content[ADYTUMFS_BLOCK_SIZE];
+    for (u32 index = 0; index < ADYTUMFS_BLOCK_SIZE; index++)
+        content[index] = (u8)(index * 7u + 1u);
+    content[0] = (u8)seed;
+    content[1] = (u8)(seed >> 8);
+    content[2] = (u8)(seed >> 16);
+    content[3] = (u8)(seed >> 24);
+    if (blake2b(value->hash, ADYTUMFS_CAS_HASH_SIZE, content,
+                ADYTUMFS_BLOCK_SIZE))
+        return -1;
+    value->length = ADYTUMFS_BLOCK_SIZE;
+    u64 number = 0;
+    if (adytumfs_cas_place(dev, super, store, value->hash, &number)) return -1;
+    return adytumfs_data_write(dev, super, number, content);
 }
 
 // The tree resolves a node by hash, so it runs against the index mkfs
@@ -324,7 +356,7 @@ int test_adytumfs_tree_traverse64(void) {
     // special case before the first insert.
     crypto_zero(root, ADYTUMFS_CAS_HASH_SIZE);
     key = key_at(0);
-    value_at(0, &value);
+    value_place(dev, &super, &store, 0, &value);
     valid = valid && adytumfs_tree_root_empty(root) == 1 &&
         adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
                              next) == 0 &&
@@ -346,14 +378,14 @@ int test_adytumfs_tree_traverse64(void) {
         for (u32 byte = 0; byte < ADYTUMFS_CAS_HASH_SIZE; byte++)
             root[byte] = next[byte];
         key = key_at(index);
-        value_at(index, &value);
+        value_place(dev, &super, &store, index, &value);
         valid = valid &&
             adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
                                  next) == 0;
     }
     for (u32 index = 0; index <= ADYTUMFS_TREE_LEAF_MAX; index++) {
         key = key_at(index);
-        value_at(index, &value);
+        value_place(dev, &super, &store, index, &value);
         valid = valid &&
             adytumfs_tree_lookup(dev, &super, &store, next, &key,
                                  &found) == 0 &&
@@ -376,14 +408,14 @@ int test_adytumfs_tree_traverse64(void) {
         root[byte] = next[byte];
     }
     key = key_at(0);
-    value_at(0, &value);
+    value_place(dev, &super, &store, 0, &value);
     valid = valid &&
         adytumfs_tree_insert(dev, &super, &store, snapshot, &key, &value,
                              next) == 0;
     key = key_at(9u * ADYTUMFS_TREE_LEAF_MAX);
     valid = valid &&
         adytumfs_tree_lookup(dev, &super, &store, next, &key, &found) != 0;
-    value_at(99, &value);
+    value_place(dev, &super, &store, 99, &value);
     valid = valid &&
         adytumfs_tree_insert(dev, &super, &store, next, &key, &value,
                              next) == 0 &&
@@ -399,14 +431,14 @@ int test_adytumfs_tree_traverse64(void) {
         for (u32 byte = 0; byte < ADYTUMFS_CAS_HASH_SIZE; byte++)
             root[byte] = next[byte];
         key = key_at(ADYTUMFS_TREE_LEAF_MAX + index);
-        value_at(index + 1000u, &value);
+        value_place(dev, &super, &store, index + 1000u, &value);
         valid = valid &&
             adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
                                  next) == 0;
     }
     for (u32 index = 0; index < ADYTUMFS_TREE_LEAF_MAX; index++) {
         key = key_at(ADYTUMFS_TREE_LEAF_MAX + index);
-        value_at(index + 1000u, &value);
+        value_place(dev, &super, &store, index + 1000u, &value);
         valid = valid &&
             adytumfs_tree_lookup(dev, &super, &store, next, &key,
                                  &found) == 0 &&
@@ -415,7 +447,7 @@ int test_adytumfs_tree_traverse64(void) {
 
     // Replacing a key changes the value and leaves the key set alone.
     key = key_at(3u * ADYTUMFS_TREE_LEAF_MAX);
-    value_at(1234, &value);
+    value_place(dev, &super, &store, 1234, &value);
     valid = valid &&
         adytumfs_tree_insert(dev, &super, &store, next, &key, &value,
                              next) == 0 &&
@@ -481,7 +513,7 @@ int test_adytumfs_tree_gc64(void) {
 
     for (u32 index = 0; index < ADYTUMFS_TREE_LEAF_MAX; index++) {
         key = key_at(index);
-        value_at(index, &value);
+        value_place(dev, &super, &store, index, &value);
         valid = valid &&
             adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
                                  next) == 0 &&
@@ -490,22 +522,27 @@ int test_adytumfs_tree_gc64(void) {
             left == 0;
         root_copy(root, next);
     }
-    // One full leaf and nothing else. Every intermediate version of the way
-    // here has been collected, which is what makes the count below a
-    // statement about the tree rather than about its history.
+    // One full leaf, plus the content each of its entries names. Every
+    // intermediate version of the way here has been collected, which is what
+    // makes the count below a statement about the tree rather than about its
+    // history. The content is part of that statement now: an entry that names
+    // a block is a reason to keep it, so a collected tree keeps exactly the
+    // blocks its live entries point at.
     u64 steady = tree_count(dev, &super, &store);
-    valid = valid && steady == 1u;
+    valid = valid && steady == ADYTUMFS_TREE_LEAF_MAX + 1u;
 
     // The point of the slice. Rewriting one key over and over has to leave the
     // table where it was. Without the discard every round leaked a node
     // version, and the table capped the whole tree at a few hundred writes.
     for (u32 round = 0; round < 60u; round++) {
         key = key_at(0);
-        value_at(1000u + round, &value);
+        value_place(dev, &super, &store, 1000u + round, &value);
         valid = valid &&
             adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
                                  next) == 0 &&
-            tree_count(dev, &super, &store) == steady + 1u &&
+            // A rewrite adds a node version and a block of new content, and
+            // the discard below takes back the old pair.
+            tree_count(dev, &super, &store) == steady + 2u &&
             adytumfs_tree_discard(dev, &super, &store, root, 64u,
                                   &left) == 0 &&
             left == 0 && tree_count(dev, &super, &store) == steady;
@@ -515,7 +552,7 @@ int test_adytumfs_tree_gc64(void) {
     // Nothing that is still reachable went with the garbage.
     for (u32 index = 0; index < ADYTUMFS_TREE_LEAF_MAX; index++) {
         key = key_at(index);
-        value_at(index ? index : 1059u, &value);
+        value_place(dev, &super, &store, index ? index : 1059u, &value);
         valid = valid &&
             adytumfs_tree_lookup(dev, &super, &store, root, &key,
                                  &found) == 0 &&
@@ -526,7 +563,7 @@ int test_adytumfs_tree_gc64(void) {
     // and has to leave the children the new root still points at alone.
     for (u32 index = 0; index < ADYTUMFS_TREE_LEAF_MAX; index++) {
         key = key_at(ADYTUMFS_TREE_LEAF_MAX + index);
-        value_at(index + 2000u, &value);
+        value_place(dev, &super, &store, index + 2000u, &value);
         valid = valid &&
             adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
                                  next) == 0 &&
@@ -537,13 +574,14 @@ int test_adytumfs_tree_gc64(void) {
     }
     // Splitting in half does not rebalance, so 102 keys land in four leaves
     // of 25, 25, 25 and 27 with the branch over them, and nothing else: every
-    // intermediate version of the way down has been collected.
+    // intermediate version of the way down has been collected. The second run
+    // brings its own content, so the store holds both runs' blocks.
     u64 grown = tree_count(dev, &super, &store);
-    valid = valid && grown == 5u;
+    valid = valid && grown == 2u * ADYTUMFS_TREE_LEAF_MAX + 5u;
 
     for (u32 round = 0; round < 20u; round++) {
         key = key_at(ADYTUMFS_TREE_LEAF_MAX);
-        value_at(3000u + round, &value);
+        value_place(dev, &super, &store, 3000u + round, &value);
         valid = valid &&
             adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
                                  next) == 0 &&
@@ -556,7 +594,7 @@ int test_adytumfs_tree_gc64(void) {
     // A budget that runs out stops the walk instead of finishing it, and a
     // second walk refuses rather than dropping the first one half done.
     key = key_at(ADYTUMFS_TREE_LEAF_MAX);
-    value_at(4000u, &value);
+    value_place(dev, &super, &store, 4000u, &value);
     valid = valid &&
         adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
                              next) == 0 &&
@@ -584,7 +622,7 @@ int test_adytumfs_tree_gc64(void) {
     valid = valid &&
         adytumfs_cas_acquire(dev, &super, &store, kept, &block) == 0;
     key = key_at(ADYTUMFS_TREE_LEAF_MAX + 1u);
-    value_at(5000u, &value);
+    value_place(dev, &super, &store, 5000u, &value);
     valid = valid &&
         adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
                              next) == 0;
@@ -602,7 +640,7 @@ int test_adytumfs_tree_gc64(void) {
     // A node that no longer hashes to what its parent promised is refused on
     // the way out too, not only on the way in.
     key = key_at(ADYTUMFS_TREE_LEAF_MAX);
-    value_at(6000u, &value);
+    value_place(dev, &super, &store, 6000u, &value);
     root_copy(kept, root);
     valid = valid &&
         adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
@@ -736,7 +774,7 @@ int test_adytumfs_tree_find64(void) {
     lengths[2] = 2u * ADYTUMFS_BLOCK_SIZE;
     for (u32 index = 0; valid && index < 3; index++) {
         key.end = ends[index];
-        value_at(index, &value);
+        value_place(dev, &super, &store, index, &value);
         value.length = lengths[index];
         valid = adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
                                      next) == 0;
@@ -745,7 +783,7 @@ int test_adytumfs_tree_find64(void) {
     valid = valid && tree_entries(dev, &super, &store, root) == 3;
 
     for (u32 index = 0; valid && index < 3; index++) {
-        value_at(index, &value);
+        value_place(dev, &super, &store, index, &value);
         value.length = lengths[index];
         u64 offsets[3];
         offsets[0] = ends[index] - lengths[index];
@@ -828,7 +866,7 @@ static int build_run(struct kernel_object *dev, struct adytumfs_superblock *supe
     crypto_zero(root, ADYTUMFS_CAS_HASH_SIZE);
     for (u64 index = 0; index < TRUNCATE_ENTRIES; index++) {
         key.end = entry_end(index);
-        value_at((u32)index, &value);
+        value_place(dev, super, store, (u32)index, &value);
         value.length = entry_len(index);
         if (adytumfs_tree_insert(dev, super, store, root, &key, &value, next))
             return -1;
@@ -917,6 +955,152 @@ static int check_cut(struct kernel_object *dev,
             return -1;
     }
     return 0;
+}
+
+// Dropping a tree has to give back the blocks its entries named, not only the
+// nodes. Counting them is the whole point: a leak here is invisible to every
+// other test because the tree still reads correctly, and it grows with every
+// overwrite and every truncation the filesystem ever does.
+int test_adytumfs_tree_reclaim64(void) {
+    static struct adytumfs_cas store;
+    static u8 scratch[ADYTUMFS_BLOCK_SIZE];
+    struct adytumfs_superblock super;
+    u32 objects = object_active_count();
+    u32 devices = block_active_count();
+    struct kernel_object *dev = block_create(4096, 0);
+    int valid = dev && adytumfs_make(dev) == 0 &&
+        adytumfs_block_read(dev, 0, scratch) == 0 &&
+        adytumfs_super_unpack(&super, scratch) == 0;
+    valid = valid && tree_index_empty(dev, &super, &store) == 0;
+
+    // The allocator's free count lives in the caller's copy of the superblock
+    // and only reaches the disk on a commit, so the store's own count is what
+    // this can observe.
+    u64 base_count = 0;
+    valid = valid && adytumfs_cas_count(dev, &super, &store, &base_count) == 0;
+
+    struct adytumfs_tree_key key;
+    struct adytumfs_tree_value value;
+    u8 root[ADYTUMFS_CAS_HASH_SIZE];
+    u8 next[ADYTUMFS_CAS_HASH_SIZE];
+    u8 previous[ADYTUMFS_CAS_HASH_SIZE];
+    crypto_zero(root, ADYTUMFS_CAS_HASH_SIZE);
+    const u32 entries = 20u;
+    u32 remaining = 0;
+    for (u32 index = 0; valid && index < entries; index++) {
+        // Letting go of the version an insert replaced is the caller's job,
+        // exactly as it is in the filesystem. Holding every version here
+        // instead would keep every block alive and prove nothing.
+        root_copy(previous, root);
+        key.end = (u64)(index + 1u) * ADYTUMFS_BLOCK_SIZE;
+        valid = value_place(dev, &super, &store, 7000u + index, &value) == 0 &&
+            adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
+                                 next) == 0;
+        root_copy(root, next);
+        if (valid && index)
+            valid = adytumfs_tree_discard(dev, &super, &store, previous, 4096u,
+                                          &remaining) == 0 && remaining == 0;
+    }
+    // Every entry names its own block, so the store holds the contents on top
+    // of the single leaf holding them.
+    u64 grown_count = 0;
+    valid = valid &&
+        adytumfs_cas_count(dev, &super, &store, &grown_count) == 0 &&
+        grown_count > base_count + entries;
+
+    valid = valid &&
+        adytumfs_tree_discard(dev, &super, &store, root, 4096u,
+                              &remaining) == 0 &&
+        remaining == 0;
+    // Nothing named anything any more, so nothing is left and the allocator
+    // has every block back.
+    u64 after_count = 0;
+    valid = valid &&
+        adytumfs_cas_count(dev, &super, &store, &after_count) == 0 &&
+        after_count == base_count;
+
+    adytumfs_window_discard(dev);
+    if (dev) object_release(dev);
+    valid = valid && object_active_count() == objects &&
+        block_active_count() == devices;
+    return valid ? 0 : -1;
+}
+
+// A discard gives back no more than the budget allows, and says so. Releasing
+// the contents a leaf names is work too, so it counts against the budget like
+// anything else; a walk that quietly overran its own limit would be a stall in
+// the caller that asked for a bounded step.
+int test_adytumfs_tree_budget64(void) {
+    static struct adytumfs_cas store;
+    static u8 scratch[ADYTUMFS_BLOCK_SIZE];
+    struct adytumfs_superblock super;
+    u32 objects = object_active_count();
+    u32 devices = block_active_count();
+    struct kernel_object *dev = block_create(4096, 0);
+    int valid = dev && adytumfs_make(dev) == 0 &&
+        adytumfs_block_read(dev, 0, scratch) == 0 &&
+        adytumfs_super_unpack(&super, scratch) == 0;
+    valid = valid && tree_index_empty(dev, &super, &store) == 0;
+
+    u64 base_count = 0;
+    valid = valid && adytumfs_cas_count(dev, &super, &store, &base_count) == 0;
+
+    // Past the leaf cap, so the root is a branch over two leaves and the walk
+    // has something still queued behind the leaf it is draining.
+    struct adytumfs_tree_key key;
+    struct adytumfs_tree_value value;
+    u8 root[ADYTUMFS_CAS_HASH_SIZE];
+    u8 next[ADYTUMFS_CAS_HASH_SIZE];
+    u8 previous[ADYTUMFS_CAS_HASH_SIZE];
+    crypto_zero(root, ADYTUMFS_CAS_HASH_SIZE);
+    u32 remaining = 0;
+    const u32 entries = ADYTUMFS_TREE_LEAF_MAX + 5u;
+    for (u32 index = 0; valid && index < entries; index++) {
+        root_copy(previous, root);
+        key.end = (u64)(index + 1u) * ADYTUMFS_BLOCK_SIZE;
+        valid = value_place(dev, &super, &store, 9000u + index, &value) == 0 &&
+            adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
+                                 next) == 0;
+        root_copy(root, next);
+        if (valid && index)
+            valid = adytumfs_tree_discard(dev, &super, &store, previous, 4096u,
+                                          &remaining) == 0 && remaining == 0;
+    }
+    u64 built = 0;
+    valid = valid && adytumfs_cas_count(dev, &super, &store, &built) == 0 &&
+        built > base_count + entries + 2u;
+
+    // One step takes the root and no more, so both children are still queued
+    // behind it. Counting the node itself is what makes that true.
+    valid = valid &&
+        adytumfs_tree_discard(dev, &super, &store, root, 1u, &remaining) == 0 &&
+        remaining == 2;
+    u64 part = 0;
+    valid = valid &&
+        adytumfs_cas_count(dev, &super, &store, &part) == 0 &&
+        part == built - 1u;
+
+    // Three more steps reach one leaf and run out inside its contents, which
+    // is the other half of the accounting: what a leaf names is work too.
+    valid = valid &&
+        adytumfs_tree_discard_resume(dev, &super, &store, 3u,
+                                     &remaining) == 0 && remaining == 1;
+
+    // The walk owns the stack until it finishes, so it is resumed rather than
+    // started again; a fresh discard is refused while one is in flight.
+    valid = valid &&
+        adytumfs_tree_discard_resume(dev, &super, &store, 4096u,
+                                     &remaining) == 0 && remaining == 0;
+    u64 after = 0;
+    valid = valid &&
+        adytumfs_cas_count(dev, &super, &store, &after) == 0 &&
+        after == base_count;
+
+    adytumfs_window_discard(dev);
+    if (dev) object_release(dev);
+    valid = valid && object_active_count() == objects &&
+        block_active_count() == devices;
+    return valid ? 0 : -1;
 }
 
 int test_adytumfs_tree_truncate64(void) {
@@ -1015,7 +1199,7 @@ int test_adytumfs_tree_remove64(void) {
 
     // One key in, one key out, and the tree is empty again rather than holding
     // a node nothing can reach.
-    value_at(0, &value);
+    value_place(dev, &super, &store, 0, &value);
     valid = valid &&
         adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
                              next) == 0;
@@ -1042,7 +1226,7 @@ int test_adytumfs_tree_remove64(void) {
         for (u32 byte = 0; byte < ADYTUMFS_CAS_HASH_SIZE; byte++)
             root[byte] = next[byte];
         key = key_at(index);
-        value_at(index, &value);
+        value_place(dev, &super, &store, index, &value);
         valid = valid &&
             adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
                                  next) == 0;
@@ -1071,7 +1255,7 @@ int test_adytumfs_tree_remove64(void) {
     for (u32 index = 0; index < keys_total; index++) {
         int gone = index == keys_total - 1u;
         key = key_at(index);
-        value_at(index, &value);
+        value_place(dev, &super, &store, index, &value);
         int hit = adytumfs_tree_lookup(dev, &super, &store, next, &key,
                                        &found);
         valid = valid && (gone ? hit != 0 : hit == 0) &&
