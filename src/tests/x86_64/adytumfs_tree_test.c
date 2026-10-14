@@ -347,3 +347,174 @@ int test_adytumfs_tree_traverse64(void) {
         block_active_count() == devices;
     return valid ? 0 : -1;
 }
+
+static void root_copy(u8 *to, const u8 *from) {
+    for (u32 byte = 0; byte < ADYTUMFS_CAS_HASH_SIZE; byte++)
+        to[byte] = from[byte];
+}
+
+int test_adytumfs_tree_gc64(void) {
+    static struct adytumfs_cas store;
+    static u8 scratch[ADYTUMFS_BLOCK_SIZE];
+    struct adytumfs_superblock super;
+    struct adytumfs_tree_key key;
+    struct adytumfs_tree_value value;
+    struct adytumfs_tree_value found;
+    u32 objects = object_active_count();
+    u32 devices = block_active_count();
+    struct kernel_object *dev = block_create(4096, 0);
+    int valid = dev && adytumfs_make(dev) == 0 &&
+        adytumfs_block_read(dev, 0, scratch) == 0 &&
+        adytumfs_super_unpack(&super, scratch) == 0;
+    adytumfs_cas_reset(&store);
+
+    u8 root[ADYTUMFS_CAS_HASH_SIZE];
+    u8 next[ADYTUMFS_CAS_HASH_SIZE];
+    u64 block = 0;
+    u32 left = 1u;
+
+    // An empty root has nothing to drop, and that is not an error the caller
+    // has to check for before the first commit.
+    crypto_zero(root, ADYTUMFS_CAS_HASH_SIZE);
+    valid = valid &&
+        adytumfs_tree_discard(dev, &super, &store, root, 64u, &left) == 0 &&
+        left == 0;
+
+    for (u32 index = 0; index < ADYTUMFS_TREE_LEAF_MAX; index++) {
+        key = key_at(1, (u64)index * 4096u);
+        value_at(index, &value);
+        valid = valid &&
+            adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
+                                 next) == 0 &&
+            adytumfs_tree_discard(dev, &super, &store, root, 64u,
+                                  &left) == 0 &&
+            left == 0;
+        root_copy(root, next);
+    }
+    // One full leaf and nothing else. Every intermediate version of the way
+    // here has been collected, which is what makes the count below a
+    // statement about the tree rather than about its history.
+    u32 steady = adytumfs_cas_count(&store);
+    valid = valid && steady == 1u;
+
+    // The point of the slice. Rewriting one key over and over has to leave the
+    // table where it was. Without the discard every round leaked a node
+    // version, and the table capped the whole tree at a few hundred writes.
+    for (u32 round = 0; round < 60u; round++) {
+        key = key_at(1, 0);
+        value_at(1000u + round, &value);
+        valid = valid &&
+            adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
+                                 next) == 0 &&
+            adytumfs_cas_count(&store) == steady + 1u &&
+            adytumfs_tree_discard(dev, &super, &store, root, 64u,
+                                  &left) == 0 &&
+            left == 0 && adytumfs_cas_count(&store) == steady;
+        root_copy(root, next);
+    }
+
+    // Nothing that is still reachable went with the garbage.
+    for (u32 index = 0; index < ADYTUMFS_TREE_LEAF_MAX; index++) {
+        key = key_at(1, (u64)index * 4096u);
+        value_at(index ? index : 1059u, &value);
+        valid = valid &&
+            adytumfs_tree_lookup(dev, &super, &store, root, &key,
+                                 &found) == 0 &&
+            found.length == value.length && found.flags == value.flags &&
+            crypto_equal(found.hash, value.hash, ADYTUMFS_CAS_HASH_SIZE);
+    }
+
+    // A second object grows the tree a level, so the discard walks a branch
+    // and has to leave the children the new root still points at alone.
+    for (u32 index = 0; index < ADYTUMFS_TREE_LEAF_MAX; index++) {
+        key = key_at(2, (u64)index * 4096u);
+        value_at(index + 2000u, &value);
+        valid = valid &&
+            adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
+                                 next) == 0 &&
+            adytumfs_tree_discard(dev, &super, &store, root, 64u,
+                                  &left) == 0 &&
+            left == 0;
+        root_copy(root, next);
+    }
+    // Splitting in half does not rebalance, so 92 keys land in three leaves
+    // with the branch over them, and nothing else: every intermediate version
+    // of the way down has been collected.
+    u32 grown = adytumfs_cas_count(&store);
+    valid = valid && grown == 4u;
+
+    for (u32 round = 0; round < 20u; round++) {
+        key = key_at(2, 0);
+        value_at(3000u + round, &value);
+        valid = valid &&
+            adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
+                                 next) == 0 &&
+            adytumfs_tree_discard(dev, &super, &store, root, 64u,
+                                  &left) == 0 &&
+            left == 0 && adytumfs_cas_count(&store) == grown;
+        root_copy(root, next);
+    }
+
+    // A budget that runs out stops the walk instead of finishing it, and a
+    // second walk refuses rather than dropping the first one half done.
+    key = key_at(2, 0);
+    value_at(4000u, &value);
+    valid = valid &&
+        adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
+                             next) == 0 &&
+        adytumfs_tree_discard(dev, &super, &store, root, 1u, &left) == 0 &&
+        left > 0 &&
+        adytumfs_tree_discard(dev, &super, &store, next, 64u, &left) != 0;
+    while (left) {
+        u32 before = left;
+        valid = valid &&
+            adytumfs_tree_discard_resume(dev, &super, &store, 4u,
+                                         &left) == 0 &&
+            left < before;
+    }
+    valid = valid && adytumfs_cas_count(&store) == grown;
+    root_copy(root, next);
+
+    // A held root is the snapshot case: while anything else references it,
+    // dropping the tree's own reference frees nothing at all.
+    u8 kept[ADYTUMFS_CAS_HASH_SIZE];
+    root_copy(kept, root);
+    valid = valid &&
+        adytumfs_cas_acquire(dev, &super, &store, kept, &block) == 0;
+    key = key_at(2, 4096u);
+    value_at(5000u, &value);
+    valid = valid &&
+        adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
+                             next) == 0;
+    u32 with_both = adytumfs_cas_count(&store);
+    valid = valid && with_both > grown &&
+        adytumfs_tree_discard(dev, &super, &store, root, 64u, &left) == 0 &&
+        left == 0 && adytumfs_cas_count(&store) == with_both;
+    root_copy(root, next);
+    // Letting go of the held root is what finally reclaims it, and only the
+    // part of it the committed tree does not share.
+    valid = valid &&
+        adytumfs_tree_discard(dev, &super, &store, kept, 64u, &left) == 0 &&
+        left == 0 && adytumfs_cas_count(&store) < with_both;
+
+    // A node that no longer hashes to what its parent promised is refused on
+    // the way out too, not only on the way in.
+    key = key_at(2, 0);
+    value_at(6000u, &value);
+    root_copy(kept, root);
+    valid = valid &&
+        adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
+                             next) == 0 &&
+        adytumfs_cas_lookup(&store, kept, &block) == 0 &&
+        adytumfs_data_read(dev, &super, block, scratch) == 0;
+    scratch[ADYTUMFS_TREE_HEADER_SIZE] ^= 0x01u;
+    valid = valid &&
+        adytumfs_data_write(dev, &super, block, scratch) == 0 &&
+        adytumfs_tree_discard(dev, &super, &store, kept, 64u, &left) != 0;
+
+    adytumfs_window_discard(dev);
+    if (dev) object_release(dev);
+    valid = valid && object_active_count() == objects &&
+        block_active_count() == devices;
+    return valid ? 0 : -1;
+}

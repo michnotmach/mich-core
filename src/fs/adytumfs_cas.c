@@ -63,6 +63,16 @@ int adytumfs_cas_lookup(const struct adytumfs_cas *store,
     return 0;
 }
 
+int adytumfs_cas_refs(const struct adytumfs_cas *store,
+                      const u8 hash[ADYTUMFS_CAS_HASH_SIZE], u32 *refs) {
+    if (!store || !hash || !refs) return -1;
+    int found = 0;
+    u32 index = cas_slot(store, hash, &found);
+    if (!found) return -1;
+    *refs = store->entries[index].refs;
+    return 0;
+}
+
 int adytumfs_cas_acquire(struct kernel_object *device,
                          struct adytumfs_superblock *super,
                          struct adytumfs_cas *store,
@@ -87,6 +97,41 @@ int adytumfs_cas_acquire(struct kernel_object *device,
     entry->live = ADYTUMFS_CAS_LIVE;
     store->count++;
     *block = start;
+    return 0;
+}
+
+int adytumfs_cas_place(struct kernel_object *device,
+                       struct adytumfs_superblock *super,
+                       struct adytumfs_cas *store,
+                       const u8 hash[ADYTUMFS_CAS_HASH_SIZE], u64 *block) {
+    if (!device || !super || !store || !hash || !block) return -1;
+    int found = 0;
+    u32 index = cas_slot(store, hash, &found);
+    if (found) {
+        *block = store->entries[index].block;
+        return 0;
+    }
+    if (index >= ADYTUMFS_CAS_SLOTS) return -1;
+    u64 start = 0;
+    if (adytumfs_alloc_run(device, super, 1, &start)) return -1;
+    struct adytumfs_cas_entry *entry = &store->entries[index];
+    for (u32 offset = 0; offset < ADYTUMFS_CAS_HASH_SIZE; offset++)
+        entry->hash[offset] = hash[offset];
+    entry->block = start;
+    entry->refs = 0;
+    entry->live = ADYTUMFS_CAS_LIVE;
+    store->count++;
+    *block = start;
+    return 0;
+}
+
+int adytumfs_cas_retain(struct adytumfs_cas *store,
+                        const u8 hash[ADYTUMFS_CAS_HASH_SIZE]) {
+    if (!store || !hash) return -1;
+    int found = 0;
+    u32 index = cas_slot(store, hash, &found);
+    if (!found) return -1;
+    store->entries[index].refs++;
     return 0;
 }
 

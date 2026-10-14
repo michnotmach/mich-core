@@ -272,7 +272,21 @@ static int tree_store(struct kernel_object *device,
                       u8 hash[ADYTUMFS_CAS_HASH_SIZE]) {
     if (adytumfs_tree_node_hash(block, hash)) return -1;
     u64 number = 0;
-    if (adytumfs_cas_acquire(device, super, store, hash, &number)) return -1;
+    if (adytumfs_cas_place(device, super, store, hash, &number)) return -1;
+    // A branch holds a reference on every child it names, taken here rather
+    // than at each pack site so that no new store can forget it. Without this
+    // the count says how often a node was written rather than how many parents
+    // reach it, and a discard frees subtrees the committed root still uses.
+    if (adytumfs_read_le32(block + 4) == 1u) {
+        u32 count = adytumfs_read_le32(block + 8);
+        for (u32 index = 0; index < count; index++)
+            if (adytumfs_cas_retain(store,
+                                    block + ADYTUMFS_TREE_HEADER_SIZE +
+                                        index *
+                                            ADYTUMFS_TREE_BRANCH_ENTRY_SIZE +
+                                        ADYTUMFS_TREE_KEY_SIZE))
+                return -1;
+    }
     return adytumfs_data_write(device, super, number, block);
 }
 
@@ -502,13 +516,13 @@ int adytumfs_tree_lookup(struct kernel_object *device,
     return 0;
 }
 
-int adytumfs_tree_insert(struct kernel_object *device,
-                         struct adytumfs_superblock *super,
-                         struct adytumfs_cas *store,
-                         const u8 root[ADYTUMFS_CAS_HASH_SIZE],
-                         const struct adytumfs_tree_key *key,
-                         const struct adytumfs_tree_value *value,
-                         u8 new_root[ADYTUMFS_CAS_HASH_SIZE]) {
+static int tree_insert(struct kernel_object *device,
+                       struct adytumfs_superblock *super,
+                       struct adytumfs_cas *store,
+                       const u8 root[ADYTUMFS_CAS_HASH_SIZE],
+                       const struct adytumfs_tree_key *key,
+                       const struct adytumfs_tree_value *value,
+                       u8 new_root[ADYTUMFS_CAS_HASH_SIZE]) {
     if (!device || !super || !store || !root || !key || !value || !new_root)
         return -1;
     if (adytumfs_tree_root_empty(root)) {
@@ -560,4 +574,112 @@ int adytumfs_tree_insert(struct kernel_object *device,
     hash_copy(children[1], below.right);
     if (adytumfs_tree_branch_pack(tree_node, 2u, keys, children)) return -1;
     return tree_store(device, super, store, tree_node, new_root);
+}
+
+struct adytumfs_tree_discard_item {
+    u8 hash[ADYTUMFS_CAS_HASH_SIZE];
+    u32 depth;
+};
+
+// Depth first over an explicit stack, because the walk is as deep as the tree
+// and a recursive one would put that depth on the kernel stack. The bound is
+// the worst case for depth first: every level leaves its other children
+// pending while one of them is descended into.
+#define ADYTUMFS_TREE_DISCARD_STACK \
+    (ADYTUMFS_TREE_DEPTH_MAX * ADYTUMFS_TREE_BRANCH_MAX)
+
+static struct adytumfs_tree_discard_item
+    discard_stack[ADYTUMFS_TREE_DISCARD_STACK];
+static u32 discard_top;
+
+static int discard_run(struct kernel_object *device,
+                       struct adytumfs_superblock *super,
+                       struct adytumfs_cas *store, u32 budget,
+                       u32 *remaining) {
+    static u8 children[ADYTUMFS_TREE_BRANCH_MAX][ADYTUMFS_CAS_HASH_SIZE];
+    u32 spent = 0;
+    while (discard_top && spent < budget) {
+        discard_top--;
+        u8 hash[ADYTUMFS_CAS_HASH_SIZE];
+        hash_copy(hash, discard_stack[discard_top].hash);
+        u32 depth = discard_stack[discard_top].depth;
+        u32 refs = 0;
+        if (adytumfs_cas_refs(store, hash, &refs)) return -1;
+        if (!refs) return -1;
+        if (tree_fetch(device, super, store, hash, tree_node)) return -1;
+        u32 level = adytumfs_read_le32(tree_node + 4);
+        if (level > 1u) return -1;
+        if (adytumfs_tree_node_check(tree_node, level)) return -1;
+        u32 count = adytumfs_read_le32(tree_node + 8);
+        // Children are copied out before the release, because dropping the
+        // last reference hands the block back to the allocator and the next
+        // allocation is free to overwrite it.
+        if (level) {
+            for (u32 index = 0; index < count; index++)
+                hash_copy(children[index],
+                          tree_node + ADYTUMFS_TREE_HEADER_SIZE +
+                              index * ADYTUMFS_TREE_BRANCH_ENTRY_SIZE +
+                              ADYTUMFS_TREE_KEY_SIZE);
+        }
+        if (adytumfs_cas_release(device, super, store, hash)) return -1;
+        spent++;
+        // Only a node whose last reference just went takes its children with
+        // it. One still held elsewhere belongs to that holder, and a later
+        // pass over it will see refs reach one and descend then.
+        if (refs != 1u || !level) continue;
+        for (u32 index = 0; index < count; index++) {
+            if (discard_top >= ADYTUMFS_TREE_DISCARD_STACK) return -1;
+            if (depth + 1u > ADYTUMFS_TREE_DEPTH_MAX) return -1;
+            hash_copy(discard_stack[discard_top].hash, children[index]);
+            discard_stack[discard_top].depth = depth + 1u;
+            discard_top++;
+        }
+    }
+    *remaining = discard_top;
+    return 0;
+}
+
+int adytumfs_tree_discard(struct kernel_object *device,
+                          struct adytumfs_superblock *super,
+                          struct adytumfs_cas *store,
+                          const u8 root[ADYTUMFS_CAS_HASH_SIZE],
+                          u32 budget, u32 *remaining) {
+    if (!device || !super || !store || !root || !remaining || !budget)
+        return -1;
+    // A walk already in flight owns the stack. Starting a second one would
+    // drop the first half finished and leak everything it had not reached.
+    if (discard_top) return -1;
+    if (adytumfs_tree_root_empty(root)) {
+        *remaining = 0;
+        return 0;
+    }
+    hash_copy(discard_stack[0].hash, root);
+    discard_stack[0].depth = 1u;
+    discard_top = 1u;
+    return discard_run(device, super, store, budget, remaining);
+}
+
+int adytumfs_tree_discard_resume(struct kernel_object *device,
+                                 struct adytumfs_superblock *super,
+                                 struct adytumfs_cas *store,
+                                 u32 budget, u32 *remaining) {
+    if (!device || !super || !store || !remaining || !budget) return -1;
+    return discard_run(device, super, store, budget, remaining);
+}
+
+int adytumfs_tree_insert(struct kernel_object *device,
+                         struct adytumfs_superblock *super,
+                         struct adytumfs_cas *store,
+                         const u8 root[ADYTUMFS_CAS_HASH_SIZE],
+                         const struct adytumfs_tree_key *key,
+                         const struct adytumfs_tree_value *value,
+                         u8 new_root[ADYTUMFS_CAS_HASH_SIZE]) {
+    if (tree_insert(device, super, store, root, key, value, new_root))
+        return -1;
+    // Every other node is reached through its parent, and the root's parent is
+    // whoever commits it, so the caller is handed a reference and drops it by
+    // discarding that root once a later one is committed. Without this the
+    // root would have no parent at all and the first discard would free the
+    // whole tree out from under whoever is holding it.
+    return adytumfs_cas_retain(store, new_root);
 }

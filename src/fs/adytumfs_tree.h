@@ -118,4 +118,20 @@ int adytumfs_tree_insert(struct kernel_object *device,
                          const struct adytumfs_tree_value *value,
                          u8 new_root[ADYTUMFS_CAS_HASH_SIZE]);
 
+// Drop every version that this root is the only reason to keep, which is what
+// makes a commit collect its own garbage instead of leaking a node per write.
+// budget caps the nodes one call touches, so dropping a large subtree cannot
+// stall a machine that is serving requests; remaining says what is left and
+// adytumfs_tree_discard_resume finishes the walk. A root held by a snapshot
+// simply has more than one reference, and then nothing below it dies.
+int adytumfs_tree_discard(struct kernel_object *device,
+                          struct adytumfs_superblock *super,
+                          struct adytumfs_cas *store,
+                          const u8 root[ADYTUMFS_CAS_HASH_SIZE],
+                          u32 budget, u32 *remaining);
+int adytumfs_tree_discard_resume(struct kernel_object *device,
+                                 struct adytumfs_superblock *super,
+                                 struct adytumfs_cas *store,
+                                 u32 budget, u32 *remaining);
+
 #endif

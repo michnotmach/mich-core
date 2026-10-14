@@ -119,6 +119,7 @@
 #define TEST_ID_ADYTUMFS_CAS 125
 #define TEST_ID_ADYTUMFS_TREE 126
 #define TEST_ID_ADYTUMFS_TREE_WALK 127
+#define TEST_ID_ADYTUMFS_TREE_GC 128
 
 struct test_result64 {
     u32 id;
