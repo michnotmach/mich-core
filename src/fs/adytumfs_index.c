@@ -192,6 +192,36 @@ int adytumfs_index_lookup(struct kernel_object *device,
     return 0;
 }
 
+int adytumfs_index_fetch(struct kernel_object *device,
+                         const struct adytumfs_superblock *super,
+                         const struct adytumfs_index *index,
+                         const u8 hash[ADYTUMFS_INDEX_HASH_SIZE], u64 *block,
+                         u32 *refs) {
+    if (!device || !super || !index || !hash || !block || !refs) return -1;
+    u8 entry[ADYTUMFS_INDEX_ENTRY_SIZE];
+    if (index_entry_fetch(device, super, index, hash, entry)) return -1;
+    *block = index_entry_number(entry);
+    *refs = index_entry_refs(entry);
+    return 0;
+}
+
+int adytumfs_index_repoint(struct kernel_object *device,
+                           const struct adytumfs_superblock *super,
+                           const struct adytumfs_index *index,
+                           const u8 hash[ADYTUMFS_INDEX_HASH_SIZE],
+                           u64 block) {
+    if (!device || !super || !index || !hash) return -1;
+    u64 slot = 0;
+    u64 reuse = 0;
+    int found = 0;
+    u8 entry[ADYTUMFS_INDEX_ENTRY_SIZE];
+    if (index_probe(device, super, index, hash, &slot, &found, &reuse, entry))
+        return -1;
+    if (!found) return -1;
+    adytumfs_write_le64(entry + ADYTUMFS_INDEX_HASH_SIZE, block);
+    return index_entry_write(device, super, index, slot, entry);
+}
+
 int adytumfs_index_refs(struct kernel_object *device,
                         const struct adytumfs_superblock *super,
                         const struct adytumfs_index *index,

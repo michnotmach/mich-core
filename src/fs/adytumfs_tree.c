@@ -255,7 +255,7 @@ static int tree_fetch(struct kernel_object *device,
                       struct adytumfs_cas *store,
                       const u8 hash[ADYTUMFS_CAS_HASH_SIZE], u8 *block) {
     u64 number = 0;
-    if (adytumfs_cas_lookup(store, hash, &number)) return -1;
+    if (adytumfs_cas_lookup(device, super, store, hash, &number)) return -1;
     if (adytumfs_data_read(device, super, number, block)) return -1;
     // Compare against the hash the parent stored. Skipping this would make
     // that hash decorative: a block silently holding something else would be
@@ -280,7 +280,7 @@ static int tree_store(struct kernel_object *device,
     if (adytumfs_read_le32(block + 4) == 1u) {
         u32 count = adytumfs_read_le32(block + 8);
         for (u32 index = 0; index < count; index++)
-            if (adytumfs_cas_retain(store,
+            if (adytumfs_cas_retain(device, super, store,
                                     block + ADYTUMFS_TREE_HEADER_SIZE +
                                         index *
                                             ADYTUMFS_TREE_BRANCH_ENTRY_SIZE +
@@ -604,7 +604,7 @@ static int discard_run(struct kernel_object *device,
         hash_copy(hash, discard_stack[discard_top].hash);
         u32 depth = discard_stack[discard_top].depth;
         u32 refs = 0;
-        if (adytumfs_cas_refs(store, hash, &refs)) return -1;
+        if (adytumfs_cas_refs(device, super, store, hash, &refs)) return -1;
         if (!refs) return -1;
         if (tree_fetch(device, super, store, hash, tree_node)) return -1;
         u32 level = adytumfs_read_le32(tree_node + 4);
@@ -681,5 +681,5 @@ int adytumfs_tree_insert(struct kernel_object *device,
     // discarding that root once a later one is committed. Without this the
     // root would have no parent at all and the first discard would free the
     // whole tree out from under whoever is holding it.
-    return adytumfs_cas_retain(store, new_root);
+    return adytumfs_cas_retain(device, super, store, new_root);
 }

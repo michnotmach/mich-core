@@ -24,6 +24,31 @@ static void value_at(u32 index, struct adytumfs_tree_value *value) {
     value->flags = index * 3u;
 }
 
+// The tree resolves a node by hash, so it needs a location index to run
+// against. The cache in front of it is only a cache, and this is where the
+// authority gets formatted.
+static int tree_index_open(struct kernel_object *device,
+                           struct adytumfs_superblock *super,
+                           struct adytumfs_cas *store, u64 blocks) {
+    struct adytumfs_index index;
+    u64 start = 0;
+    if (adytumfs_alloc_run(device, super, blocks, &start)) return -1;
+    adytumfs_index_init(&index, start, blocks);
+    if (adytumfs_index_format(device, super, &index)) return -1;
+    adytumfs_cas_open(store, start, blocks);
+    return 0;
+}
+
+// A failure has to be distinguishable from a real zero, so it reads as
+// something no live count can be.
+static u64 tree_count(struct kernel_object *device,
+                      const struct adytumfs_superblock *super,
+                      struct adytumfs_cas *store) {
+    u64 count = 0;
+    if (adytumfs_cas_count(device, super, store, &count)) return (u64)-1;
+    return count;
+}
+
 int test_adytumfs_tree64(void) {
     static u8 node[ADYTUMFS_BLOCK_SIZE];
     static u8 left[ADYTUMFS_BLOCK_SIZE];
@@ -213,7 +238,7 @@ int test_adytumfs_tree_traverse64(void) {
     int valid = dev && adytumfs_make(dev) == 0 &&
         adytumfs_block_read(dev, 0, scratch) == 0 &&
         adytumfs_super_unpack(&super, scratch) == 0;
-    adytumfs_cas_reset(&store);
+    valid = valid && tree_index_open(dev, &super, &store, 4) == 0;
 
     u8 root[ADYTUMFS_CAS_HASH_SIZE];
     u8 next[ADYTUMFS_CAS_HASH_SIZE];
@@ -265,7 +290,7 @@ int test_adytumfs_tree_traverse64(void) {
     // hanging off nothing.
     u64 root_block = 0;
     valid = valid &&
-        adytumfs_cas_lookup(&store, next, &root_block) == 0 &&
+        adytumfs_cas_lookup(dev, &super, &store, next, &root_block) == 0 &&
         adytumfs_data_read(dev, &super, root_block, scratch) == 0 &&
         adytumfs_read_le32(scratch + 4) == 1u &&
         adytumfs_read_le32(scratch + 8) == 2u;
@@ -332,7 +357,7 @@ int test_adytumfs_tree_traverse64(void) {
     // written, and walking it would hand back another file's data.
     key = key_at(1, 0);
     valid = valid &&
-        adytumfs_cas_lookup(&store, next, &root_block) == 0 &&
+        adytumfs_cas_lookup(dev, &super, &store, next, &root_block) == 0 &&
         adytumfs_data_read(dev, &super, root_block, scratch) == 0;
     scratch[ADYTUMFS_TREE_HEADER_SIZE] ^= 0x01u;
     valid = valid &&
@@ -366,7 +391,7 @@ int test_adytumfs_tree_gc64(void) {
     int valid = dev && adytumfs_make(dev) == 0 &&
         adytumfs_block_read(dev, 0, scratch) == 0 &&
         adytumfs_super_unpack(&super, scratch) == 0;
-    adytumfs_cas_reset(&store);
+    valid = valid && tree_index_open(dev, &super, &store, 4) == 0;
 
     u8 root[ADYTUMFS_CAS_HASH_SIZE];
     u8 next[ADYTUMFS_CAS_HASH_SIZE];
@@ -394,7 +419,7 @@ int test_adytumfs_tree_gc64(void) {
     // One full leaf and nothing else. Every intermediate version of the way
     // here has been collected, which is what makes the count below a
     // statement about the tree rather than about its history.
-    u32 steady = adytumfs_cas_count(&store);
+    u64 steady = tree_count(dev, &super, &store);
     valid = valid && steady == 1u;
 
     // The point of the slice. Rewriting one key over and over has to leave the
@@ -406,10 +431,10 @@ int test_adytumfs_tree_gc64(void) {
         valid = valid &&
             adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
                                  next) == 0 &&
-            adytumfs_cas_count(&store) == steady + 1u &&
+            tree_count(dev, &super, &store) == steady + 1u &&
             adytumfs_tree_discard(dev, &super, &store, root, 64u,
                                   &left) == 0 &&
-            left == 0 && adytumfs_cas_count(&store) == steady;
+            left == 0 && tree_count(dev, &super, &store) == steady;
         root_copy(root, next);
     }
 
@@ -440,7 +465,7 @@ int test_adytumfs_tree_gc64(void) {
     // Splitting in half does not rebalance, so 92 keys land in three leaves
     // with the branch over them, and nothing else: every intermediate version
     // of the way down has been collected.
-    u32 grown = adytumfs_cas_count(&store);
+    u64 grown = tree_count(dev, &super, &store);
     valid = valid && grown == 4u;
 
     for (u32 round = 0; round < 20u; round++) {
@@ -451,7 +476,7 @@ int test_adytumfs_tree_gc64(void) {
                                  next) == 0 &&
             adytumfs_tree_discard(dev, &super, &store, root, 64u,
                                   &left) == 0 &&
-            left == 0 && adytumfs_cas_count(&store) == grown;
+            left == 0 && tree_count(dev, &super, &store) == grown;
         root_copy(root, next);
     }
 
@@ -472,7 +497,7 @@ int test_adytumfs_tree_gc64(void) {
                                          &left) == 0 &&
             left < before;
     }
-    valid = valid && adytumfs_cas_count(&store) == grown;
+    valid = valid && tree_count(dev, &super, &store) == grown;
     root_copy(root, next);
 
     // A held root is the snapshot case: while anything else references it,
@@ -486,16 +511,16 @@ int test_adytumfs_tree_gc64(void) {
     valid = valid &&
         adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
                              next) == 0;
-    u32 with_both = adytumfs_cas_count(&store);
+    u64 with_both = tree_count(dev, &super, &store);
     valid = valid && with_both > grown &&
         adytumfs_tree_discard(dev, &super, &store, root, 64u, &left) == 0 &&
-        left == 0 && adytumfs_cas_count(&store) == with_both;
+        left == 0 && tree_count(dev, &super, &store) == with_both;
     root_copy(root, next);
     // Letting go of the held root is what finally reclaims it, and only the
     // part of it the committed tree does not share.
     valid = valid &&
         adytumfs_tree_discard(dev, &super, &store, kept, 64u, &left) == 0 &&
-        left == 0 && adytumfs_cas_count(&store) < with_both;
+        left == 0 && tree_count(dev, &super, &store) < with_both;
 
     // A node that no longer hashes to what its parent promised is refused on
     // the way out too, not only on the way in.
@@ -505,7 +530,7 @@ int test_adytumfs_tree_gc64(void) {
     valid = valid &&
         adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
                              next) == 0 &&
-        adytumfs_cas_lookup(&store, kept, &block) == 0 &&
+        adytumfs_cas_lookup(dev, &super, &store, kept, &block) == 0 &&
         adytumfs_data_read(dev, &super, block, scratch) == 0;
     scratch[ADYTUMFS_TREE_HEADER_SIZE] ^= 0x01u;
     valid = valid &&

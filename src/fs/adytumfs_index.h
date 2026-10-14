@@ -66,6 +66,24 @@ int adytumfs_index_lookup(struct kernel_object *device,
                           const u8 hash[ADYTUMFS_INDEX_HASH_SIZE],
                           u64 *block);
 
+// Both halves of an entry in one probe. The cache in front of this asks for
+// the location and the reference count together, and two lookups would walk
+// the same chain twice over the device.
+int adytumfs_index_fetch(struct kernel_object *device,
+                         const struct adytumfs_superblock *super,
+                         const struct adytumfs_index *index,
+                         const u8 hash[ADYTUMFS_INDEX_HASH_SIZE], u64 *block,
+                         u32 *refs);
+
+// Aim an existing mapping at a different block without disturbing its
+// reference count. This is the whole reason the location lives apart from the
+// content: moving a block is one entry here and no hash changes, so nothing
+// that points at the content has to be rewritten.
+int adytumfs_index_repoint(struct kernel_object *device,
+                           const struct adytumfs_superblock *super,
+                           const struct adytumfs_index *index,
+                           const u8 hash[ADYTUMFS_INDEX_HASH_SIZE], u64 block);
+
 int adytumfs_index_refs(struct kernel_object *device,
                         const struct adytumfs_superblock *super,
                         const struct adytumfs_index *index,
