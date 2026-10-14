@@ -7,7 +7,7 @@
 
 #define ADYTUMFS_TREE_MAGIC 0x54524533u
 #define ADYTUMFS_TREE_HEADER_SIZE 16u
-#define ADYTUMFS_TREE_KEY_SIZE 16u
+#define ADYTUMFS_TREE_KEY_SIZE 8u
 #define ADYTUMFS_TREE_CHILD_SIZE ADYTUMFS_CAS_HASH_SIZE
 #define ADYTUMFS_TREE_VALUE_SIZE (ADYTUMFS_CAS_HASH_SIZE + 8u)
 #define ADYTUMFS_TREE_LEAF_ENTRY_SIZE \
@@ -22,9 +22,8 @@
      ADYTUMFS_TREE_BRANCH_ENTRY_SIZE)
 
 // One CoW B-tree replaces the v2 inode table, the indirect fields and the
-// directory blocks. The key is (object, offset), so inodes are allocated
-// dynamically with no ceiling set at format time and a file reaches 2^64
-// without separate indirect levels.
+// directory blocks. Each file gets its own tree, so the key needs no owner
+// field and a file reaches 2^64 without separate indirect levels.
 //
 // Nothing in a node holds a physical block number. A branch entry names its
 // child by content hash and the location table resolves that hash to a block,
@@ -32,22 +31,32 @@
 // makes the tree self verifying: the parent promised the hash, so a child that
 // reads back different is corrupt, with no separate checksum region to consult.
 //
+// The key is the exclusive end of the entry's byte range, not its start. An
+// entry covers [end - length, end), so the block holding a query is the first
+// entry whose end is above it, and a plain lower bound search finds it with no
+// step back into the previous leaf. Keying by start would need the greatest
+// entry at or below the query, which can sit in the sibling to the left.
+// Strictly increasing ends are then also what makes the entries not overlap.
+//
 // The value carries a content hash rather than a block for the same reason.
-// Length is how many consecutive file blocks the entry covers, so a run of
-// identical blocks, in practice a run of zeroes, costs one entry.
+// Length counts the bytes the entry covers and the hash repeats every block
+// size of them, so a run of identical blocks, in practice a run of zeroes,
+// costs one entry. Both fields are byte counts and both are whole blocks;
+// packing refuses anything else, which is what makes a zero length entry, and
+// with it the v2 end of list sentinel, unrepresentable.
 struct adytumfs_tree_key {
-    u64 object_id;
-    u64 offset;
+    u64 end;
 };
 
 struct adytumfs_tree_value {
     u8 hash[ADYTUMFS_CAS_HASH_SIZE];
-    u32 length;
-    u32 flags;
+    u64 length;
 };
 
 // Pack and unpack one node. Packing is the only writer of the on-disk shape,
 // so the layout lives in one place instead of being open coded at each site.
+// Packing a leaf is also where the entry invariants are enforced, because a
+// leaf that violates them is a bug in this file and no reader can repair it.
 int adytumfs_tree_leaf_pack(u8 *block, u32 count,
                             const struct adytumfs_tree_key *keys,
                             const struct adytumfs_tree_value *values);

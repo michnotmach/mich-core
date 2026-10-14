@@ -13,25 +13,39 @@ static u32 level_capacity(u32 level) {
 
 static int key_equal(const struct adytumfs_tree_key *left,
                      const struct adytumfs_tree_key *right) {
-    return left->object_id == right->object_id &&
-           left->offset == right->offset;
+    return left->end == right->end;
 }
 
 static int key_less(const struct adytumfs_tree_key *left,
                     const struct adytumfs_tree_key *right) {
-    if (left->object_id != right->object_id)
-        return left->object_id < right->object_id;
-    return left->offset < right->offset;
+    return left->end < right->end;
 }
 
 static void write_key(u8 *entry, const struct adytumfs_tree_key *key) {
-    adytumfs_write_le64(entry, key->object_id);
-    adytumfs_write_le64(entry + 8, key->offset);
+    adytumfs_write_le64(entry, key->end);
 }
 
 static void read_key(const u8 *entry, struct adytumfs_tree_key *key) {
-    key->object_id = adytumfs_read_le64(entry);
-    key->offset = adytumfs_read_le64(entry + 8);
+    key->end = adytumfs_read_le64(entry);
+}
+
+// One leaf entry is [end - length, end) of the file, so the invariants below
+// are what make the entries tile the file without gaps in the accounting and
+// without overlap. They are checked on the write side because a leaf that
+// breaks them is a bug in this file, and no reader can repair one.
+static int leaf_entries_valid(u32 count,
+                              const struct adytumfs_tree_key *keys,
+                              const struct adytumfs_tree_value *values) {
+    u64 previous = 0;
+    for (u32 index = 0; index < count; index++) {
+        if (keys[index].end & (ADYTUMFS_BLOCK_SIZE - 1u)) return -1;
+        if (values[index].length & (ADYTUMFS_BLOCK_SIZE - 1u)) return -1;
+        if (values[index].length < ADYTUMFS_BLOCK_SIZE) return -1;
+        if (keys[index].end < values[index].length) return -1;
+        if (keys[index].end - values[index].length < previous) return -1;
+        previous = keys[index].end;
+    }
+    return 0;
 }
 
 static void write_header(u8 *block, u32 level, u32 count) {
@@ -67,16 +81,15 @@ int adytumfs_tree_leaf_pack(u8 *block, u32 count,
                             const struct adytumfs_tree_key *keys,
                             const struct adytumfs_tree_value *values) {
     if (!values) return -1;
+    if (leaf_entries_valid(count, keys, values)) return -1;
     if (node_pack(block, 0, count, keys)) return -1;
     for (u32 index = 0; index < count; index++) {
         u8 *entry = block + ADYTUMFS_TREE_HEADER_SIZE +
             index * ADYTUMFS_TREE_LEAF_ENTRY_SIZE + ADYTUMFS_TREE_KEY_SIZE;
         for (u32 byte = 0; byte < ADYTUMFS_CAS_HASH_SIZE; byte++)
             entry[byte] = values[index].hash[byte];
-        adytumfs_write_le32(entry + ADYTUMFS_CAS_HASH_SIZE,
+        adytumfs_write_le64(entry + ADYTUMFS_CAS_HASH_SIZE,
                             values[index].length);
-        adytumfs_write_le32(entry + ADYTUMFS_CAS_HASH_SIZE + 4,
-                            values[index].flags);
     }
     return 0;
 }
@@ -108,9 +121,7 @@ int adytumfs_tree_leaf_unpack(const u8 *block, u32 *count,
         const u8 *value = entry + ADYTUMFS_TREE_KEY_SIZE;
         for (u32 byte = 0; byte < ADYTUMFS_CAS_HASH_SIZE; byte++)
             values[index].hash[byte] = value[byte];
-        values[index].length = adytumfs_read_le32(value + ADYTUMFS_CAS_HASH_SIZE);
-        values[index].flags =
-            adytumfs_read_le32(value + ADYTUMFS_CAS_HASH_SIZE + 4);
+        values[index].length = adytumfs_read_le64(value + ADYTUMFS_CAS_HASH_SIZE);
     }
     return 0;
 }
@@ -302,8 +313,7 @@ static void key_from_entry(const u8 *block, u32 index, u32 level,
                            struct adytumfs_tree_key *key) {
     const u8 *entry = block + ADYTUMFS_TREE_HEADER_SIZE +
         index * level_stride(level);
-    key->object_id = adytumfs_read_le64(entry);
-    key->offset = adytumfs_read_le64(entry + 8);
+    key->end = adytumfs_read_le64(entry);
 }
 
 static int tree_descend(struct kernel_object *device,
@@ -509,9 +519,7 @@ int adytumfs_tree_lookup(struct kernel_object *device,
     u32 count = 0;
     if (adytumfs_tree_leaf_unpack(tree_node, &count, keys, values)) return -1;
     if ((u32)found >= count) return -1;
-    if (keys[found].object_id != key->object_id ||
-        keys[found].offset != key->offset)
-        return -1;
+    if (keys[found].end != key->end) return -1;
     *value = values[found];
     return 0;
 }
