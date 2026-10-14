@@ -43,7 +43,7 @@ static inline void adytumfs_write_le64(u8 *p, u64 value) {
 #define ADYTUMFS_NAME_MAX 255u
 #define ADYTUMFS_EXTENT_SIZE 16u
 #define ADYTUMFS_DIRECT_EXTENTS 10u
-#define ADYTUMFS_FORMAT_VERSION 2u
+#define ADYTUMFS_FORMAT_VERSION 3u
 #define ADYTUMFS_ROOT_INODE 1u
 // v1 bounds the inode table at sixteen blocks (256 inodes at sixteen per
 // block); the formatter caps at the same value, so a bigger table is a volume
@@ -52,12 +52,14 @@ static inline void adytumfs_write_le64(u8 *p, u64 value) {
 // One u32 crc32c per data block lives in the checksum region, so a 4 KiB
 // region block covers 1024 data blocks.
 #define ADYTUMFS_CHECKSUMS_PER_BLOCK (ADYTUMFS_BLOCK_SIZE / 4u)
-// The whole v2 layout is one incompatible package: the data checksum region
-// plus the shadow metadata tail (a second superblock, bitmap, and inode table
-// reserved at the end of the volume for the durability work). An exact mask
-// match is required, so a volume with bits this build never wrote is refused
-// rather than half interpreted.
+// The whole layout is one incompatible package, and an exact mask match is
+// required, so a volume carrying bits this build never wrote is refused rather
+// than half interpreted. V2 is the data checksum region plus the shadow
+// metadata tail. V3 adds the on disk location index the content addressed tree
+// resolves through, and nothing reads a v2 volume: there is no migration path,
+// so a v2 mask is simply a volume this build formats over.
 #define ADYTUMFS_FEATURE_INCOMPAT_V2 0x1u
+#define ADYTUMFS_FEATURE_INCOMPAT_V3 0x3u
 
 // The superblock lives in block 0 (a backup copy in the last block). Its
 // checksum is the last field and covers every byte before it, so it never has
@@ -98,6 +100,12 @@ struct adytumfs_superblock {
     u64 feature_incompat;
     u64 feature_ro_compat;
     u64 data_checksum_region;
+    // Where the on disk location index lives. It is reserved at format time and
+    // never handed to the allocator, because the tree cannot be read without
+    // it: a volume that lost these blocks lost every hash to location mapping
+    // it had.
+    u64 index_start;
+    u64 index_blocks;
     // Which superblock slot this copy came from: 0 is block 0, 1 is the tail
     // copy in the last block. Runtime state only, never serialised; the
     // reader defaults it to the primary slot and the mount picker overrides

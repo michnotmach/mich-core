@@ -28,14 +28,24 @@ int test_adytumfs_volume64(void) {
         backup.total_blocks == super.total_blocks &&
         backup.data_start == super.data_start;
 
-    // The bitmap marks block 0 and the backup block used and leaves the first
-    // data block free.
+    // The bitmap marks block 0, the backup block, and the reserved index
+    // region used, and leaves the first block past the index free.
     u64 last = super.total_blocks - 1;
+    u64 first_free = super.index_start + super.index_blocks;
     valid = valid &&
         adytumfs_block_read(dev, super.block_bitmap_start, block) == 0 &&
         (block[0] & 1u) &&
-        (block[super.data_start / 8] & (u8)(1u << (super.data_start % 8))) == 0 &&
-        (block[last / 8] & (u8)(1u << (last % 8)));
+        (block[super.data_start / 8] & (u8)(1u << (super.data_start % 8))) &&
+        (block[last / 8] & (u8)(1u << (last % 8))) &&
+        (block[first_free / 8] & (u8)(1u << (first_free % 8))) == 0;
+
+    // The reserved region is recorded, sits inside the data area, and is
+    // excluded from the free count, so nothing can hand it out twice.
+    valid = valid && super.index_blocks >= 2 &&
+        super.index_start == super.data_start &&
+        super.index_start + super.index_blocks <= super.data_checksum_region &&
+        super.free_blocks + super.index_blocks ==
+            super.data_checksum_region - super.data_start;
 
     // The root inode is a directory that owns no data yet.
     struct adytumfs_inode root;

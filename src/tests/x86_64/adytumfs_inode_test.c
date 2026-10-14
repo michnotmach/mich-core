@@ -37,13 +37,14 @@ int test_adytumfs_inode64(void) {
     u64 generation = file.generation;
 
     file.size = 12345;
-    file.direct[0].start_block = super.data_start;
+    file.direct[0].start_block = super.data_start + super.index_blocks;
     file.direct[0].length = 2;
     struct adytumfs_inode again;
     valid = valid && adytumfs_inode_write(dev, &super, number, &file) == 0 &&
         adytumfs_inode_read(dev, &super, number, &again) == 0 &&
         again.size == 12345 &&
-        again.direct[0].start_block == super.data_start &&
+        again.direct[0].start_block ==
+            super.data_start + super.index_blocks &&
         again.direct[0].length == 2;
 
     // The nanosecond halves of the timestamps round-trip through the slot

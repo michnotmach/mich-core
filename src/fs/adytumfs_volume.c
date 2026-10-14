@@ -1,4 +1,5 @@
 #include "adytumfs_format.h"
+#include "adytumfs_index.h"
 #include "crc32c.h"
 #include "block.h"
 #include "cache.h"
@@ -123,6 +124,15 @@ int adytumfs_make(struct kernel_object *device) {
     u64 data_blocks = data_span - region_blocks;
     if (data_blocks == 0) return -1;
     u64 region_start = data_start + data_blocks;
+    // The location index is reserved out of the data region rather than put in
+    // the metadata prefix, so the prefix stays the size it was and the index
+    // grows with the volume instead of being a second fixed table. It carries
+    // one entry per content block, and a hash table driven at full load
+    // degenerates into a scan, so it is sized for roughly three quarters.
+    u64 index_capacity = data_blocks + data_blocks / 3;
+    u64 index_blocks = index_capacity / ADYTUMFS_INDEX_PER_BLOCK + 2u;
+    if (index_blocks * 2u > data_blocks) return -1;
+    u64 index_start = data_start;
     // The tail packs upward from where the checksum region ends: shadow
     // table, then shadow bitmap, then the backup superblock in the last
     // block. Starting the table at tail_base rather than below it keeps the
@@ -142,15 +152,17 @@ int adytumfs_make(struct kernel_object *device) {
         .inode_count = inode_count,
         .root_inode = ADYTUMFS_ROOT_INODE,
         .data_start = data_start,
-        .free_blocks = data_blocks,
+        .free_blocks = data_blocks - index_blocks,
         // Slot 0 is the null inode and the root occupies slot 1, so the
         // free count starts two below the table size.
         .free_inodes = inode_count - 2,
         .generation = 1,
         .feature_compat = 0,
-        .feature_incompat = ADYTUMFS_FEATURE_INCOMPAT_V2,
+        .feature_incompat = ADYTUMFS_FEATURE_INCOMPAT_V3,
         .feature_ro_compat = 0,
         .data_checksum_region = region_start,
+        .index_start = index_start,
+        .index_blocks = index_blocks,
     };
 
     // A 4 KiB staging block is too big for a modest stack, and the format path is
@@ -170,7 +182,8 @@ int adytumfs_make(struct kernel_object *device) {
         for (u32 index = 0; index < ADYTUMFS_BLOCK_SIZE; index++) block[index] = 0;
         u64 base = bitmap * bits_per_block;
         for (u64 used = 0; used < total_blocks; used++)
-            if ((used < data_start || used >= region_start) &&
+            if ((used < data_start || used >= region_start ||
+                 (used >= index_start && used < index_start + index_blocks)) &&
                 used >= base && used - base < bits_per_block)
                 block[(used - base) / 8] |= (u8)(1u << ((used - base) % 8));
         if (adytumfs_block_write(device, super.block_bitmap_start + bitmap, block) ||
@@ -205,6 +218,13 @@ int adytumfs_make(struct kernel_object *device) {
         if (adytumfs_block_write(device, region_start + region,
                                  adytumfs_zero_block))
             return -1;
+
+    // The index is formatted last, once the checksum region exists, because it
+    // is written through the verified data path like everything else the tree
+    // will read.
+    struct adytumfs_index index;
+    adytumfs_index_init(&index, index_start, index_blocks);
+    if (adytumfs_index_format(device, &super, &index)) return -1;
 
     return block_cache_flush(device);
 }

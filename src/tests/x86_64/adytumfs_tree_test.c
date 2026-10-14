@@ -24,18 +24,18 @@ static void value_at(u32 index, struct adytumfs_tree_value *value) {
     value->flags = index * 3u;
 }
 
-// The tree resolves a node by hash, so it needs a location index to run
-// against. The cache in front of it is only a cache, and this is where the
-// authority gets formatted.
-static int tree_index_open(struct kernel_object *device,
-                           struct adytumfs_superblock *super,
-                           struct adytumfs_cas *store, u64 blocks) {
+// The tree resolves a node by hash, so it runs against the index mkfs
+// reserved and recorded in the superblock. Nothing here allocates one, which
+// is the point: a formatted volume arrives with a working index.
+static int tree_index_empty(struct kernel_object *device,
+                            const struct adytumfs_superblock *super,
+                            struct adytumfs_cas *store) {
     struct adytumfs_index index;
-    u64 start = 0;
-    if (adytumfs_alloc_run(device, super, blocks, &start)) return -1;
-    adytumfs_index_init(&index, start, blocks);
-    if (adytumfs_index_format(device, super, &index)) return -1;
-    adytumfs_cas_open(store, start, blocks);
+    u64 live = 1;
+    adytumfs_index_init(&index, super->index_start, super->index_blocks);
+    if (adytumfs_index_live(device, super, &index, &live)) return -1;
+    if (live) return -1;
+    adytumfs_cas_open(store, super->index_start, super->index_blocks);
     return 0;
 }
 
@@ -238,7 +238,12 @@ int test_adytumfs_tree_traverse64(void) {
     int valid = dev && adytumfs_make(dev) == 0 &&
         adytumfs_block_read(dev, 0, scratch) == 0 &&
         adytumfs_super_unpack(&super, scratch) == 0;
-    valid = valid && tree_index_open(dev, &super, &store, 4) == 0;
+    valid = valid && tree_index_empty(dev, &super, &store) == 0;
+    // The index is reserved out of the data region, so the free count has to
+    // already exclude it. A count that still includes the reservation reports
+    // space the allocator will never hand out.
+    valid = valid && super.free_blocks + super.index_blocks <=
+        super.data_checksum_region - super.data_start;
 
     u8 root[ADYTUMFS_CAS_HASH_SIZE];
     u8 next[ADYTUMFS_CAS_HASH_SIZE];
@@ -391,7 +396,7 @@ int test_adytumfs_tree_gc64(void) {
     int valid = dev && adytumfs_make(dev) == 0 &&
         adytumfs_block_read(dev, 0, scratch) == 0 &&
         adytumfs_super_unpack(&super, scratch) == 0;
-    valid = valid && tree_index_open(dev, &super, &store, 4) == 0;
+    valid = valid && tree_index_empty(dev, &super, &store) == 0;
 
     u8 root[ADYTUMFS_CAS_HASH_SIZE];
     u8 next[ADYTUMFS_CAS_HASH_SIZE];
@@ -490,12 +495,16 @@ int test_adytumfs_tree_gc64(void) {
         adytumfs_tree_discard(dev, &super, &store, root, 1u, &left) == 0 &&
         left > 0 &&
         adytumfs_tree_discard(dev, &super, &store, next, 64u, &left) != 0;
+    // The step is taken outside the short circuit: a walk that stops making
+    // progress has to end the loop rather than spin on a stale count once
+    // valid has already gone false.
     while (left) {
         u32 before = left;
-        valid = valid &&
-            adytumfs_tree_discard_resume(dev, &super, &store, 4u,
-                                         &left) == 0 &&
+        int stepped =
+            adytumfs_tree_discard_resume(dev, &super, &store, 4u, &left) == 0 &&
             left < before;
+        valid = valid && stepped;
+        if (!stepped) break;
     }
     valid = valid && tree_count(dev, &super, &store) == grown;
     root_copy(root, next);

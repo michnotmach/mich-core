@@ -24,6 +24,8 @@ void adytumfs_super_pack(u8 *block, const struct adytumfs_superblock *super) {
     adytumfs_write_le64(block + 112, super->feature_incompat);
     adytumfs_write_le64(block + 120, super->feature_ro_compat);
     adytumfs_write_le64(block + 128, super->data_checksum_region);
+    adytumfs_write_le64(block + 136, super->index_start);
+    adytumfs_write_le64(block + 144, super->index_blocks);
     adytumfs_write_le32(block + ADYTUMFS_SUPER_CHECKSUM_OFFSET,
                         crc32c(block, ADYTUMFS_SUPER_CHECKSUM_OFFSET));
 }
@@ -55,6 +57,8 @@ int adytumfs_super_unpack(struct adytumfs_superblock *super, const u8 *block) {
     super->feature_incompat = adytumfs_read_le64(block + 112);
     super->feature_ro_compat = adytumfs_read_le64(block + 120);
     super->data_checksum_region = adytumfs_read_le64(block + 128);
+    super->index_start = adytumfs_read_le64(block + 136);
+    super->index_blocks = adytumfs_read_le64(block + 144);
     // The slot is runtime state, not on-disk state: the primary superblock is
     // the default guess, and the mount picker overrides it when the tail copy
     // wins on generation.
@@ -64,11 +68,11 @@ int adytumfs_super_unpack(struct adytumfs_superblock *super, const u8 *block) {
 
 int adytumfs_super_valid(const struct adytumfs_superblock *super,
                          u64 device_blocks) {
-    // The v2 layout is one incompatible package (checksum region plus the
-    // shadow tail), so the mask must match exactly: a missing bit is a volume
-    // this build cannot interpret, and an extra bit is one a future build
-    // wrote and this one must not guess at.
-    if (super->feature_incompat != ADYTUMFS_FEATURE_INCOMPAT_V2) return -1;
+    // The layout is one incompatible package, so the mask must match exactly:
+    // a missing bit is a volume this build cannot interpret, and an extra bit
+    // is one a future build wrote and this one must not guess at. A v2 mask is
+    // a missing bit, which is the clean break: there is no migration path.
+    if (super->feature_incompat != ADYTUMFS_FEATURE_INCOMPAT_V3) return -1;
     if (super->block_size != ADYTUMFS_BLOCK_SIZE) return -1;
     if (super->total_blocks > device_blocks) return -1;
 
@@ -120,6 +124,17 @@ int adytumfs_super_valid(const struct adytumfs_superblock *super,
     if (region_blocks <
         (data_blocks + ADYTUMFS_CHECKSUMS_PER_BLOCK - 1) /
             ADYTUMFS_CHECKSUMS_PER_BLOCK)
+        return -1;
+
+    // The index sits inside the data region, reserved at format time and
+    // marked allocated in the bitmap. Block zero of the region is its header,
+    // so a region of one block would hold no entries at all, and a region
+    // reaching past the checksum boundary would send the first tree lookup
+    // somewhere the volume never wrote.
+    if (super->index_blocks < 2u) return -1;
+    if (super->index_start < super->data_start ||
+        super->index_blocks >
+            super->data_checksum_region - super->index_start)
         return -1;
     return 0;
 }

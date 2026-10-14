@@ -50,6 +50,10 @@ int adytumfs_verify(struct kernel_object *device,
     verify_bitmap_window = ~(u64)0;
     u64 free_inodes = 0;
     u64 claimed = 0;
+    // The index region is reserved metadata that happens to sit inside the
+    // data span. It is allocated at format time and no inode owns it, so it
+    // stays out of both sides of the allocation ledger.
+    u64 index_end = super->index_start + super->index_blocks;
 
     // An unreachable inode still owns its blocks, and a used slot with a
     // broken body means the table itself is lying, so every used slot is
@@ -87,6 +91,10 @@ int adytumfs_verify(struct kernel_object *device,
                 start >= super->data_checksum_region ||
                 length > super->data_checksum_region - start)
                 return -1;
+            // An extent reaching the index would let a file overwrite the
+            // structure every hash lookup resolves through.
+            if (start < index_end && start + length > super->index_start)
+                return -1;
             if (verify_claim_count >= ADYTUMFS_VERIFY_CLAIMS_MAX) return -1;
             verify_claims[verify_claim_count].start = start;
             verify_claims[verify_claim_count].length = length;
@@ -99,14 +107,16 @@ int adytumfs_verify(struct kernel_object *device,
         // mapped blocks anyway.
     }
 
-    // The metadata prefix and the tail from the checksum region on must stay
-    // allocated, and every allocated data block must belong to an extent.
+    // The metadata prefix, the reserved index region, and the tail from the
+    // checksum region on must stay allocated, and every allocated data block
+    // must belong to an extent.
     u64 allocated = 0;
     for (u64 block = 0; block < super->total_blocks; block++) {
         int bit = verify_bit(device, super, block);
         if (bit < 0) return -1;
         if (block < super->data_start ||
-            block >= super->data_checksum_region) {
+            block >= super->data_checksum_region ||
+            (block >= super->index_start && block < index_end)) {
             if (!bit) return -1;
             continue;
         }
@@ -134,9 +144,11 @@ int adytumfs_verify(struct kernel_object *device,
     if (claimed != allocated) return -1;
     if (super->free_inodes != free_inodes) return -1;
     // The allocatable span ends at the checksum region, not at the backup
-    // superblock, so the free count is taken against the region start.
+    // superblock, and the reserved index is not allocatable either, so the
+    // free count is taken against the span the allocator can actually reach.
     if (super->free_blocks !=
-        super->data_checksum_region - super->data_start - allocated)
+        super->data_checksum_region - super->data_start - super->index_blocks -
+            allocated)
         return -1;
     return 0;
 }

@@ -23,9 +23,11 @@ int test_adytumfs_super64(void) {
         .free_inodes = 63,
         .generation = 1,
         .feature_compat = 0,
-        .feature_incompat = ADYTUMFS_FEATURE_INCOMPAT_V2,
+        .feature_incompat = ADYTUMFS_FEATURE_INCOMPAT_V3,
         .feature_ro_compat = 0,
         .data_checksum_region = 1017,
+        .index_start = 6,
+        .index_blocks = 21,
     };
 
     adytumfs_super_pack(block, &super);
@@ -51,7 +53,9 @@ int test_adytumfs_super64(void) {
         decoded.free_inodes == super.free_inodes &&
         decoded.generation == super.generation &&
         decoded.feature_incompat == super.feature_incompat &&
-        decoded.data_checksum_region == super.data_checksum_region;
+        decoded.data_checksum_region == super.data_checksum_region &&
+        decoded.index_start == super.index_start &&
+        decoded.index_blocks == super.index_blocks;
 
     // The checksum must catch a single flipped byte, and a broken signature
     // must be rejected before anything else.
@@ -77,7 +81,29 @@ int test_adytumfs_super64(void) {
     bad.data_checksum_region = super.data_start;
     valid = valid && adytumfs_super_valid(&bad, 1024) != 0;
     bad = super;
-    bad.feature_incompat = ADYTUMFS_FEATURE_INCOMPAT_V2 | 0x2u;
+    bad.feature_incompat = ADYTUMFS_FEATURE_INCOMPAT_V3 | 0x4u;
+    valid = valid && adytumfs_super_valid(&bad, 1024) != 0;
+
+    // The clean break: the v2 mask is not a smaller v3, it is a volume this
+    // build refuses to interpret at all.
+    bad = super;
+    bad.feature_incompat = ADYTUMFS_FEATURE_INCOMPAT_V2;
+    valid = valid && adytumfs_super_valid(&bad, 1024) != 0;
+
+    // The index region is part of the layout, so a header with no entries, one
+    // that starts above the data region, and one that runs into the checksum
+    // region are all volumes the formatter never wrote.
+    bad = super;
+    bad.index_blocks = 1;
+    valid = valid && adytumfs_super_valid(&bad, 1024) != 0;
+    bad = super;
+    bad.index_start = super.inode_table_start;
+    valid = valid && adytumfs_super_valid(&bad, 1024) != 0;
+    bad = super;
+    bad.index_start = super.data_checksum_region - 1;
+    valid = valid && adytumfs_super_valid(&bad, 1024) != 0;
+    bad = super;
+    bad.index_blocks = super.data_checksum_region - super.data_start + 1;
     valid = valid && adytumfs_super_valid(&bad, 1024) != 0;
 
     return valid ? 0 : -1;

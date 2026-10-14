@@ -9,7 +9,6 @@
 // number is no longer a limit on anything: the cache is allowed to be smaller
 // than the volume, and was the ceiling on it before.
 #define CAS_TEST_MANY 300u
-#define CAS_TEST_INDEX_BLOCKS 8u
 
 // A distinct key per index, derived with the same hash the filesystem uses, so
 // the cache is exercised on real digests rather than on hand written byte
@@ -42,14 +41,14 @@ int test_adytumfs_cas64(void) {
         adytumfs_block_read(dev, 0, block) == 0 &&
         adytumfs_super_unpack(&super, block) == 0;
 
-    u64 index_start = 0;
-    valid = valid &&
-        adytumfs_alloc_run(dev, &super, CAS_TEST_INDEX_BLOCKS,
-                           &index_start) == 0;
+    // The index is the one mkfs reserved, not one the test carved out, and a
+    // fresh volume has to start with it empty.
     struct adytumfs_index layout;
-    adytumfs_index_init(&layout, index_start, CAS_TEST_INDEX_BLOCKS);
-    valid = valid && adytumfs_index_format(dev, &super, &layout) == 0;
-    adytumfs_cas_open(&store, index_start, CAS_TEST_INDEX_BLOCKS);
+    u64 fresh = 1;
+    adytumfs_index_init(&layout, super.index_start, super.index_blocks);
+    valid = valid && super.index_blocks > 1 &&
+        adytumfs_index_live(dev, &super, &layout, &fresh) == 0 && fresh == 0;
+    adytumfs_cas_open(&store, super.index_start, super.index_blocks);
 
     u8 key_a[ADYTUMFS_CAS_HASH_SIZE];
     u8 key_b[ADYTUMFS_CAS_HASH_SIZE];
@@ -145,7 +144,7 @@ int test_adytumfs_cas64(void) {
 
     // Dropping the cache entirely is the strongest form of the same claim:
     // nothing lives in memory that the index does not also hold.
-    adytumfs_cas_open(&store, index_start, CAS_TEST_INDEX_BLOCKS);
+    adytumfs_cas_open(&store, super.index_start, super.index_blocks);
     valid = valid && cas_live(dev, &super, &store) == CAS_TEST_MANY;
     for (u32 index = 0; index < CAS_TEST_MANY; index++) {
         u64 where = 0;

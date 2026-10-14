@@ -1319,6 +1319,10 @@ int test_adytumfs_integrity64(void) {
             super.inode_table_blocks * ADYTUMFS_INODES_PER_BLOCK;
         super.data_start =
             super.inode_table_start + super.inode_table_blocks;
+        // Keep the index consistent with the moved data start, so the volume
+        // is refused for the oversized table rather than for a region that
+        // fell behind it.
+        super.index_start = super.data_start;
         adytumfs_super_pack(adytumfs_probe_block, &super);
     }
     ok = ok && !adytumfs_block_write(dev, adytumfs_superblock_block(&super),

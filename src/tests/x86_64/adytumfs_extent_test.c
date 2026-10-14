@@ -20,7 +20,9 @@ int test_adytumfs_extent64(void) {
         adytumfs_block_read(dev, 0, block) == 0 &&
         adytumfs_super_unpack(&super, block) == 0;
 
-    u64 data = super.data_start;
+    // The index region is reserved at the front of the data area, so the
+    // first extent a grow can take starts past it.
+    u64 data = super.data_start + super.index_blocks;
     u64 na = 0;
     u64 nb = 0;
     struct adytumfs_inode a;

@@ -26,11 +26,11 @@ int test_adytumfs_alloc64(void) {
     u64 moved = 0;
     u64 reused = 0;
 
-    // First-fit places the first run at the start of the data region and the
-    // second immediately after it. The edits stage in the open window, so the
+    // First-fit places the first run just past the reserved index region and
+    // the second immediately after it. The edits stage in the open window, so the
     // counters move in memory while the device bitmap waits for the commit.
     valid = valid && adytumfs_alloc_run(dev, &super, 3, &first) == 0 &&
-        first == super.data_start &&
+        first == super.data_start + super.index_blocks &&
         adytumfs_alloc_run(dev, &super, 2, &second) == 0 &&
         second == first + 3 &&
         super.free_blocks == free0 - 5;
