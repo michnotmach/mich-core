@@ -115,6 +115,9 @@ int tests64_run(const struct test64_env *env) {
     if (test_report_record(TEST_ID_ADYTUMFS_INDEX, test_adytumfs_index64()))
         return -1;
     serial64_write("Mich test64: adytumfs disk index pass\n");
+    if (test_report_record(TEST_ID_ADYTUMFS_VERIFY, test_adytumfs_verify64()))
+        return -1;
+    serial64_write("Mich test64: adytumfs mount audit pass\n");
     if (test_report_record(TEST_ID_ADYTUMFS_INODE, test_adytumfs_inode64()))
         return -1;
     serial64_write("Mich test64: adytumfs inode table pass\n");
