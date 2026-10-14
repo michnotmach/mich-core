@@ -1,7 +1,10 @@
 #include "types.h"
+#include "object.h"
+#include "block.h"
 #include "blake2b.h"
 #include "crypto.h"
 #include "adytumfs_tree.h"
+#include "adytumfs_cas.h"
 
 static struct adytumfs_tree_key key_at(u64 object, u64 offset) {
     struct adytumfs_tree_key key;
@@ -190,5 +193,157 @@ int test_adytumfs_tree64(void) {
     unsorted[1] = key_at(4, 0);
     valid = valid && adytumfs_tree_leaf_pack(node, 2, unsorted, values) != 0;
 
+    return valid ? 0 : -1;
+}
+
+// Traversal against a real device, through the same location table the
+// filesystem will use. Every insert is copy on write, so this also checks the
+// property the design rests on: a root that was current a moment ago still
+// names a complete tree.
+int test_adytumfs_tree_traverse64(void) {
+    static struct adytumfs_cas store;
+    static u8 scratch[ADYTUMFS_BLOCK_SIZE];
+    struct adytumfs_superblock super;
+    struct adytumfs_tree_key key;
+    struct adytumfs_tree_value value;
+    struct adytumfs_tree_value found;
+    u32 objects = object_active_count();
+    u32 devices = block_active_count();
+    struct kernel_object *dev = block_create(4096, 0);
+    int valid = dev && adytumfs_make(dev) == 0 &&
+        adytumfs_block_read(dev, 0, scratch) == 0 &&
+        adytumfs_super_unpack(&super, scratch) == 0;
+    adytumfs_cas_reset(&store);
+
+    u8 root[ADYTUMFS_CAS_HASH_SIZE];
+    u8 next[ADYTUMFS_CAS_HASH_SIZE];
+    u8 snapshot[ADYTUMFS_CAS_HASH_SIZE];
+
+    // A fresh volume has no tree, and that is not a case the caller has to
+    // special case before the first insert.
+    crypto_zero(root, ADYTUMFS_CAS_HASH_SIZE);
+    key = key_at(1, 0);
+    value_at(0, &value);
+    valid = valid && adytumfs_tree_root_empty(root) == 1 &&
+        adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
+                             next) == 0 &&
+        adytumfs_tree_root_empty(next) == 0 &&
+        adytumfs_tree_lookup(dev, &super, &store, next, &key, &found) == 0 &&
+        found.length == value.length && found.flags == value.flags &&
+        crypto_equal(found.hash, value.hash, ADYTUMFS_CAS_HASH_SIZE);
+
+    // A key that is not there stays not there, on both sides of the one that is.
+    key = key_at(1, 4096);
+    valid = valid &&
+        adytumfs_tree_lookup(dev, &super, &store, next, &key, &found) != 0;
+    key = key_at(0, 0);
+    valid = valid &&
+        adytumfs_tree_lookup(dev, &super, &store, next, &key, &found) != 0;
+
+    // Filling past leaf capacity has to grow the tree, and every earlier key
+    // has to survive the split that does it.
+    for (u32 index = 1; index <= ADYTUMFS_TREE_LEAF_MAX; index++) {
+        for (u32 byte = 0; byte < ADYTUMFS_CAS_HASH_SIZE; byte++)
+            root[byte] = next[byte];
+        key = key_at(1, (u64)index * 4096u);
+        value_at(index, &value);
+        valid = valid &&
+            adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
+                                 next) == 0;
+    }
+    for (u32 index = 0; index <= ADYTUMFS_TREE_LEAF_MAX; index++) {
+        key = key_at(1, (u64)index * 4096u);
+        value_at(index, &value);
+        valid = valid &&
+            adytumfs_tree_lookup(dev, &super, &store, next, &key,
+                                 &found) == 0 &&
+            found.length == value.length && found.flags == value.flags &&
+            crypto_equal(found.hash, value.hash, ADYTUMFS_CAS_HASH_SIZE);
+    }
+
+    // The split produced a branch root with two children, not a second leaf
+    // hanging off nothing.
+    u64 root_block = 0;
+    valid = valid &&
+        adytumfs_cas_lookup(&store, next, &root_block) == 0 &&
+        adytumfs_data_read(dev, &super, root_block, scratch) == 0 &&
+        adytumfs_read_le32(scratch + 4) == 1u &&
+        adytumfs_read_le32(scratch + 8) == 2u;
+
+    // Snapshot: the root from before the next insert still resolves, which is
+    // what removes the need for a journal.
+    for (u32 byte = 0; byte < ADYTUMFS_CAS_HASH_SIZE; byte++) {
+        snapshot[byte] = next[byte];
+        root[byte] = next[byte];
+    }
+    key = key_at(1, 0);
+    value_at(0, &value);
+    valid = valid &&
+        adytumfs_tree_insert(dev, &super, &store, snapshot, &key, &value,
+                             next) == 0;
+    key = key_at(9, 0);
+    valid = valid &&
+        adytumfs_tree_lookup(dev, &super, &store, next, &key, &found) != 0;
+    value_at(99, &value);
+    valid = valid &&
+        adytumfs_tree_insert(dev, &super, &store, next, &key, &value,
+                             next) == 0 &&
+        adytumfs_tree_lookup(dev, &super, &store, snapshot, &key,
+                             &found) != 0 &&
+        adytumfs_tree_lookup(dev, &super, &store, next, &key, &found) == 0 &&
+        found.flags == value.flags;
+
+    // A second object spreads the tree over more than two leaves, so branch
+    // entries past the first are exercised on the way down.
+    for (u32 index = 0; index < ADYTUMFS_TREE_LEAF_MAX; index++) {
+        for (u32 byte = 0; byte < ADYTUMFS_CAS_HASH_SIZE; byte++)
+            root[byte] = next[byte];
+        key = key_at(2, (u64)index * 4096u);
+        value_at(index + 1000u, &value);
+        valid = valid &&
+            adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
+                                 next) == 0;
+    }
+    for (u32 index = 0; index < ADYTUMFS_TREE_LEAF_MAX; index++) {
+        key = key_at(2, (u64)index * 4096u);
+        value_at(index + 1000u, &value);
+        valid = valid &&
+            adytumfs_tree_lookup(dev, &super, &store, next, &key,
+                                 &found) == 0 &&
+            found.length == value.length && found.flags == value.flags &&
+            crypto_equal(found.hash, value.hash, ADYTUMFS_CAS_HASH_SIZE);
+    }
+
+    // Replacing a key changes the value and leaves the key set alone.
+    key = key_at(3, 0);
+    value_at(1234, &value);
+    valid = valid &&
+        adytumfs_tree_insert(dev, &super, &store, next, &key, &value,
+                             next) == 0 &&
+        adytumfs_tree_lookup(dev, &super, &store, next, &key, &found) == 0 &&
+        found.flags == value.flags &&
+        crypto_equal(found.hash, value.hash, ADYTUMFS_CAS_HASH_SIZE);
+    key = key_at(3, 4096);
+    valid = valid &&
+        adytumfs_tree_lookup(dev, &super, &store, next, &key, &found) != 0;
+
+    // One flipped byte in the root has to be refused. The parent promised this
+    // hash, so a node that reads back different is not the node that was
+    // written, and walking it would hand back another file's data.
+    key = key_at(1, 0);
+    valid = valid &&
+        adytumfs_cas_lookup(&store, next, &root_block) == 0 &&
+        adytumfs_data_read(dev, &super, root_block, scratch) == 0;
+    scratch[ADYTUMFS_TREE_HEADER_SIZE] ^= 0x01u;
+    valid = valid &&
+        adytumfs_data_write(dev, &super, root_block, scratch) == 0 &&
+        adytumfs_tree_lookup(dev, &super, &store, next, &key, &found) != 0 &&
+        adytumfs_tree_insert(dev, &super, &store, next, &key, &value,
+                             next) != 0;
+
+    adytumfs_window_discard(dev);
+    if (dev) object_release(dev);
+    valid = valid && object_active_count() == objects &&
+        block_active_count() == devices;
     return valid ? 0 : -1;
 }

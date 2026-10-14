@@ -87,4 +87,35 @@ int adytumfs_tree_leaf_split(const u8 *full, u8 *left, u8 *right,
 int adytumfs_tree_branch_split(const u8 *full, u8 *left, u8 *right,
                                struct adytumfs_tree_key *split_key);
 
+// Traversal lives here rather than in the caller because the descent has to
+// verify each node against the hash its parent promised, and doing that once
+// is the difference between a self checking tree and one that trusts the disk.
+//
+// A zero root is an empty tree, so inserting into a fresh volume needs no
+// special case and node_check stays strict about count.
+#define ADYTUMFS_TREE_DEPTH_MAX 12u
+
+int adytumfs_tree_root_empty(const u8 root[ADYTUMFS_CAS_HASH_SIZE]);
+
+int adytumfs_tree_lookup(struct kernel_object *device,
+                         struct adytumfs_superblock *super,
+                         struct adytumfs_cas *store,
+                         const u8 root[ADYTUMFS_CAS_HASH_SIZE],
+                         const struct adytumfs_tree_key *key,
+                         struct adytumfs_tree_value *value);
+
+// Insert or replace, copy on write. Only the nodes on the path to the key are
+// rewritten, every other subtree keeps its hash and therefore its block, and
+// the result is a new root hash. The caller commits by recording that hash,
+// which is atomic in the only sense that matters here: the old root still
+// names a complete, valid tree, so a reader that started before the commit
+// finishes against the tree as it was.
+int adytumfs_tree_insert(struct kernel_object *device,
+                         struct adytumfs_superblock *super,
+                         struct adytumfs_cas *store,
+                         const u8 root[ADYTUMFS_CAS_HASH_SIZE],
+                         const struct adytumfs_tree_key *key,
+                         const struct adytumfs_tree_value *value,
+                         u8 new_root[ADYTUMFS_CAS_HASH_SIZE]);
+
 #endif
