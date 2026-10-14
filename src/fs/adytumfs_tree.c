@@ -576,6 +576,135 @@ static int tree_insert(struct kernel_object *device,
     return tree_store(device, super, store, tree_node, new_root);
 }
 
+// The bottom up result of a removal. A node that lost its last entry is never
+// stored, because node_check requires at least one entry: an empty node is not
+// a node this filesystem writes, so the parent drops the entry that named it
+// instead of being handed a hash for nothing.
+struct adytumfs_tree_shrink {
+    u8 child[ADYTUMFS_CAS_HASH_SIZE];
+    struct adytumfs_tree_key child_max;
+    int gone;
+};
+
+static int leaf_remove(struct kernel_object *device,
+                       struct adytumfs_superblock *super,
+                       struct adytumfs_cas *store, const u8 *node, u32 at,
+                       struct adytumfs_tree_shrink *below) {
+    static struct adytumfs_tree_key keys[ADYTUMFS_TREE_LEAF_MAX];
+    static struct adytumfs_tree_value values[ADYTUMFS_TREE_LEAF_MAX];
+    u32 count = 0;
+    if (adytumfs_tree_leaf_unpack(node, &count, keys, values)) return -1;
+    if (at >= count) return -1;
+    if (count == 1u) {
+        below->gone = 1;
+        return 0;
+    }
+    for (u32 index = at; index + 1u < count; index++) {
+        keys[index] = keys[index + 1u];
+        values[index] = values[index + 1u];
+    }
+    if (adytumfs_tree_leaf_pack(tree_node, count - 1u, keys, values)) return -1;
+    below->gone = 0;
+    key_from_entry(tree_node, count - 2u, 0, &below->child_max);
+    return tree_store(device, super, store, tree_node, below->child);
+}
+
+static int branch_remove(struct kernel_object *device,
+                         struct adytumfs_superblock *super,
+                         struct adytumfs_cas *store, const u8 *node,
+                         u32 at, int is_root,
+                         const struct adytumfs_tree_shrink *below,
+                         struct adytumfs_tree_shrink *above) {
+    static struct adytumfs_tree_key keys[ADYTUMFS_TREE_BRANCH_MAX];
+    static u8 children[ADYTUMFS_TREE_BRANCH_MAX][ADYTUMFS_CAS_HASH_SIZE];
+    u32 count = 0;
+    if (adytumfs_tree_branch_unpack(node, &count, keys, children)) return -1;
+    if (at >= count) return -1;
+    u32 total = count;
+    if (below->gone) {
+        for (u32 index = at; index + 1u < count; index++) {
+            keys[index] = keys[index + 1u];
+            hash_copy(children[index], children[index + 1u]);
+        }
+        total = count - 1u;
+        if (!total) {
+            above->gone = 1;
+            return 0;
+        }
+    } else {
+        // A separator stays correct if it is left alone, because routing only
+        // needs it below the next child's first key and removing the greatest
+        // key cannot break that. It is rewritten anyway: the format defines a
+        // separator as exactly the subtree's greatest key, and a tree whose
+        // separators drift stops being the tree the format describes.
+        keys[at] = below->child_max;
+        hash_copy(children[at], below->child);
+    }
+    // A root left with one child is a level the tree no longer needs. Dropping
+    // it here rather than after the store matters: a one entry branch written
+    // first would be referenced by nothing afterwards and stay in the index as
+    // garbage no root can reach.
+    if (is_root && total == 1u) {
+        above->gone = 0;
+        hash_copy(above->child, children[0]);
+        return 0;
+    }
+    if (adytumfs_tree_branch_pack(tree_node, total, keys, children)) return -1;
+    above->gone = 0;
+    key_from_entry(tree_node, total - 1u, 1, &above->child_max);
+    return tree_store(device, super, store, tree_node, above->child);
+}
+
+// Removal is copy on write like insert: only the path to the key is rewritten
+// and the result is a new root, so the old root still names a complete tree.
+// Underfull nodes are not rebalanced, the way ZFS does not rebalance either;
+// the exception is the root, because the height lives there and a tree that
+// grew deep and then shrank would otherwise walk the empty levels forever.
+static int tree_remove(struct kernel_object *device,
+                       struct adytumfs_superblock *super,
+                       struct adytumfs_cas *store,
+                       const u8 root[ADYTUMFS_CAS_HASH_SIZE],
+                       const struct adytumfs_tree_key *key,
+                       u8 new_root[ADYTUMFS_CAS_HASH_SIZE]) {
+    if (!device || !super || !store || !root || !key || !new_root) return -1;
+    if (adytumfs_tree_root_empty(root)) return -1;
+    static struct adytumfs_tree_step path[ADYTUMFS_TREE_DEPTH_MAX];
+    u32 depth = 0;
+    int found = -1;
+    if (tree_descend(device, super, store, root, key, path, &depth, &found))
+        return -1;
+    // An absent key is an error rather than a no op: every caller removes an
+    // extent it believes is there, and a silent nothing would hide the
+    // disagreement between the caller's picture and the tree.
+    if (found < 0) return -1;
+    struct adytumfs_tree_shrink below;
+    struct adytumfs_tree_shrink above;
+    static u8 node_copy[ADYTUMFS_BLOCK_SIZE];
+    if (tree_fetch(device, super, store, path[depth - 1u].hash, tree_node))
+        return -1;
+    for (u32 index = 0; index < ADYTUMFS_BLOCK_SIZE; index++)
+        node_copy[index] = tree_node[index];
+    if (leaf_remove(device, super, store, node_copy, (u32)found, &below))
+        return -1;
+    for (u32 step = depth - 1u; step > 0; step--) {
+        if (tree_fetch(device, super, store, path[step - 1u].hash, tree_node))
+            return -1;
+        for (u32 index = 0; index < ADYTUMFS_BLOCK_SIZE; index++)
+            node_copy[index] = tree_node[index];
+        if (branch_remove(device, super, store, node_copy,
+                          path[step - 1u].index, step == 1u, &below, &above))
+            return -1;
+        below = above;
+    }
+    if (below.gone) {
+        for (u32 index = 0; index < ADYTUMFS_CAS_HASH_SIZE; index++)
+            new_root[index] = 0;
+        return 0;
+    }
+    hash_copy(new_root, below.child);
+    return 0;
+}
+
 struct adytumfs_tree_discard_item {
     u8 hash[ADYTUMFS_CAS_HASH_SIZE];
     u32 depth;
@@ -665,6 +794,17 @@ int adytumfs_tree_discard_resume(struct kernel_object *device,
                                  u32 budget, u32 *remaining) {
     if (!device || !super || !store || !remaining || !budget) return -1;
     return discard_run(device, super, store, budget, remaining);
+}
+
+int adytumfs_tree_remove(struct kernel_object *device,
+                         struct adytumfs_superblock *super,
+                         struct adytumfs_cas *store,
+                         const u8 root[ADYTUMFS_CAS_HASH_SIZE],
+                         const struct adytumfs_tree_key *key,
+                         u8 new_root[ADYTUMFS_CAS_HASH_SIZE]) {
+    if (tree_remove(device, super, store, root, key, new_root)) return -1;
+    if (adytumfs_tree_root_empty(new_root)) return 0;
+    return adytumfs_cas_retain(device, super, store, new_root);
 }
 
 int adytumfs_tree_insert(struct kernel_object *device,

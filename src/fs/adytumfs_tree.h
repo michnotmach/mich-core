@@ -118,6 +118,16 @@ int adytumfs_tree_insert(struct kernel_object *device,
                          const struct adytumfs_tree_value *value,
                          u8 new_root[ADYTUMFS_CAS_HASH_SIZE]);
 
+// Remove one key, copy on write, and hand back the new root the same way
+// insert does. Removing a key that is not there fails rather than succeeding
+// quietly. Removing the last key leaves the zero root that means empty.
+int adytumfs_tree_remove(struct kernel_object *device,
+                         struct adytumfs_superblock *super,
+                         struct adytumfs_cas *store,
+                         const u8 root[ADYTUMFS_CAS_HASH_SIZE],
+                         const struct adytumfs_tree_key *key,
+                         u8 new_root[ADYTUMFS_CAS_HASH_SIZE]);
+
 // Drop every version that this root is the only reason to keep, which is what
 // makes a commit collect its own garbage instead of leaking a node per write.
 // budget caps the nodes one call touches, so dropping a large subtree cannot
