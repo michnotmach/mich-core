@@ -55,6 +55,8 @@ int test_adytumfs_tree64(void);
 int test_adytumfs_tree_traverse64(void);
 int test_adytumfs_tree_gc64(void);
 int test_adytumfs_tree_remove64(void);
+int test_adytumfs_tree_find64(void);
+int test_adytumfs_tree_truncate64(void);
 int test_adytumfs_index64(void);
 int test_adytumfs_verify64(void);
 int test_adytumfs_inode64(void);

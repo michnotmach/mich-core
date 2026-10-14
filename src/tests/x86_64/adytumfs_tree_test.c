@@ -669,6 +669,325 @@ static int separators_exact(struct kernel_object *device,
     return 1;
 }
 
+// Count the entries a tree actually holds, by walking it. A truncation is
+// easy to get wrong in a way that leaves the right number of nodes and the
+// wrong number of entries, so the count comes from the leaves and not from a
+// counter the tree keeps.
+static u64 tree_entries(struct kernel_object *device,
+                        const struct adytumfs_superblock *super,
+                        struct adytumfs_cas *store,
+                        const u8 root[ADYTUMFS_CAS_HASH_SIZE]) {
+    static u8 scratch[ADYTUMFS_BLOCK_SIZE];
+    static u8 kids[ADYTUMFS_TREE_BRANCH_MAX][ADYTUMFS_CAS_HASH_SIZE];
+    if (adytumfs_tree_root_empty(root)) return 0;
+    u64 number = 0;
+    if (adytumfs_cas_lookup(device, super, store, root, &number))
+        return (u64)-1;
+    if (adytumfs_data_read(device, super, number, scratch)) return (u64)-1;
+    u32 level = adytumfs_read_le32(scratch + 4);
+    u32 count = adytumfs_read_le32(scratch + 8);
+    if (!level) return count;
+    // The children are copied out first: the scratch buffer is shared, so the
+    // first recursive read would otherwise overwrite the node being walked.
+    for (u32 index = 0; index < count; index++) {
+        const u8 *entry = scratch + ADYTUMFS_TREE_HEADER_SIZE +
+            index * ADYTUMFS_TREE_BRANCH_ENTRY_SIZE;
+        for (u32 byte = 0; byte < ADYTUMFS_CAS_HASH_SIZE; byte++)
+            kids[index][byte] = entry[ADYTUMFS_TREE_KEY_SIZE + byte];
+    }
+    u64 total = 0;
+    for (u32 index = 0; index < count; index++) {
+        u64 below = tree_entries(device, super, store, kids[index]);
+        if (below == (u64)-1) return (u64)-1;
+        total += below;
+    }
+    return total;
+}
+
+int test_adytumfs_tree_find64(void) {
+    static struct adytumfs_cas store;
+    static u8 scratch[ADYTUMFS_BLOCK_SIZE];
+    struct adytumfs_superblock super;
+    u32 objects = object_active_count();
+    u32 devices = block_active_count();
+    struct kernel_object *dev = block_create(4096, 0);
+    int valid = dev && adytumfs_make(dev) == 0 &&
+        adytumfs_block_read(dev, 0, scratch) == 0 &&
+        adytumfs_super_unpack(&super, scratch) == 0;
+    valid = valid && tree_index_empty(dev, &super, &store) == 0;
+    u8 root[ADYTUMFS_CAS_HASH_SIZE];
+    u8 next[ADYTUMFS_CAS_HASH_SIZE];
+    crypto_zero(root, ADYTUMFS_CAS_HASH_SIZE);
+    struct adytumfs_tree_key key;
+    struct adytumfs_tree_value value;
+    struct adytumfs_tree_span found;
+
+    // Three entries with a hole between the first two and a two block run at
+    // the end, so the cases that matter are all reachable: a covered offset,
+    // an offset inside the hole, an offset inside a run, and one past the end.
+    //   [0, 4096)  hole [4096, 8192)  [8192, 12288)  [12288, 20480)
+    u64 ends[3];
+    u64 lengths[3];
+    ends[0] = ADYTUMFS_BLOCK_SIZE;
+    lengths[0] = ADYTUMFS_BLOCK_SIZE;
+    ends[1] = 3u * ADYTUMFS_BLOCK_SIZE;
+    lengths[1] = ADYTUMFS_BLOCK_SIZE;
+    ends[2] = 5u * ADYTUMFS_BLOCK_SIZE;
+    lengths[2] = 2u * ADYTUMFS_BLOCK_SIZE;
+    for (u32 index = 0; valid && index < 3; index++) {
+        key.end = ends[index];
+        value_at(index, &value);
+        value.length = lengths[index];
+        valid = adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
+                                     next) == 0;
+        root_copy(root, next);
+    }
+    valid = valid && tree_entries(dev, &super, &store, root) == 3;
+
+    for (u32 index = 0; valid && index < 3; index++) {
+        value_at(index, &value);
+        value.length = lengths[index];
+        u64 offsets[3];
+        offsets[0] = ends[index] - lengths[index];
+        offsets[1] = ends[index] - 1u;
+        offsets[2] = ends[index] - lengths[index] / 2u;
+        for (u32 probe = 0; valid && probe < 3; probe++) {
+            valid = adytumfs_tree_find(dev, &super, &store, root,
+                                       offsets[probe], &found) == 0 &&
+                found.start == ends[index] - lengths[index] &&
+                found.end == ends[index] &&
+                crypto_equal(found.hash, value.hash, ADYTUMFS_CAS_HASH_SIZE);
+        }
+    }
+
+    // The hole has to read as absent rather than as one of its neighbours. A
+    // lower bound search on its own would hand back the entry after the gap.
+    valid = valid &&
+        adytumfs_tree_find(dev, &super, &store, root, ADYTUMFS_BLOCK_SIZE,
+                           &found) != 0 &&
+        adytumfs_tree_find(dev, &super, &store, root,
+                           2u * ADYTUMFS_BLOCK_SIZE - 1u, &found) != 0;
+    // Past the last end there is nothing, and below the first start there is
+    // nothing either even though an entry sorts above the query.
+    valid = valid &&
+        adytumfs_tree_find(dev, &super, &store, root,
+                           5u * ADYTUMFS_BLOCK_SIZE, &found) != 0 &&
+        adytumfs_tree_find(dev, &super, &store, root, (u64)-1, &found) != 0;
+    // An empty tree has nothing to find and that is not an error to set up.
+    u8 empty[ADYTUMFS_CAS_HASH_SIZE];
+    crypto_zero(empty, ADYTUMFS_CAS_HASH_SIZE);
+    valid = valid &&
+        adytumfs_tree_find(dev, &super, &store, empty, 0, &found) != 0;
+
+    adytumfs_window_discard(dev);
+    if (dev) object_release(dev);
+    valid = valid && object_active_count() == objects &&
+        block_active_count() == devices;
+    return valid ? 0 : -1;
+}
+
+// One entry in the run covers two blocks, so a cut can land inside an entry
+// and not only on a boundary. Ends are cumulative because that is what makes
+// the entries tile the file, and the run is the only place the step changes.
+#define TRUNCATE_ENTRIES 102u
+#define TRUNCATE_RUN_AT 50u
+
+static u64 entry_len(u64 index) {
+    return index == TRUNCATE_RUN_AT ? 2u * ADYTUMFS_BLOCK_SIZE
+                                    : ADYTUMFS_BLOCK_SIZE;
+}
+
+static u64 entry_end(u64 index) {
+    u64 end = 0;
+    for (u64 at = 0; at <= index; at++) end += entry_len(at);
+    return end;
+}
+
+// An independent count of the entries a cut at a block boundary has to leave:
+// every entry that starts below the cut. Computed from the layout the inserts
+// used and from nothing the tree reports, so it is an oracle rather than a
+// restatement. Entry i starts at block i below the run and at block i + 1
+// above it, because the run entry covers two.
+static u64 kept_by_cut(u64 blocks) {
+    u64 kept = 0;
+    for (u64 index = 0; index < TRUNCATE_ENTRIES; index++) {
+        u64 start = (entry_end(index) - entry_len(index)) / ADYTUMFS_BLOCK_SIZE;
+        if (start < blocks) kept++;
+    }
+    return kept;
+}
+
+// Insert the whole run and hand back its root. 102 entries land in four
+// leaves of 25, 25, 25 and 27 under one branch, so a cut has siblings to the
+// right of the descended path to drop at every level but the last.
+static int build_run(struct kernel_object *dev, struct adytumfs_superblock *super,
+                     struct adytumfs_cas *store, u8 root[ADYTUMFS_CAS_HASH_SIZE]) {
+    u8 next[ADYTUMFS_CAS_HASH_SIZE];
+    struct adytumfs_tree_key key;
+    struct adytumfs_tree_value value;
+    crypto_zero(root, ADYTUMFS_CAS_HASH_SIZE);
+    for (u64 index = 0; index < TRUNCATE_ENTRIES; index++) {
+        key.end = entry_end(index);
+        value_at((u32)index, &value);
+        value.length = entry_len(index);
+        if (adytumfs_tree_insert(dev, super, store, root, &key, &value, next))
+            return -1;
+        root_copy(root, next);
+    }
+    return 0;
+}
+
+// One truncation against a fresh volume: build the run, cut it, then check the
+// entry count and that the bytes below the cut still resolve while the ones at
+// or above it do not.
+static int check_cut(struct kernel_object *dev,
+                     struct adytumfs_superblock *super,
+                     struct adytumfs_cas *store, u64 cut, u64 kept,
+                     int root_is_leaf) {
+    u8 root[ADYTUMFS_CAS_HASH_SIZE];
+    u8 next[ADYTUMFS_CAS_HASH_SIZE];
+    struct adytumfs_tree_span found;
+    if (build_run(dev, super, store, root)) return -1;
+    if (tree_entries(dev, super, store, root) != TRUNCATE_ENTRIES) return -1;
+    if (adytumfs_tree_truncate(dev, super, store, root, cut, next)) return -1;
+    if (tree_entries(dev, super, store, next) != kept) return -1;
+    if (kept && adytumfs_tree_root_empty(next)) return -1;
+    if (!kept && !adytumfs_tree_root_empty(next)) return -1;
+    if (kept) {
+        u8 probe_root[ADYTUMFS_CAS_HASH_SIZE];
+        u64 number = 0;
+        if (adytumfs_cas_lookup(dev, super, store, next, &number)) return -1;
+        static u8 head[ADYTUMFS_BLOCK_SIZE];
+        if (adytumfs_data_read(dev, super, number, head)) return -1;
+        int is_leaf = adytumfs_read_le32(head + 4) == 0;
+        if (is_leaf != root_is_leaf) return -1;
+        crypto_zero(probe_root, ADYTUMFS_CAS_HASH_SIZE);
+        // The last byte the cut leaves in the file resolves and the first one
+        // it took away does not. A cut at or past the end leaves the whole
+        // file, so the byte to probe is the file's own last one rather than a
+        // byte that was never there.
+        u64 size = entry_end(TRUNCATE_ENTRIES - 1u);
+        u64 limit = cut < size ? cut : size;
+        u64 last = limit - 1u;
+        if (adytumfs_tree_find(dev, super, store, next, last, &found))
+            return -1;
+        // The entry that covers the last surviving byte has to end exactly
+        // where the file now ends. Nothing else catches a straddler whose end
+        // stayed where it was: it keeps its entry count, it stays findable,
+        // and the overlap it now has with the entry before it is across a leaf
+        // boundary, where no node's own validation can see it.
+        if (found.end != limit) return -1;
+        // A cut shortens an entry, it never moves the entry's start. Asking
+        // where the covering entry begins is what tells a shortened straddler
+        // from one that kept its old length: the second slides its start back
+        // over the entry before it, and that overlap crosses a leaf boundary,
+        // so no node's own validation can see it.
+        u64 want_start = 0;
+        for (u64 index = 0; index < TRUNCATE_ENTRIES; index++) {
+            u64 start = entry_end(index) - entry_len(index);
+            if (start <= last && entry_end(index) > last) {
+                want_start = start;
+                break;
+            }
+        }
+        if (found.start != want_start) return -1;
+        if (adytumfs_tree_find(dev, super, store, next, cut, &found) == 0)
+            return -1;
+        // Every separator still has to name its subtree's greatest key. A
+        // truncation shrinks that key and routing survives a stale separator
+        // anyway, so reading the nodes back is the only thing that can tell.
+        static u8 child_node[ADYTUMFS_BLOCK_SIZE];
+        static u8 node_scratch[ADYTUMFS_BLOCK_SIZE];
+        if (separators_exact(dev, super, store, next, node_scratch,
+                             child_node) != 1)
+            return -1;
+    }
+    // Discarding the old root has to leave the new one standing. A truncation
+    // that did not take a reference on the root it hands back would return a
+    // tree the next collection walk is free to take apart.
+    u32 remaining = 0;
+    if (adytumfs_tree_discard(dev, super, store, root, 4096u, &remaining))
+        return -1;
+    if (tree_entries(dev, super, store, next) != kept) return -1;
+    if (kept) {
+        u64 size = entry_end(TRUNCATE_ENTRIES - 1u);
+        u64 limit = cut < size ? cut : size;
+        if (adytumfs_tree_find(dev, super, store, next, limit - 1u, &found) ||
+            found.end != limit)
+            return -1;
+    }
+    return 0;
+}
+
+int test_adytumfs_tree_truncate64(void) {
+    static struct adytumfs_cas store;
+    static u8 scratch[ADYTUMFS_BLOCK_SIZE];
+    struct adytumfs_superblock super;
+    u32 objects = object_active_count();
+    u32 devices = block_active_count();
+    struct kernel_object *dev = block_create(4096, 0);
+    int valid = dev && adytumfs_make(dev) == 0 &&
+        adytumfs_block_read(dev, 0, scratch) == 0 &&
+        adytumfs_super_unpack(&super, scratch) == 0;
+    valid = valid && tree_index_empty(dev, &super, &store) == 0;
+
+    // Cuts at a boundary and inside the two block run, each keeping a
+    // different number of leaves alive so both the drop and the collapse are
+    // reached. The last is inside the run, which is the only cut that has to
+    // shorten an entry rather than just drop it.
+    // The oracle is pinned to one hand counted value, or a mistake in it
+    // would move every expectation below along with it.
+    valid = valid && kept_by_cut(60u) == 59u && kept_by_cut(51u) == 51u &&
+        kept_by_cut(20u) == 20u && kept_by_cut(0) == 0 &&
+        kept_by_cut(TRUNCATE_ENTRIES + 1u) == TRUNCATE_ENTRIES;
+
+    struct {
+        u64 blocks;
+        int leaf;
+    } cases[] = {
+        { 20u, 1 },
+        { 30u, 0 },
+        { 60u, 0 },
+        { 51u, 0 },
+        { 0, 0 },
+        { (entry_end(TRUNCATE_ENTRIES - 1u)) / ADYTUMFS_BLOCK_SIZE, 0 },
+        { (entry_end(TRUNCATE_ENTRIES - 1u)) / ADYTUMFS_BLOCK_SIZE + 1u, 0 },
+    };
+    for (u32 index = 0; valid && index < sizeof(cases) / sizeof(cases[0]);
+         index++)
+        valid = check_cut(dev, &super, &store,
+                          cases[index].blocks * ADYTUMFS_BLOCK_SIZE,
+                          kept_by_cut(cases[index].blocks),
+                          cases[index].leaf) == 0;
+
+    // A cut that is not a whole number of blocks cannot be represented,
+    // because an entry ends on a block boundary or not at all.
+    u8 root[ADYTUMFS_CAS_HASH_SIZE];
+    u8 next[ADYTUMFS_CAS_HASH_SIZE];
+    valid = valid && build_run(dev, &super, &store, root) == 0 &&
+        adytumfs_tree_truncate(dev, &super, &store, root,
+                               ADYTUMFS_BLOCK_SIZE + 1u, next) != 0;
+    // Truncating an empty tree is not an error, because unlinking a file that
+    // never had data has to work.
+    u8 empty[ADYTUMFS_CAS_HASH_SIZE];
+    crypto_zero(empty, ADYTUMFS_CAS_HASH_SIZE);
+    valid = valid &&
+        adytumfs_tree_truncate(dev, &super, &store, empty, 0, next) == 0 &&
+        adytumfs_tree_root_empty(next) == 1;
+    // An empty tree has no leaf to reject an unaligned cut, so refusing it up
+    // front is the only thing that stands between a caller and a tree that
+    // silently accepted an offset no entry can end at.
+    valid = valid &&
+        adytumfs_tree_truncate(dev, &super, &store, empty,
+                               ADYTUMFS_BLOCK_SIZE + 1u, next) != 0;
+
+    adytumfs_window_discard(dev);
+    if (dev) object_release(dev);
+    valid = valid && object_active_count() == objects &&
+        block_active_count() == devices;
+    return valid ? 0 : -1;
+}
+
 int test_adytumfs_tree_remove64(void) {
     static struct adytumfs_cas store;
     static u8 scratch[ADYTUMFS_BLOCK_SIZE];

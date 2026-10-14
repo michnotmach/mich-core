@@ -713,6 +713,161 @@ static int tree_remove(struct kernel_object *device,
     return 0;
 }
 
+// Find the entry that covers a byte offset. The key is the exclusive end, so
+// the covering entry is the first one whose end is above the offset, which is
+// the lower bound the descent already lands on. The extra start check is what
+// separates "covered" from "in a hole": a file with a gap has entries on both
+// sides of it, and the lower bound of an offset inside the gap is the entry
+// after the gap.
+static int tree_find(struct kernel_object *device,
+                     struct adytumfs_superblock *super,
+                     struct adytumfs_cas *store,
+                     const u8 root[ADYTUMFS_CAS_HASH_SIZE], u64 offset,
+                     struct adytumfs_tree_span *span) {
+    if (!device || !super || !store || !root || !span) return -1;
+    if (adytumfs_tree_root_empty(root)) return -1;
+    if (offset + 1u == 0) return -1;
+    struct adytumfs_tree_key probe;
+    probe.end = offset + 1u;
+    static struct adytumfs_tree_step path[ADYTUMFS_TREE_DEPTH_MAX];
+    u32 depth = 0;
+    int found = -1;
+    if (tree_descend(device, super, store, root, &probe, path, &depth, &found))
+        return -1;
+    if (tree_fetch(device, super, store, path[depth - 1u].hash, tree_node))
+        return -1;
+    static struct adytumfs_tree_key keys[ADYTUMFS_TREE_LEAF_MAX];
+    static struct adytumfs_tree_value values[ADYTUMFS_TREE_LEAF_MAX];
+    u32 count = 0;
+    if (adytumfs_tree_leaf_unpack(tree_node, &count, keys, values)) return -1;
+    u32 at = path[depth - 1u].index;
+    if (at >= count) return -1;
+    if (keys[at].end - values[at].length > offset) return -1;
+    span->start = keys[at].end - values[at].length;
+    span->end = keys[at].end;
+    for (u32 byte = 0; byte < ADYTUMFS_CAS_HASH_SIZE; byte++)
+        span->hash[byte] = values[at].hash[byte];
+    return 0;
+}
+
+// Drop every entry at or above a byte offset and shorten the one that
+// straddles it. Only a suffix goes, so the entries that survive are a prefix
+// of the leaf and the last of them is the only one whose length can change.
+static int leaf_truncate(struct kernel_object *device,
+                         struct adytumfs_superblock *super,
+                         struct adytumfs_cas *store, const u8 *node, u64 at,
+                         struct adytumfs_tree_shrink *below) {
+    static struct adytumfs_tree_key keys[ADYTUMFS_TREE_LEAF_MAX];
+    static struct adytumfs_tree_value values[ADYTUMFS_TREE_LEAF_MAX];
+    u32 count = 0;
+    if (adytumfs_tree_leaf_unpack(node, &count, keys, values)) return -1;
+    u32 keep = count;
+    for (u32 index = 0; index < count; index++) {
+        if (keys[index].end < at) continue;
+        u64 start = keys[index].end - values[index].length;
+        if (keys[index].end == at || start < at) {
+            // The straddler keeps the part below the cut, so both of its
+            // fields move: the end becomes the cut and the length is what is
+            // left below it. Leaving the end alone would keep the entry
+            // structurally valid and silently point it at the wrong blocks.
+            keys[index].end = at;
+            values[index].length = at - start;
+            keep = index + 1u;
+        } else {
+            keep = index;
+        }
+        break;
+    }
+    if (!keep) {
+        below->gone = 1;
+        return 0;
+    }
+    if (adytumfs_tree_leaf_pack(tree_node, keep, keys, values)) return -1;
+    below->gone = 0;
+    key_from_entry(tree_node, keep - 1u, 0, &below->child_max);
+    return tree_store(device, super, store, tree_node, below->child);
+}
+
+// Rewrite one branch on the way up from a truncation. Everything after the
+// descended child goes with it: the descent picked the first child whose
+// separator reaches the cut, so every child past that one holds keys strictly
+// above it and has nothing left to keep. The dropped subtrees are not freed
+// here, they simply stop being reachable and the collection walk takes them.
+static int branch_truncate(struct kernel_object *device,
+                           struct adytumfs_superblock *super,
+                           struct adytumfs_cas *store, const u8 *node,
+                           u32 at, int is_root,
+                           const struct adytumfs_tree_shrink *below,
+                           struct adytumfs_tree_shrink *above) {
+    static struct adytumfs_tree_key keys[ADYTUMFS_TREE_BRANCH_MAX];
+    static u8 children[ADYTUMFS_TREE_BRANCH_MAX][ADYTUMFS_CAS_HASH_SIZE];
+    u32 count = 0;
+    if (adytumfs_tree_branch_unpack(node, &count, keys, children)) return -1;
+    if (at >= count) return -1;
+    u32 total = at;
+    if (!below->gone) {
+        keys[at] = below->child_max;
+        hash_copy(children[at], below->child);
+        total = at + 1u;
+    }
+    if (!total) {
+        above->gone = 1;
+        return 0;
+    }
+    // A root left with one child is a level the tree no longer needs, and it is
+    // dropped before the store for the same reason a removal drops it: a one
+    // entry branch written first would be reachable from nothing afterwards.
+    if (is_root && total == 1u) {
+        above->gone = 0;
+        hash_copy(above->child, children[0]);
+        return 0;
+    }
+    if (adytumfs_tree_branch_pack(tree_node, total, keys, children)) return -1;
+    above->gone = 0;
+    key_from_entry(tree_node, total - 1u, 1, &above->child_max);
+    return tree_store(device, super, store, tree_node, above->child);
+}
+
+static int tree_truncate(struct kernel_object *device,
+                         struct adytumfs_superblock *super,
+                         struct adytumfs_cas *store,
+                         const u8 root[ADYTUMFS_CAS_HASH_SIZE], u64 at,
+                         u8 new_root[ADYTUMFS_CAS_HASH_SIZE]) {
+    if (!device || !super || !store || !root || !new_root) return -1;
+    if (at & (ADYTUMFS_BLOCK_SIZE - 1u)) return -1;
+    for (u32 index = 0; index < ADYTUMFS_CAS_HASH_SIZE; index++)
+        new_root[index] = 0;
+    if (adytumfs_tree_root_empty(root)) return 0;
+    struct adytumfs_tree_key probe;
+    probe.end = at;
+    static struct adytumfs_tree_step path[ADYTUMFS_TREE_DEPTH_MAX];
+    u32 depth = 0;
+    int found = -1;
+    if (tree_descend(device, super, store, root, &probe, path, &depth, &found))
+        return -1;
+    struct adytumfs_tree_shrink below;
+    struct adytumfs_tree_shrink above;
+    static u8 node_copy[ADYTUMFS_BLOCK_SIZE];
+    if (tree_fetch(device, super, store, path[depth - 1u].hash, tree_node))
+        return -1;
+    for (u32 index = 0; index < ADYTUMFS_BLOCK_SIZE; index++)
+        node_copy[index] = tree_node[index];
+    if (leaf_truncate(device, super, store, node_copy, at, &below)) return -1;
+    for (u32 step = depth - 1u; step > 0; step--) {
+        if (tree_fetch(device, super, store, path[step - 1u].hash, tree_node))
+            return -1;
+        for (u32 index = 0; index < ADYTUMFS_BLOCK_SIZE; index++)
+            node_copy[index] = tree_node[index];
+        if (branch_truncate(device, super, store, node_copy,
+                            path[step - 1u].index, step == 1u, &below, &above))
+            return -1;
+        below = above;
+    }
+    if (below.gone) return 0;
+    hash_copy(new_root, below.child);
+    return 0;
+}
+
 struct adytumfs_tree_discard_item {
     u8 hash[ADYTUMFS_CAS_HASH_SIZE];
     u32 depth;
@@ -774,6 +929,24 @@ static int discard_run(struct kernel_object *device,
     }
     *remaining = discard_top;
     return 0;
+}
+
+int adytumfs_tree_find(struct kernel_object *device,
+                       struct adytumfs_superblock *super,
+                       struct adytumfs_cas *store,
+                       const u8 root[ADYTUMFS_CAS_HASH_SIZE], u64 offset,
+                       struct adytumfs_tree_span *span) {
+    return tree_find(device, super, store, root, offset, span);
+}
+
+int adytumfs_tree_truncate(struct kernel_object *device,
+                           struct adytumfs_superblock *super,
+                           struct adytumfs_cas *store,
+                           const u8 root[ADYTUMFS_CAS_HASH_SIZE], u64 at,
+                           u8 new_root[ADYTUMFS_CAS_HASH_SIZE]) {
+    if (tree_truncate(device, super, store, root, at, new_root)) return -1;
+    if (adytumfs_tree_root_empty(new_root)) return 0;
+    return adytumfs_cas_retain(device, super, store, new_root);
 }
 
 int adytumfs_tree_discard(struct kernel_object *device,

@@ -137,6 +137,39 @@ int adytumfs_tree_remove(struct kernel_object *device,
                          const struct adytumfs_tree_key *key,
                          u8 new_root[ADYTUMFS_CAS_HASH_SIZE]);
 
+// What a lookup resolves to: the content that covers a byte range. A caller
+// moving through a file needs the range and not only the content, because the
+// entry it is in ends somewhere and the next byte may be in another entry, in
+// a hole, or past the end of the file.
+struct adytumfs_tree_span {
+    u8 hash[ADYTUMFS_CAS_HASH_SIZE];
+    u64 start;
+    u64 end;
+};
+
+// Find the span covering a byte offset, or fail when the offset falls in a
+// hole or past the end. This is the lookup a read or write wants: the key is
+// the exclusive end of an entry, so the entry that covers an offset is the
+// first one whose end is above it, and no caller has to know that.
+int adytumfs_tree_find(struct kernel_object *device,
+                       struct adytumfs_superblock *super,
+                       struct adytumfs_cas *store,
+                       const u8 root[ADYTUMFS_CAS_HASH_SIZE], u64 offset,
+                       struct adytumfs_tree_span *span);
+
+// Cut the tree down to the bytes below at, copy on write, and hand back the
+// new root the way insert and remove do. at is a byte count and has to be a
+// whole number of blocks, because an entry cannot end in the middle of one.
+// The entry that straddles the cut is shortened rather than dropped. Only a
+// suffix goes, which is what truncating and unlinking a file need; the
+// subtrees that stop being reachable are collected by the walk below. An empty
+// tree and a cut at zero both yield the zero root that means empty.
+int adytumfs_tree_truncate(struct kernel_object *device,
+                           struct adytumfs_superblock *super,
+                           struct adytumfs_cas *store,
+                           const u8 root[ADYTUMFS_CAS_HASH_SIZE], u64 at,
+                           u8 new_root[ADYTUMFS_CAS_HASH_SIZE]);
+
 // Drop every version that this root is the only reason to keep, which is what
 // makes a commit collect its own garbage instead of leaking a node per write.
 // budget caps the nodes one call touches, so dropping a large subtree cannot
