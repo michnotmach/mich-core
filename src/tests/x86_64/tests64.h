@@ -51,6 +51,7 @@ int test_adytumfs_super64(void);
 int test_adytumfs_volume64(void);
 int test_adytumfs_alloc64(void);
 int test_adytumfs_cas64(void);
+int test_adytumfs_tree64(void);
 int test_adytumfs_inode64(void);
 int test_adytumfs_extent64(void);
 int test_adytumfs_dir64(void);
