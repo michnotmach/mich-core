@@ -54,7 +54,7 @@ int test_adytumfs_extent64(void) {
         adytumfs_inode_map(dev, &super, &store, &a, 5, &physical) != 0;
 
     // What a hole resolves to really is zeroes.
-    valid = valid && adytumfs_data_read(dev, &super, hole, block) == 0;
+    valid = valid && adytumfs_block_read(dev, hole, block) == 0;
     for (u32 index = 0; valid && index < ADYTUMFS_BLOCK_SIZE; index++)
         if (block[index]) {
             valid = 0;
@@ -103,7 +103,7 @@ int test_adytumfs_extent64(void) {
         side == hole &&
         adytumfs_inode_map(dev, &super, &store, &a, 3, &side) == 0 &&
         side == hole &&
-        adytumfs_data_read(dev, &super, own, block) == 0 &&
+        adytumfs_block_read(dev, own, block) == 0 &&
         block[0] == 7u && block[ADYTUMFS_BLOCK_SIZE - 1] == 6u;
 
     // Truncating to three drops the tail and keeps the written block. The

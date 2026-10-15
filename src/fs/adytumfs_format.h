@@ -199,24 +199,22 @@ int adytumfs_block_write(struct kernel_object *device, u64 block,
 // Zero one 4 KiB block with direct device I/O, bypassing the cache, and drop
 // any cached copy first. File data moves through direct page transfers, so a
 // cached zero would be flushed over the real bytes later, and a reallocated
-// block must not resurrect its previous owner's cached content either. The
-// zero image is sealed into the checksum region, because a grown hole must
-// read back as zeroes through the verified path too.
-int adytumfs_block_zero(struct kernel_object *device,
-                        const struct adytumfs_superblock *super, u64 block);
-// Read or write one data block through its checksum region entry: a read
+// block must not resurrect its previous owner's cached content either.
+int adytumfs_block_zero(struct kernel_object *device, u64 block);
+// Read or write one index block through its checksum region entry: a read
 // hands back only bytes the region vouches for, and a write seals the new
-// crc32c alongside the data. Metadata blocks (super, bitmap, table, and the
-// region itself) go through the raw block calls above.
+// crc32c alongside the data. The index is the one structure nothing else
+// vouches for, so it keeps the region until it carries its own crc32c.
+// Content blocks go through the raw block calls above and answer to the
+// hash their parent records instead.
 int adytumfs_data_read(struct kernel_object *device,
                        const struct adytumfs_superblock *super,
                        u64 block, u8 *buffer);
 int adytumfs_data_write(struct kernel_object *device,
                         const struct adytumfs_superblock *super,
                         u64 block, const u8 *buffer);
-// Compare a data block's bytes against its region entry, or seal new bytes
-// into it. The page-cache paths move file data with direct transfers into
-// pages, so they verify and seal without a staging block.
+// Compare an index block's bytes against its region entry, or seal new
+// bytes into it.
 int adytumfs_data_check(struct kernel_object *device,
                         const struct adytumfs_superblock *super,
                         u64 block, const u8 *bytes);

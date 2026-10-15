@@ -63,7 +63,7 @@ static int value_place(struct kernel_object *dev,
     value->length = ADYTUMFS_BLOCK_SIZE;
     u64 number = 0;
     if (adytumfs_cas_place(dev, super, store, value->hash, &number)) return -1;
-    return adytumfs_data_write(dev, super, number, content);
+    return adytumfs_block_write(dev, number, content);
 }
 
 // The tree resolves a node by hash, so it runs against the index mkfs
@@ -397,7 +397,7 @@ int test_adytumfs_tree_traverse64(void) {
     u64 root_block = 0;
     valid = valid &&
         adytumfs_cas_lookup(dev, &super, &store, next, &root_block) == 0 &&
-        adytumfs_data_read(dev, &super, root_block, scratch) == 0 &&
+        adytumfs_block_read(dev, root_block, scratch) == 0 &&
         adytumfs_read_le32(scratch + 4) == 1u &&
         adytumfs_read_le32(scratch + 8) == 2u;
 
@@ -464,10 +464,10 @@ int test_adytumfs_tree_traverse64(void) {
     key = key_at(0);
     valid = valid &&
         adytumfs_cas_lookup(dev, &super, &store, next, &root_block) == 0 &&
-        adytumfs_data_read(dev, &super, root_block, scratch) == 0;
+        adytumfs_block_read(dev, root_block, scratch) == 0;
     scratch[ADYTUMFS_TREE_HEADER_SIZE] ^= 0x01u;
     valid = valid &&
-        adytumfs_data_write(dev, &super, root_block, scratch) == 0 &&
+        adytumfs_block_write(dev, root_block, scratch) == 0 &&
         adytumfs_tree_lookup(dev, &super, &store, next, &key, &found) != 0 &&
         adytumfs_tree_insert(dev, &super, &store, next, &key, &value,
                              next) != 0;
@@ -649,10 +649,10 @@ int test_adytumfs_tree_gc64(void) {
         adytumfs_tree_insert(dev, &super, &store, root, &key, &value,
                              next) == 0 &&
         adytumfs_cas_lookup(dev, &super, &store, kept, &block) == 0 &&
-        adytumfs_data_read(dev, &super, block, scratch) == 0;
+        adytumfs_block_read(dev, block, scratch) == 0;
     scratch[ADYTUMFS_TREE_HEADER_SIZE] ^= 0x01u;
     valid = valid &&
-        adytumfs_data_write(dev, &super, block, scratch) == 0 &&
+        adytumfs_block_write(dev, block, scratch) == 0 &&
         adytumfs_tree_discard(dev, &super, &store, kept, 64u, &left) != 0;
 
     adytumfs_window_discard(dev);
@@ -671,7 +671,7 @@ static int root_shape(struct kernel_object *device,
                       u32 *level, u32 *count) {
     u64 number = 0;
     if (adytumfs_cas_lookup(device, super, store, root, &number)) return -1;
-    if (adytumfs_data_read(device, super, number, scratch)) return -1;
+    if (adytumfs_block_read(device, number, scratch)) return -1;
     *level = adytumfs_read_le32(scratch + 4);
     *count = adytumfs_read_le32(scratch + 8);
     return 0;
@@ -687,7 +687,7 @@ static int separators_exact(struct kernel_object *device,
                             u8 *scratch, u8 *child) {
     u64 number = 0;
     if (adytumfs_cas_lookup(device, super, store, root, &number)) return -1;
-    if (adytumfs_data_read(device, super, number, scratch)) return -1;
+    if (adytumfs_block_read(device, number, scratch)) return -1;
     if (adytumfs_read_le32(scratch + 4) != 1u) return 1;
     u32 count = adytumfs_read_le32(scratch + 8);
     for (u32 index = 0; index < count; index++) {
@@ -697,7 +697,7 @@ static int separators_exact(struct kernel_object *device,
         if (adytumfs_cas_lookup(device, super, store,
                                 entry + ADYTUMFS_TREE_KEY_SIZE, &at))
             return -1;
-        if (adytumfs_data_read(device, super, at, child)) return -1;
+        if (adytumfs_block_read(device, at, child)) return -1;
         u32 entries = adytumfs_read_le32(child + 8);
         if (!entries) return 0;
         u32 stride = adytumfs_read_le32(child + 4)
@@ -724,7 +724,7 @@ static u64 tree_entries(struct kernel_object *device,
     u64 number = 0;
     if (adytumfs_cas_lookup(device, super, store, root, &number))
         return (u64)-1;
-    if (adytumfs_data_read(device, super, number, scratch)) return (u64)-1;
+    if (adytumfs_block_read(device, number, scratch)) return (u64)-1;
     u32 level = adytumfs_read_le32(scratch + 4);
     u32 count = adytumfs_read_le32(scratch + 8);
     if (!level) return count;
@@ -899,7 +899,7 @@ static int check_cut(struct kernel_object *dev,
         u64 number = 0;
         if (adytumfs_cas_lookup(dev, super, store, next, &number)) return -1;
         static u8 head[ADYTUMFS_BLOCK_SIZE];
-        if (adytumfs_data_read(dev, super, number, head)) return -1;
+        if (adytumfs_block_read(dev, number, head)) return -1;
         int is_leaf = adytumfs_read_le32(head + 4) == 0;
         if (is_leaf != root_is_leaf) return -1;
         crypto_zero(probe_root, ADYTUMFS_CAS_HASH_SIZE);

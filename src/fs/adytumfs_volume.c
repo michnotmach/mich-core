@@ -92,8 +92,7 @@ int adytumfs_zero_hash(u8 hash[ADYTUMFS_HASH_SIZE]) {
     return 0;
 }
 
-int adytumfs_block_zero(struct kernel_object *device,
-                        const struct adytumfs_superblock *super, u64 block) {
+int adytumfs_block_zero(struct kernel_object *device, u64 block) {
     u32 lba = (u32)(block * ADYTUMFS_SECTORS_PER_BLOCK);
     block_cache_invalidate(device, lba, ADYTUMFS_SECTORS_PER_BLOCK);
     for (u32 sector = 0; sector < ADYTUMFS_SECTORS_PER_BLOCK; sector++)
@@ -101,9 +100,9 @@ int adytumfs_block_zero(struct kernel_object *device,
                      adytumfs_zero_block + sector * BLOCK_SECTOR_SIZE,
                      BLOCK_SECTOR_SIZE))
             return -1;
-    // A freshly allocated block reads back as zeroes through the verified
-    // path, so the zero image has to be sealed like any other write.
-    return adytumfs_data_seal(device, super, block, adytumfs_zero_block);
+    // No seal: a content block is vouched for by the hash its parent
+    // records, and the zero image names itself through adytumfs_zero_hash.
+    return 0;
 }
 
 int adytumfs_make(struct kernel_object *device) {

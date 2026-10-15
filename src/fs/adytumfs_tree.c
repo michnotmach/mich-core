@@ -281,7 +281,7 @@ static int tree_store(struct kernel_object *device,
                                 block + ADYTUMFS_TREE_HEADER_SIZE +
                                     index * stride + ADYTUMFS_TREE_KEY_SIZE))
             return -1;
-    return adytumfs_data_write(device, super, number, block);
+    return adytumfs_block_write(device, number, block);
 }
 
 static void hash_copy(u8 *to, const u8 *from) {

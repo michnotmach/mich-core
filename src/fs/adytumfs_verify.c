@@ -53,7 +53,7 @@ static int verify_tree_bytes(struct kernel_object *device,
             hash[index] = stack[top][index];
         u64 block = 0;
         if (adytumfs_cas_lookup(device, super, store, hash, &block)) return -1;
-        if (adytumfs_data_read(device, super, block, node)) return -1;
+        if (adytumfs_block_read(device, block, node)) return -1;
         if (adytumfs_tree_node_hash(node, check)) return -1;
         for (u32 index = 0; index < ADYTUMFS_HASH_SIZE; index++)
             if (hash[index] != check[index]) return -1;
@@ -99,7 +99,7 @@ static int verify_tree_refs(struct kernel_object *device,
             hash[index] = stack[top][index];
         u64 block = 0;
         if (adytumfs_cas_lookup(device, super, store, hash, &block)) return -1;
-        if (adytumfs_data_read(device, super, block, node)) return -1;
+        if (adytumfs_block_read(device, block, node)) return -1;
         if (adytumfs_tree_node_hash(node, check)) return -1;
         for (u32 index = 0; index < ADYTUMFS_HASH_SIZE; index++)
             if (hash[index] != check[index]) return -1;
@@ -216,7 +216,7 @@ static int rebuild_index(struct kernel_object *device,
         int bit = verify_bit(device, super, number);
         if (bit < 0) return -1;
         if (!bit) continue;
-        if (adytumfs_data_read(device, super, number, block)) return -1;
+        if (adytumfs_block_read(device, number, block)) return -1;
         if (adytumfs_tree_node_hash(block, hash)) return -1;
         // A content address names one block, so a second allocated block
         // hashing to a value already mapped is corruption. Inserting refuses

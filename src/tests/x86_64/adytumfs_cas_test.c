@@ -97,7 +97,7 @@ int test_adytumfs_cas64(void) {
         cas_live(dev, &super, &store) == 2;
 
     cas_image(1, block);
-    valid = valid && adytumfs_data_write(dev, &super, block_a, block) == 0;
+    valid = valid && adytumfs_block_write(dev, block_a, block) == 0;
 
     // Relocation moves the content and repoints the index. The key is an
     // input, never rewritten: the same hash still finds the block, now at a
@@ -110,7 +110,7 @@ int test_adytumfs_cas64(void) {
     valid = valid &&
         adytumfs_cas_lookup(dev, &super, &store, key_a, &found) == 0 &&
         found == moved &&
-        adytumfs_data_read(dev, &super, moved, readback) == 0;
+        adytumfs_block_read(dev, moved, readback) == 0;
     for (u32 index = 0; valid && index < ADYTUMFS_BLOCK_SIZE; index++)
         valid = readback[index] == block[index];
 

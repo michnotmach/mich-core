@@ -213,7 +213,7 @@ int adytumfs_cas_relocate(struct kernel_object *device,
     u64 to = 0;
     if (adytumfs_alloc_run(device, super, 1, &to)) return -1;
     if (adytumfs_cas_read(device, super, store, hash, cas_copy_scratch) ||
-        adytumfs_data_write(device, super, to, cas_copy_scratch)) {
+        adytumfs_block_write(device, to, cas_copy_scratch)) {
         adytumfs_free_run(device, super, to, 1);
         return -1;
     }

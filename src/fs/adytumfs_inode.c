@@ -219,7 +219,7 @@ static int content_place(struct kernel_object *device,
     if (blake2b(hash, ADYTUMFS_HASH_SIZE, content, ADYTUMFS_BLOCK_SIZE))
         return -1;
     if (adytumfs_cas_place(device, super, store, hash, number)) return -1;
-    return adytumfs_data_write(device, super, *number, content);
+    return adytumfs_block_write(device, *number, content);
 }
 
 int adytumfs_inode_grow(struct kernel_object *device,
@@ -239,7 +239,7 @@ int adytumfs_inode_grow(struct kernel_object *device,
     value.length = (new_blocks - blocks) * ADYTUMFS_BLOCK_SIZE;
     if (adytumfs_cas_place(device, super, store, value.hash, &number))
         return -1;
-    if (adytumfs_block_zero(device, super, number)) return -1;
+    if (adytumfs_block_zero(device, number)) return -1;
     struct adytumfs_tree_key key;
     u8 next[ADYTUMFS_HASH_SIZE];
     key.end = new_blocks * ADYTUMFS_BLOCK_SIZE;
