@@ -572,12 +572,15 @@ int test_adytumfs_tree_gc64(void) {
             left == 0;
         root_copy(root, next);
     }
-    // Splitting in half does not rebalance, so 102 keys land in four leaves
-    // of 25, 25, 25 and 27 with the branch over them, and nothing else: every
+    // Splitting in half does not rebalance, so 102 keys land in three leaves
+    // of 26, 26 and 50 with the branch over them, and nothing else: every
     // intermediate version of the way down has been collected. The second run
-    // brings its own content, so the store holds both runs' blocks.
+    // brings its own content, so the store holds both runs' blocks. A leaf
+    // splits once the entry being written has been cut in around it, which is
+    // why the halves are even and the last leaf runs up to nearly full before
+    // it splits in turn.
     u64 grown = tree_count(dev, &super, &store);
-    valid = valid && grown == 2u * ADYTUMFS_TREE_LEAF_MAX + 5u;
+    valid = valid && grown == 2u * ADYTUMFS_TREE_LEAF_MAX + 4u;
 
     for (u32 round = 0; round < 20u; round++) {
         key = key_at(ADYTUMFS_TREE_LEAF_MAX);

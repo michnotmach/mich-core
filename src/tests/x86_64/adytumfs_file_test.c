@@ -2,6 +2,7 @@
 #include "object.h"
 #include "block.h"
 #include "adytumfs_format.h"
+#include "adytumfs_cas.h"
 
 int test_adytumfs_file64(void) {
     u32 objects = object_active_count();
@@ -12,9 +13,13 @@ int test_adytumfs_file64(void) {
     // threaded, so the scratch blocks are static.
     static u8 block[ADYTUMFS_BLOCK_SIZE];
     struct adytumfs_superblock super;
+    // The content store every extent tree resolves through. A test that
+    // touches a file's blocks needs one, exactly as a mount does.
+    static struct adytumfs_cas store;
     int valid = dev && adytumfs_make(dev) == 0 &&
         adytumfs_block_read(dev, 0, block) == 0 &&
         adytumfs_super_unpack(&super, block) == 0;
+    adytumfs_cas_open(&store, super.index_start, super.index_blocks);
 
     u64 num = 0;
     valid = valid &&
@@ -30,7 +35,7 @@ int test_adytumfs_file64(void) {
             chunk[index] = (u8)((offset + index) * 131u + 7u);
         u64 written = 0;
         valid = valid &&
-            adytumfs_file_write(dev, &super, num, offset, chunk, span,
+            adytumfs_file_write(dev, &super, &store, num, offset, chunk, span,
                                 &written) == 0 && written == span;
     }
 
@@ -43,7 +48,7 @@ int test_adytumfs_file64(void) {
         u64 span = total - offset < sizeof(chunk) ? total - offset : sizeof(chunk);
         u64 got = 0;
         valid = valid &&
-            adytumfs_file_read(dev, &super, num, offset, chunk, span, &got) == 0 &&
+            adytumfs_file_read(dev, &super, &store, num, offset, chunk, span, &got) == 0 &&
             got == span;
         for (u64 index = 0; index < span && valid; index++)
             if (chunk[index] != (u8)((offset + index) * 131u + 7u)) valid = 0;
@@ -54,9 +59,9 @@ int test_adytumfs_file64(void) {
     u64 transferred = 0;
     u8 window[5];
     valid = valid &&
-        adytumfs_file_write(dev, &super, num, 100, patch, 3, &transferred) == 0 &&
+        adytumfs_file_write(dev, &super, &store, num, 100, patch, 3, &transferred) == 0 &&
         transferred == 3 &&
-        adytumfs_file_read(dev, &super, num, 99, window, 5, &transferred) == 0 &&
+        adytumfs_file_read(dev, &super, &store, num, 99, window, 5, &transferred) == 0 &&
         transferred == 5 &&
         window[0] == (u8)(99u * 131u + 7u) && window[1] == 'X' &&
         window[2] == 'Y' && window[3] == 'Z' &&
@@ -64,7 +69,7 @@ int test_adytumfs_file64(void) {
 
     // Reading at end of file returns nothing.
     valid = valid &&
-        adytumfs_file_read(dev, &super, num, total, window, 5, &transferred) == 0 &&
+        adytumfs_file_read(dev, &super, &store, num, total, window, 5, &transferred) == 0 &&
         transferred == 0;
 
     adytumfs_window_discard(dev);

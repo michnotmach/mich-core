@@ -2,12 +2,19 @@
 #include "object.h"
 #include "block.h"
 #include "adytumfs_format.h"
+#include "adytumfs_cas.h"
+#include "adytumfs_index.h"
+#include "blake2b.h"
 
 // The mount audit is the last thing standing between a damaged volume and a
 // mount that trusts it. It keeps three copies of the allocation truth in
-// agreement: bitmap bits, inode extents, and the superblock counters. Each
-// corruption below breaks exactly one of the three and has to be refused,
-// because a mount that accepts it goes on to write through the disagreement.
+// agreement: bitmap bits, the location index, and the superblock counters.
+// Each
+// corruption below breaks exactly one of the three. A lie confined to the
+// index is one the committed generation can still account for, so the mount
+// rebuilds it and the rebuilt index has to come back true rather than merely
+// accepted. Everything else has to be refused, because a mount that takes it
+// goes on to write through the disagreement.
 
 static int bitmap_flip(struct kernel_object *dev,
                        const struct adytumfs_superblock *super, u64 at,
@@ -45,35 +52,32 @@ int test_adytumfs_verify64(void) {
     // A 4 KiB block is too big for a modest stack, and this test is single
     // threaded, so the scratch block is static.
     static u8 block[ADYTUMFS_BLOCK_SIZE];
+    static struct adytumfs_cas store;
     struct adytumfs_superblock super;
     int valid = dev && adytumfs_make(dev) == 0 &&
         adytumfs_super_read(dev, &super) == 0;
+    adytumfs_cas_open(&store, super.index_start, super.index_blocks);
 
     // A formatted volume balances at zero: the reserved index is allocated and
     // owned by nobody, and the audit has to know that or it would report the
     // reservation as a leak on every mount.
     valid = valid && adytumfs_verify(dev, &super) == 0;
 
-    // Claim three blocks with an extent on a properly allocated inode, then
-    // commit, so the bitmap, the table, and the counters all reach the device
-    // the audit reads.
-    u64 run = 0;
-    u64 first_free = super.index_start + super.index_blocks;
+    // Give one file three blocks through the tree, then commit, so the bitmap,
+    // the index, and the counters all reach the device the audit reads. What
+    // lands is one block of zeroes and the leaf that names it, because a hole
+    // is a run of identical blocks and the format says the hash repeats every
+    // block of them.
     u64 number = 0;
     u64 second = 0;
     struct adytumfs_inode file;
     valid = valid &&
-        adytumfs_alloc_run(dev, &super, 3, &run) == 0 && run == first_free &&
         adytumfs_inode_alloc(dev, &super, ADYTUMFS_MODE_REG | 0644u,
                              &number) == 0 &&
         adytumfs_inode_read(dev, &super, number, &file) == 0 &&
         adytumfs_inode_alloc(dev, &super, ADYTUMFS_MODE_REG | 0644u,
-                             &second) == 0;
-    file.size = 3 * ADYTUMFS_BLOCK_SIZE;
-    file.blocks = 3;
-    file.direct[0].start_block = run;
-    file.direct[0].length = 3;
-    valid = valid && adytumfs_inode_write(dev, &super, number, &file) == 0 &&
+                             &second) == 0 &&
+        adytumfs_inode_grow(dev, &super, &store, &file, number, 3) == 0 &&
         adytumfs_commit(dev, &super) == 0 &&
         // The commit flips the active slot, and unpack always guesses slot
         // zero, so the generation has to be picked the way the mount picks it
@@ -81,30 +85,40 @@ int test_adytumfs_verify64(void) {
         adytumfs_super_read(dev, &super) == 0 &&
         adytumfs_verify(dev, &super) == 0;
 
-    // The ledger is live, not a formality: clearing one claimed bit leaves an
-    // extent pointing at a free block.
-    valid = valid && bitmap_flip(dev, &super, run + 1, block) == 0 &&
-        adytumfs_verify(dev, &super) != 0 &&
-        bitmap_flip(dev, &super, run + 1, block) == 0 &&
+    u8 key[ADYTUMFS_HASH_SIZE];
+    u64 claimed = 0;
+    valid = valid && adytumfs_zero_hash(key) == 0 &&
+        adytumfs_cas_lookup(dev, &super, &store, key, &claimed) == 0;
+
+    // A mapping reaching into the index would let file content overwrite the
+    // structure every hash lookup resolves through. The bitmap bit is already
+    // set, so only the location is wrong, and the location is exactly what the
+    // rebuild recovers: the block still holds the content its own hash names.
+    // So the mount takes the volume, and what has to come back is the true
+    // mapping carrying the one reference the leaf owes it, not the forgery.
+    static struct adytumfs_cas probe_store;
+    u64 resolved = 0;
+    u32 refs = 0;
+    valid = valid &&
+        adytumfs_index_repoint(dev, &super, &store.index, key,
+                               super.index_start) == 0 &&
+        adytumfs_verify(dev, &super) == 0;
+    adytumfs_cas_open(&probe_store, super.index_start, super.index_blocks);
+    valid = valid &&
+        adytumfs_index_fetch(dev, &super, &probe_store.index, key, &resolved,
+                             &refs) == 0 &&
+        resolved == claimed && refs == 1u &&
         adytumfs_verify(dev, &super) == 0;
 
-    // Setting a bit nothing claims is a leak.
-    valid = valid && bitmap_flip(dev, &super, run + 9, block) == 0 &&
+    // A block a mapping names but the bitmap says is free would be handed to
+    // a second owner by the allocator.
+    valid = valid && bitmap_flip(dev, &super, claimed, block) == 0 &&
         adytumfs_verify(dev, &super) != 0 &&
-        bitmap_flip(dev, &super, run + 9, block) == 0 &&
+        bitmap_flip(dev, &super, claimed, block) == 0 &&
         adytumfs_verify(dev, &super) == 0;
 
-    // Clearing a bit inside the reserved index is corruption of a different
-    // kind: the region must stay allocated, or the allocator hands out the
-    // structure every hash lookup resolves through.
-    valid = valid && bitmap_flip(dev, &super, super.index_start, block) == 0 &&
-        adytumfs_verify(dev, &super) != 0 &&
-        bitmap_flip(dev, &super, super.index_start, block) == 0 &&
-        adytumfs_verify(dev, &super) == 0;
-
-    // The free count is the third copy of the truth. The lie is written to the
-    // device and read back the way a mount reads it, so what the audit is
-    // handed is what the volume actually claims.
+    // The superblock free count is audited against what the bitmap and the
+    // index actually hold.
     struct adytumfs_superblock lying = super;
     lying.free_blocks = super.free_blocks + 1;
     struct adytumfs_superblock probe;
@@ -117,16 +131,26 @@ int test_adytumfs_verify64(void) {
 
     // A stray bit on its own trips the free count as well, so it does not
     // prove the ledger is checked. Setting the bit and correcting the count to
-    // match leaves the totals as the only thing that disagrees: three blocks
-    // are claimed, four are allocated, and nothing else can see it.
+    // match leaves the totals as the only thing that disagrees: one more block
+    // is allocated than any content names, and nothing else can see it.
+    u64 stray = 0;
+    valid = valid && adytumfs_block_read(dev, adytumfs_bitmap_block(&super, 0),
+                                         block) == 0;
+    for (u64 scan = super.data_start; valid &&
+         scan < super.data_checksum_region; scan++)
+        if (!(block[scan / 8] & (u8)(1u << (scan % 8)))) {
+            stray = scan;
+            break;
+        }
     struct adytumfs_superblock balanced = super;
     balanced.free_blocks = super.free_blocks - 1;
-    valid = valid && bitmap_flip(dev, &super, run + 9, block) == 0 &&
+    valid = valid && stray &&
+        bitmap_flip(dev, &super, stray, block) == 0 &&
         super_rewrite(dev, &balanced, block) == 0 &&
         adytumfs_super_read(dev, &probe) == 0 &&
         adytumfs_verify(dev, &probe) != 0 &&
         super_rewrite(dev, &super, block) == 0 &&
-        bitmap_flip(dev, &super, run + 9, block) == 0 &&
+        bitmap_flip(dev, &super, stray, block) == 0 &&
         adytumfs_verify(dev, &super) == 0;
 
     // The inode counter is audited the same way: a volume that claims a
@@ -140,30 +164,6 @@ int test_adytumfs_verify64(void) {
         super_rewrite(dev, &super, block) == 0 &&
         adytumfs_verify(dev, &super) == 0;
 
-    // An extent reaching into the index would let a file overwrite it. The
-    // bitmap bits are already set, so only the claim is wrong.
-    struct adytumfs_inode thief = file;
-    thief.direct[0].start_block = super.index_start;
-    valid = valid && inode_rewrite(dev, &super, number, &thief, block) == 0 &&
-        adytumfs_verify(dev, &super) != 0 &&
-        inode_rewrite(dev, &super, number, &file, block) == 0 &&
-        adytumfs_verify(dev, &super) == 0;
-
-    // Two extents sharing a block means two files write through one
-    // allocation. The bitmap counts the block once, so the claim total is what
-    // disagrees.
-    struct adytumfs_inode twin;
-    valid = valid && adytumfs_inode_read(dev, &super, second, &twin) == 0;
-    twin.blocks = 1;
-    twin.direct[0].start_block = run + 2;
-    twin.direct[0].length = 1;
-    valid = valid && inode_rewrite(dev, &super, second, &twin, block) == 0 &&
-        adytumfs_verify(dev, &super) != 0 &&
-        inode_rewrite(dev, &super, second, &(struct adytumfs_inode){
-            .mode = ADYTUMFS_MODE_REG | 0644u, .links = 1, .generation = 1},
-            block) == 0 &&
-        adytumfs_verify(dev, &super) == 0;
-
     // A mode that is neither directory, regular, nor symlink is a table lying
     // about what it holds.
     struct adytumfs_inode odd = file;
@@ -173,19 +173,12 @@ int test_adytumfs_verify64(void) {
         inode_rewrite(dev, &super, number, &file, block) == 0 &&
         adytumfs_verify(dev, &super) == 0;
 
-    // An extent behind the terminator is a layout the format never writes.
-    struct adytumfs_inode sparse = file;
-    sparse.direct[0].length = 1;
-    sparse.blocks = 3;
-    sparse.direct[2].start_block = run + 1;
-    sparse.direct[2].length = 2;
-    valid = valid && inode_rewrite(dev, &super, number, &sparse, block) == 0 &&
-        adytumfs_verify(dev, &super) != 0 &&
-        inode_rewrite(dev, &super, number, &file, block) == 0 &&
-        adytumfs_verify(dev, &super) == 0;
+    // The v2 case for an extent behind the zero length terminator has no
+    // counterpart here, and that is the point: a zero length entry is
+    // unrepresentable, so there is no terminator to hide anything behind.
 
-    // A block count that disagrees with the extents is a file that believes it
-    // is longer than the space it holds.
+    // A block count that disagrees with the bytes the tree covers is a file
+    // that believes it is longer than the space it holds.
     struct adytumfs_inode short_count = file;
     short_count.blocks = 2;
     valid = valid &&
@@ -193,6 +186,35 @@ int test_adytumfs_verify64(void) {
         adytumfs_verify(dev, &super) != 0 &&
         inode_rewrite(dev, &super, number, &file, block) == 0 &&
         adytumfs_verify(dev, &super) == 0;
+
+
+    // Two mappings naming one block means two writers share a single
+    // allocation. The bitmap counts the block once, so the mapping count is
+    // what disagrees, and the audit needs no pairwise comparison to see it.
+    // The forgery survives the rebuild only as the duplicate it is: the block
+    // is rehashed once, so what comes back is the single mapping its content
+    // earns and the twin is gone with the reference it took.
+    // The forged entry takes a reference first: a bare insert leaves refs at
+    // zero and the audit would reject the entry for that rather than for the
+    // count. Dropping the reference again is not an option either, because it
+    // would hand the block back while the tree still names it, so this is the
+    // last thing the test does to the volume.
+    u8 twin[ADYTUMFS_HASH_SIZE];
+    u64 live_before = 0;
+    u64 live_after = 0;
+    valid = valid && adytumfs_block_read(dev, claimed, block) == 0;
+    block[0] ^= 0x5au;
+    valid = valid &&
+        blake2b(twin, ADYTUMFS_HASH_SIZE, block, ADYTUMFS_BLOCK_SIZE) == 0 &&
+        adytumfs_index_live(dev, &super, &store.index, &live_before) == 0 &&
+        adytumfs_index_insert(dev, &super, &store.index, twin, claimed) == 0 &&
+        adytumfs_cas_retain(dev, &super, &store, twin) == 0 &&
+        adytumfs_verify(dev, &super) == 0;
+    adytumfs_cas_open(&probe_store, super.index_start, super.index_blocks);
+    valid = valid &&
+        adytumfs_index_live(dev, &super, &probe_store.index, &live_after) == 0 &&
+        live_after == live_before &&
+        adytumfs_cas_lookup(dev, &super, &probe_store, twin, &resolved) != 0;
 
     adytumfs_window_discard(dev);
     if (dev) object_release(dev);

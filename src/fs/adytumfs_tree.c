@@ -345,11 +345,13 @@ static int tree_descend(struct kernel_object *device,
             // an existing entry.
             path[step].index = index >= 0 ? (u32)index : count;
             *depth = step + 1u;
-            *found = -1;
-            if (index >= 0) {
-                struct adytumfs_tree_key candidate;
-                key_from_entry(tree_node, (u32)index, 0, &candidate);
-                if (key_equal(&candidate, key)) *found = index;
+            if (found) {
+                *found = -1;
+                if (index >= 0) {
+                    struct adytumfs_tree_key candidate;
+                    key_from_entry(tree_node, (u32)index, 0, &candidate);
+                    if (key_equal(&candidate, key)) *found = index;
+                }
             }
             return 0;
         }
@@ -366,64 +368,87 @@ static int tree_descend(struct kernel_object *device,
 }
 
 
+// Write one range into a leaf. The new entry lands between whatever it
+// covers, so any entry it overlaps is cut down to the parts outside the
+// range: writing one block into a hole run leaves the block plus the runs
+// either side of it, and the caller never has to carve them first. Only one
+// entry can hold each end of the range, so the list grows by at most two.
+// References need no handling here, because a stored leaf takes its own on
+// every value it names and the leaf this one supersedes gives its up when the
+// commit that replaced it is discarded.
 static int leaf_insert(struct kernel_object *device,
                        struct adytumfs_superblock *super,
-                       struct adytumfs_cas *store, const u8 *node, u32 at,
-                       int replace, const struct adytumfs_tree_key *key,
+                       struct adytumfs_cas *store, const u8 *node,
+                       const struct adytumfs_tree_key *key,
                        const struct adytumfs_tree_value *value,
                        struct adytumfs_tree_growth *growth) {
     static struct adytumfs_tree_key keys[ADYTUMFS_TREE_LEAF_MAX];
     static struct adytumfs_tree_value values[ADYTUMFS_TREE_LEAF_MAX];
+    static struct adytumfs_tree_key cut_keys[ADYTUMFS_TREE_LEAF_MAX + 2u];
+    static struct adytumfs_tree_value cut_values[ADYTUMFS_TREE_LEAF_MAX + 2u];
     u32 count = 0;
     if (adytumfs_tree_leaf_unpack(node, &count, keys, values)) return -1;
-    if (replace) {
-        values[at] = *value;
-        if (adytumfs_tree_leaf_pack(tree_node, count, keys, values)) return -1;
-        growth->split = 0;
-        key_from_entry(tree_node, count - 1u, 0, &growth->left_max);
-        return tree_store(device, super, store, tree_node, growth->left);
-    }
-    if (count < ADYTUMFS_TREE_LEAF_MAX) {
-        for (u32 index = count; index > at; index--) {
-            keys[index] = keys[index - 1u];
-            values[index] = values[index - 1u];
+    u64 start = key->end - value->length;
+    u32 total = 0;
+    int placed = 0;
+    for (u32 index = 0; index < count; index++) {
+        u64 entry_end = keys[index].end;
+        u64 entry_start = entry_end - values[index].length;
+        int outside = entry_end <= start || entry_start >= key->end;
+        if (!outside && entry_start < start) {
+            cut_keys[total].end = start;
+            hash_copy(cut_values[total].hash, values[index].hash);
+            cut_values[total].length = start - entry_start;
+            total++;
         }
-        keys[at] = *key;
-        values[at] = *value;
-        if (adytumfs_tree_leaf_pack(tree_node, count + 1u, keys, values))
+        if (!placed && entry_end >= key->end) {
+            cut_keys[total] = *key;
+            cut_values[total] = *value;
+            total++;
+            placed = 1;
+        }
+        if (outside) {
+            cut_keys[total] = keys[index];
+            cut_values[total] = values[index];
+            total++;
+        } else if (entry_end > key->end) {
+            cut_keys[total].end = entry_end;
+            hash_copy(cut_values[total].hash, values[index].hash);
+            cut_values[total].length = entry_end - key->end;
+            total++;
+        }
+    }
+    if (!placed) {
+        cut_keys[total] = *key;
+        cut_values[total] = *value;
+        total++;
+    }
+    if (total <= ADYTUMFS_TREE_LEAF_MAX) {
+        if (adytumfs_tree_leaf_pack(tree_node, total, cut_keys, cut_values))
             return -1;
         growth->split = 0;
-        key_from_entry(tree_node, count, 0, &growth->left_max);
+        key_from_entry(tree_node, total - 1u, 0, &growth->left_max);
         return tree_store(device, super, store, tree_node, growth->left);
     }
-    // A full leaf splits before the entry goes in, so both halves have room and
-    // no array ever has to hold one more entry than the format allows.
-    struct adytumfs_tree_key separator;
-    if (adytumfs_tree_leaf_split(node, tree_left, tree_right, &separator))
+    // Cutting can leave the leaf one or two entries over, so it splits here
+    // rather than before: which entries survive the cut is not known until
+    // the walk above has run.
+    u32 half = total / 2u;
+    if (adytumfs_tree_leaf_pack(tree_left, half, cut_keys, cut_values))
         return -1;
-    u8 *target = key_less(key, &separator) ? tree_left : tree_right;
-    u8 *other = target == tree_left ? tree_right : tree_left;
-    u32 half = 0;
-    if (adytumfs_tree_leaf_unpack(target, &half, keys, values)) return -1;
-    u32 place = 0;
-    while (place < half && key_less(&keys[place], key)) place++;
-    for (u32 index = half; index > place; index--) {
-        keys[index] = keys[index - 1u];
-        values[index] = values[index - 1u];
+    for (u32 index = half; index < total; index++) {
+        cut_keys[index - half] = cut_keys[index];
+        cut_values[index - half] = cut_values[index];
     }
-    keys[place] = *key;
-    values[place] = *value;
-    if (adytumfs_tree_leaf_pack(target, half + 1u, keys, values)) return -1;
-    growth->split = 1;
-    key_from_entry(tree_left, adytumfs_read_le32(tree_left + 8) - 1u, 0,
-                   &growth->left_max);
-    key_from_entry(tree_right, adytumfs_read_le32(tree_right + 8) - 1u, 0,
-                   &growth->right_max);
-    if (tree_store(device, super, store, other,
-                   target == tree_left ? growth->right : growth->left))
+    if (adytumfs_tree_leaf_pack(tree_right, total - half, cut_keys,
+                                cut_values))
         return -1;
-    return tree_store(device, super, store, target,
-                      target == tree_left ? growth->left : growth->right);
+    growth->split = 1;
+    key_from_entry(tree_left, half - 1u, 0, &growth->left_max);
+    key_from_entry(tree_right, total - half - 1u, 0, &growth->right_max);
+    if (tree_store(device, super, store, tree_right, growth->right))
+        return -1;
+    return tree_store(device, super, store, tree_left, growth->left);
 }
 
 // Rewrite one branch on the way up: the child the descent took is replaced by
@@ -541,8 +566,9 @@ static int tree_insert(struct kernel_object *device,
     }
     static struct adytumfs_tree_step path[ADYTUMFS_TREE_DEPTH_MAX];
     u32 depth = 0;
-    int found = -1;
-    if (tree_descend(device, super, store, root, key, path, &depth, &found))
+    // The leaf works out for itself which entries the range covers, so the
+    // descent is only asked where the leaf hangs.
+    if (tree_descend(device, super, store, root, key, path, &depth, 0))
         return -1;
     struct adytumfs_tree_growth below;
     struct adytumfs_tree_growth above;
@@ -556,9 +582,7 @@ static int tree_insert(struct kernel_object *device,
     // result back into that same buffer.
     for (u32 index = 0; index < ADYTUMFS_BLOCK_SIZE; index++)
         node_copy[index] = tree_node[index];
-    u32 at = found >= 0 ? (u32)found : path[depth - 1u].index;
-    if (leaf_insert(device, super, store, node_copy, at, found >= 0, key,
-                    value, &below))
+    if (leaf_insert(device, super, store, node_copy, key, value, &below))
         return -1;
     for (u32 step = depth - 1u; step > 0; step--) {
         if (tree_fetch(device, super, store, path[step - 1u].hash, tree_node))
@@ -980,6 +1004,23 @@ int adytumfs_tree_discard(struct kernel_object *device,
     discard_stack[0].depth = 1u;
     discard_top = 1u;
     return discard_run(device, super, store, budget, remaining);
+}
+
+int adytumfs_tree_drop(struct kernel_object *device,
+                       struct adytumfs_superblock *super,
+                       struct adytumfs_cas *store,
+                       const u8 root[ADYTUMFS_CAS_HASH_SIZE]) {
+    if (!device || !super || !store || !root) return -1;
+    if (adytumfs_tree_root_empty(root)) return 0;
+    u32 remaining = 0;
+    if (adytumfs_tree_discard(device, super, store, root,
+                              ADYTUMFS_TREE_DROP_BUDGET, &remaining))
+        return -1;
+    while (remaining)
+        if (adytumfs_tree_discard_resume(device, super, store,
+                                         ADYTUMFS_TREE_DROP_BUDGET, &remaining))
+            return -1;
+    return 0;
 }
 
 int adytumfs_tree_discard_resume(struct kernel_object *device,

@@ -2,11 +2,15 @@
 #include "object.h"
 #include "block.h"
 #include "adytumfs_format.h"
+#include "adytumfs_cas.h"
+#include "adytumfs_tree.h"
 
-static int bitmap_used(const u8 *bitmap, u64 block) {
-    return (bitmap[block / 8] >> (block % 8)) & 1;
-}
-
+// A file's blocks are reached through its extent tree, and the tree names
+// content rather than locations, so what this covers is the mapping a reader
+// gets and what the growth and truncation of a file costs. The interesting
+// part is that the cost is not what a physical extent layout would suggest:
+// every hole on the volume names one shared block of zeroes, so a sparse file
+// costs nothing per hole and a second sparse file costs nothing at all.
 int test_adytumfs_extent64(void) {
     u32 objects = object_active_count();
     u32 devices = block_active_count();
@@ -15,14 +19,13 @@ int test_adytumfs_extent64(void) {
     // A 4 KiB block is too big for a modest stack, and the test is single
     // threaded, so the scratch block is static.
     static u8 block[ADYTUMFS_BLOCK_SIZE];
+    static struct adytumfs_cas store;
     struct adytumfs_superblock super;
     int valid = dev && adytumfs_make(dev) == 0 &&
         adytumfs_block_read(dev, 0, block) == 0 &&
         adytumfs_super_unpack(&super, block) == 0;
+    adytumfs_cas_open(&store, super.index_start, super.index_blocks);
 
-    // The index region is reserved at the front of the data area, so the
-    // first extent a grow can take starts past it.
-    u64 data = super.data_start + super.index_blocks;
     u64 na = 0;
     u64 nb = 0;
     struct adytumfs_inode a;
@@ -31,61 +34,95 @@ int test_adytumfs_extent64(void) {
         adytumfs_inode_alloc(dev, &super, ADYTUMFS_MODE_REG | 0644u, &na) == 0 &&
         adytumfs_inode_read(dev, &super, na, &a) == 0;
 
-    // Grow to five blocks: one contiguous extent at the start of the data area.
+    // A fresh inode names the empty tree, and a mapping through it fails
+    // rather than inventing a block.
     u64 physical = 0;
-    valid = valid && adytumfs_inode_grow(dev, &super, &a, 5) == 0 &&
-        a.blocks == 5 && a.direct[0].start_block == data &&
-        a.direct[0].length == 5 && a.direct[1].length == 0 &&
-        adytumfs_inode_map(&a, 0, &physical) == 0 && physical == data &&
-        adytumfs_inode_map(&a, 4, &physical) == 0 && physical == data + 4 &&
-        adytumfs_inode_map(&a, 5, &physical) != 0;
+    valid = valid && a.blocks == 0 &&
+        adytumfs_tree_root_empty(a.extent_root) &&
+        adytumfs_inode_map(dev, &super, &store, &a, 0, &physical) != 0;
 
-    // Persist and read it back unchanged.
+    // Growing to five blocks maps all five, and every one of them resolves to
+    // the same block because they are all holes naming the same zeroes.
+    u64 hole = 0;
+    u64 last = 0;
+    valid = valid &&
+        adytumfs_inode_grow(dev, &super, &store, &a, na, 5) == 0 &&
+        a.blocks == 5 && !adytumfs_tree_root_empty(a.extent_root) &&
+        adytumfs_inode_map(dev, &super, &store, &a, 0, &hole) == 0 &&
+        adytumfs_inode_map(dev, &super, &store, &a, 4, &last) == 0 &&
+        last == hole &&
+        adytumfs_inode_map(dev, &super, &store, &a, 5, &physical) != 0;
+
+    // What a hole resolves to really is zeroes.
+    valid = valid && adytumfs_data_read(dev, &super, hole, block) == 0;
+    for (u32 index = 0; valid && index < ADYTUMFS_BLOCK_SIZE; index++)
+        if (block[index]) {
+            valid = 0;
+            break;
+        }
+
+    // The root survives a round trip through the slot, and the mapping with
+    // it. Nothing about the physical layout is recorded in the inode, so
+    // there is nothing else to survive.
     struct adytumfs_inode again;
     valid = valid && adytumfs_inode_write(dev, &super, na, &a) == 0 &&
         adytumfs_inode_read(dev, &super, na, &again) == 0 &&
-        again.blocks == 5 && again.direct[0].length == 5;
+        again.blocks == 5 &&
+        adytumfs_inode_map(dev, &super, &store, &again, 3, &physical) == 0 &&
+        physical == hole;
 
-    // A second file takes the next block, so the next grow of A cannot coalesce
-    // and lands in a fresh extent.
+    // A second file's hole is the same block, so growing it allocates nothing
+    // new. This is the property that makes a sparse file cheap and it is only
+    // visible because the tree names content.
+    u64 live_before = 0;
+    u64 bhole = 0;
     valid = valid &&
+        adytumfs_cas_count(dev, &super, &store, &live_before) == 0 &&
         adytumfs_inode_alloc(dev, &super, ADYTUMFS_MODE_REG | 0644u, &nb) == 0 &&
         adytumfs_inode_read(dev, &super, nb, &b) == 0 &&
-        adytumfs_inode_grow(dev, &super, &b, 1) == 0 &&
-        b.direct[0].start_block == data + 5;
+        adytumfs_inode_grow(dev, &super, &store, &b, nb, 1) == 0 &&
+        adytumfs_inode_map(dev, &super, &store, &b, 0, &bhole) == 0 &&
+        bhole == hole;
+    u64 live_after = 0;
+    valid = valid &&
+        adytumfs_cas_count(dev, &super, &store, &live_after) == 0 &&
+        live_after < live_before + 3u;
 
-    valid = valid && adytumfs_inode_grow(dev, &super, &a, 8) == 0 &&
-        a.blocks == 8 && a.direct[1].start_block == data + 6 &&
-        a.direct[1].length == 3 &&
-        adytumfs_inode_map(&a, 5, &physical) == 0 && physical == data + 6 &&
-        adytumfs_inode_map(&a, 7, &physical) == 0 && physical == data + 8 &&
-        adytumfs_inode_map(&a, 8, &physical) != 0;
+    // Writing one block gives it a block of its own and leaves its neighbours
+    // on the shared zeroes, which is the copy-on-write the sharing requires.
+    static u8 content[ADYTUMFS_BLOCK_SIZE];
+    for (u32 index = 0; index < ADYTUMFS_BLOCK_SIZE; index++)
+        content[index] = (u8)(index + 7u);
+    u64 own = 0;
+    u64 side = 0;
+    valid = valid &&
+        adytumfs_inode_remap(dev, &super, &store, &a, na, 2, content) == 0 &&
+        adytumfs_inode_map(dev, &super, &store, &a, 2, &own) == 0 &&
+        own != hole &&
+        adytumfs_inode_map(dev, &super, &store, &a, 1, &side) == 0 &&
+        side == hole &&
+        adytumfs_inode_map(dev, &super, &store, &a, 3, &side) == 0 &&
+        side == hole &&
+        adytumfs_data_read(dev, &super, own, block) == 0 &&
+        block[0] == 7u && block[ADYTUMFS_BLOCK_SIZE - 1] == 6u;
 
-    // Truncate to six: the second extent keeps one block, two are reclaimed.
-    // The commit lands the window before the bitmap is read back, and the
-    // live generation's copy is the one the flip named.
-    u64 free_before = super.free_blocks;
-    valid = valid && adytumfs_inode_truncate(dev, &super, &a, 6) == 0 &&
-        a.blocks == 6 && a.direct[1].length == 1 &&
-        super.free_blocks == free_before + 2 &&
-        adytumfs_inode_map(&a, 5, &physical) == 0 && physical == data + 6 &&
-        adytumfs_inode_map(&a, 6, &physical) != 0 &&
-        adytumfs_commit(dev, &super) == 0;
-    // The live generation's bitmap is the copy the flip named.
-    valid = valid && adytumfs_block_read(
-                dev, adytumfs_bitmap_block(&super, 0), block) == 0 &&
-        bitmap_used(block, data + 6) && !bitmap_used(block, data + 7) &&
-        !bitmap_used(block, data + 8);
+    // Truncating to three drops the tail and keeps the written block. The
+    // shared zero block is not freed, because file B still names it.
+    valid = valid &&
+        adytumfs_inode_truncate(dev, &super, &store, &a, na, 3) == 0 &&
+        a.blocks == 3 &&
+        adytumfs_inode_map(dev, &super, &store, &a, 2, &physical) == 0 &&
+        physical == own &&
+        adytumfs_inode_map(dev, &super, &store, &a, 3, &physical) != 0 &&
+        adytumfs_inode_map(dev, &super, &store, &b, 0, &side) == 0 &&
+        side == hole;
 
-    // Truncate to zero frees everything the file still held. The commit
-    // ping-pongs the active set back to the primary, so the live bitmap
-    // location moves again.
-    valid = valid && adytumfs_inode_truncate(dev, &super, &a, 0) == 0 &&
-        a.blocks == 0 && a.direct[0].length == 0 &&
-        adytumfs_commit(dev, &super) == 0;
-    valid = valid && adytumfs_block_read(
-                dev, adytumfs_bitmap_block(&super, 0), block) == 0 &&
-        !bitmap_used(block, data) && !bitmap_used(block, data + 6);
+    // Truncating to nothing leaves the empty tree, and a mapping through it
+    // fails the way it did for a fresh inode.
+    valid = valid &&
+        adytumfs_inode_truncate(dev, &super, &store, &a, na, 0) == 0 &&
+        a.blocks == 0 && adytumfs_tree_root_empty(a.extent_root) &&
+        adytumfs_inode_map(dev, &super, &store, &a, 0, &physical) != 0;
 
     adytumfs_window_discard(dev);
     if (dev) object_release(dev);

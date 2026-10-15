@@ -36,16 +36,24 @@ int test_adytumfs_inode64(void) {
         file.generation >= 1;
     u64 generation = file.generation;
 
+    // The extent root is the whole of what an inode now records about a
+    // file's blocks, so the round trip that used to cover the extent array
+    // covers it. Every byte matters: a root that came back wrong would name a
+    // different tree, and the checksum over the slot is what says it did not.
     file.size = 12345;
-    file.direct[0].start_block = super.data_start + super.index_blocks;
-    file.direct[0].length = 2;
+    for (u32 index = 0; index < ADYTUMFS_HASH_SIZE; index++)
+        file.extent_root[index] = (u8)(index * 3u + 1u);
     struct adytumfs_inode again;
+    int root_same = 1;
     valid = valid && adytumfs_inode_write(dev, &super, number, &file) == 0 &&
         adytumfs_inode_read(dev, &super, number, &again) == 0 &&
-        again.size == 12345 &&
-        again.direct[0].start_block ==
-            super.data_start + super.index_blocks &&
-        again.direct[0].length == 2;
+        again.size == 12345;
+    for (u32 index = 0; valid && index < ADYTUMFS_HASH_SIZE; index++)
+        if (again.extent_root[index] != file.extent_root[index]) {
+            root_same = 0;
+            break;
+        }
+    valid = valid && root_same;
 
     // The nanosecond halves of the timestamps round-trip through the slot
     // copy the seconds always did.

@@ -1,11 +1,13 @@
 #include "adytumfs_format.h"
+#include "adytumfs_tree.h"
 #include "rtc64.h"
 
 // One staging block for partial-block read-modify-write; single-CPU filesystem.
 static u8 adytumfs_file_scratch[ADYTUMFS_BLOCK_SIZE];
 
 int adytumfs_file_read(struct kernel_object *device,
-                       const struct adytumfs_superblock *super, u64 inode_num,
+                       struct adytumfs_superblock *super,
+                       struct adytumfs_cas *store, u64 inode_num,
                        u64 offset, void *buffer, u64 length, u64 *out_read) {
     if (!out_read) return -1;
     struct adytumfs_inode inode;
@@ -26,7 +28,7 @@ int adytumfs_file_read(struct kernel_object *device,
         u32 chunk = ADYTUMFS_BLOCK_SIZE - within;
         if (chunk > want - done) chunk = (u32)(want - done);
         u64 physical;
-        if (adytumfs_inode_map(&inode, logical, &physical)) return -1;
+        if (adytumfs_inode_map(device, super, store, &inode, logical, &physical)) return -1;
         if (adytumfs_data_read(device, super, physical, adytumfs_file_scratch))
             return -1;
         for (u32 index = 0; index < chunk; index++)
@@ -38,7 +40,8 @@ int adytumfs_file_read(struct kernel_object *device,
 }
 
 int adytumfs_file_write(struct kernel_object *device,
-                        struct adytumfs_superblock *super, u64 inode_num,
+                        struct adytumfs_superblock *super,
+                        struct adytumfs_cas *store, u64 inode_num,
                         u64 offset, const void *buffer, u64 length,
                         u64 *out_written) {
     if (!out_written) return -1;
@@ -52,11 +55,8 @@ int adytumfs_file_write(struct kernel_object *device,
     u64 end = offset + length;
     if (end < offset) return -1;
     u64 need = (end + ADYTUMFS_BLOCK_SIZE - 1) / ADYTUMFS_BLOCK_SIZE;
-    // Blocks that existed before this write hold the state a later boot
-    // would read, so they are redirected to fresh copies; blocks the grow is
-    // about to add have no old state to preserve and take the direct write.
-    u64 old_blocks = inode.blocks;
-    if (need > inode.blocks && adytumfs_inode_grow(device, super, &inode, need))
+    if (need > inode.blocks &&
+        adytumfs_inode_grow(device, super, store, &inode, inode_num, need))
         return -1;
 
     const u8 *in = (const u8 *)buffer;
@@ -68,7 +68,7 @@ int adytumfs_file_write(struct kernel_object *device,
         u32 chunk = ADYTUMFS_BLOCK_SIZE - within;
         if (chunk > length - done) chunk = (u32)(length - done);
         u64 physical;
-        if (adytumfs_inode_map(&inode, logical, &physical)) return -1;
+        if (adytumfs_inode_map(device, super, store, &inode, logical, &physical)) return -1;
         // A partial block keeps its surrounding bytes; a full-block overwrite
         // does not need the prior contents.
         if ((within != 0 || chunk != ADYTUMFS_BLOCK_SIZE) &&
@@ -76,14 +76,14 @@ int adytumfs_file_write(struct kernel_object *device,
             return -1;
         for (u32 index = 0; index < chunk; index++)
             adytumfs_file_scratch[within + index] = in[done + index];
-        if (logical < old_blocks) {
-            if (adytumfs_inode_remap(device, super, &inode, inode_num,
-                                     logical, adytumfs_file_scratch))
-                return -1;
-        } else if (adytumfs_data_write(device, super, physical,
-                                       adytumfs_file_scratch)) {
+        // Every block goes through a remap, grown ones included. A hole is
+        // not a block this file owns: every hole on the volume resolves to
+        // one shared image of zeroes, so writing through the mapping would
+        // rewrite that image for everyone. The remap lands the bytes in a
+        // block of the file's own and repoints only this entry.
+        if (adytumfs_inode_remap(device, super, store, &inode, inode_num,
+                                 logical, adytumfs_file_scratch))
             return -1;
-        }
         done += chunk;
     }
     if (end > inode.size) inode.size = end;

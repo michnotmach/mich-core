@@ -1,4 +1,5 @@
 #include "adytumfs_format.h"
+#include "adytumfs_tree.h"
 #include "rtc64.h"
 
 // One staging block for directory data; the single-CPU filesystem reads,
@@ -55,7 +56,8 @@ static int adytumfs_dir_place(u8 *block, const char *name, u32 name_len,
 }
 
 int adytumfs_dir_lookup(struct kernel_object *device,
-                        const struct adytumfs_superblock *super, u64 dir_inode,
+                        struct adytumfs_superblock *super,
+                        struct adytumfs_cas *store, u64 dir_inode,
                         const char *name, u32 name_len, u64 *out_inode) {
     if (name_len == 0 || name_len > ADYTUMFS_NAME_MAX) return -1;
     struct adytumfs_inode dir;
@@ -63,7 +65,7 @@ int adytumfs_dir_lookup(struct kernel_object *device,
     if ((dir.mode & ADYTUMFS_MODE_DIR) == 0) return -1;
     for (u64 logical = 0; logical < dir.blocks; logical++) {
         u64 physical;
-        if (adytumfs_inode_map(&dir, logical, &physical)) return -1;
+        if (adytumfs_inode_map(device, super, store, &dir, logical, &physical)) return -1;
         if (adytumfs_data_read(device, super, physical, adytumfs_dir_scratch))
             return -1;
         u32 offset = 0;
@@ -87,13 +89,14 @@ int adytumfs_dir_lookup(struct kernel_object *device,
 }
 
 int adytumfs_dir_add(struct kernel_object *device,
-                     struct adytumfs_superblock *super, u64 dir_inode,
+                     struct adytumfs_superblock *super,
+                     struct adytumfs_cas *store, u64 dir_inode,
                      const char *name, u32 name_len, u64 target_inode,
                      u8 type) {
     if (name_len == 0 || name_len > ADYTUMFS_NAME_MAX || target_inode == 0)
         return -1;
     u64 present;
-    if (adytumfs_dir_lookup(device, super, dir_inode, name, name_len,
+    if (adytumfs_dir_lookup(device, super, store, dir_inode, name, name_len,
                             &present) == 0)
         return -1;
     struct adytumfs_inode dir;
@@ -103,29 +106,30 @@ int adytumfs_dir_add(struct kernel_object *device,
     u32 needed = ADYTUMFS_DIR_HEADER + ((name_len + 3u) & ~3u);
     for (u64 logical = 0; logical < dir.blocks; logical++) {
         u64 physical;
-        if (adytumfs_inode_map(&dir, logical, &physical)) return -1;
+        if (adytumfs_inode_map(device, super, store, &dir, logical, &physical)) return -1;
         if (adytumfs_data_read(device, super, physical, adytumfs_dir_scratch))
             return -1;
         if (adytumfs_dir_place(adytumfs_dir_scratch, name, name_len,
                                target_inode, type, needed) == 0) {
             adytumfs_dir_touch(&dir);
-            return adytumfs_inode_remap(device, super, &dir, dir_inode,
+            return adytumfs_inode_remap(device, super, store, &dir, dir_inode,
                                         logical, adytumfs_dir_scratch);
         }
     }
 
     // No room in any existing block, so grow by one and seed it with a single
     // free record spanning the whole block.
-    if (adytumfs_inode_grow(device, super, &dir, dir.blocks + 1)) return -1;
-    u64 physical;
-    if (adytumfs_inode_map(&dir, dir.blocks - 1, &physical)) return -1;
+    if (adytumfs_inode_grow(device, super, store, &dir, dir_inode, dir.blocks + 1)) return -1;
     for (u32 index = 0; index < ADYTUMFS_BLOCK_SIZE; index++)
         adytumfs_dir_scratch[index] = 0;
     adytumfs_write_le16(adytumfs_dir_scratch + 8, (u16)ADYTUMFS_BLOCK_SIZE);
     if (adytumfs_dir_place(adytumfs_dir_scratch, name, name_len, target_inode,
                            type, needed))
         return -1;
-    if (adytumfs_data_write(device, super, physical, adytumfs_dir_scratch))
+    // Through a remap and not into the mapping: the block the grow just added
+    // is the one image of zeroes every hole on the volume shares.
+    if (adytumfs_inode_remap(device, super, store, &dir, dir_inode,
+                             dir.blocks - 1, adytumfs_dir_scratch))
         return -1;
     dir.size = dir.blocks * ADYTUMFS_BLOCK_SIZE;
     adytumfs_dir_touch(&dir);
@@ -133,7 +137,8 @@ int adytumfs_dir_add(struct kernel_object *device,
 }
 
 int adytumfs_dir_remove(struct kernel_object *device,
-                        struct adytumfs_superblock *super, u64 dir_inode,
+                        struct adytumfs_superblock *super,
+                        struct adytumfs_cas *store, u64 dir_inode,
                         const char *name, u32 name_len) {
     if (name_len == 0 || name_len > ADYTUMFS_NAME_MAX) return -1;
     struct adytumfs_inode dir;
@@ -141,7 +146,7 @@ int adytumfs_dir_remove(struct kernel_object *device,
     if ((dir.mode & ADYTUMFS_MODE_DIR) == 0) return -1;
     for (u64 logical = 0; logical < dir.blocks; logical++) {
         u64 physical;
-        if (adytumfs_inode_map(&dir, logical, &physical)) return -1;
+        if (adytumfs_inode_map(device, super, store, &dir, logical, &physical)) return -1;
         if (adytumfs_data_read(device, super, physical, adytumfs_dir_scratch))
             return -1;
         u32 offset = 0;
@@ -158,7 +163,7 @@ int adytumfs_dir_remove(struct kernel_object *device,
                 // Tombstone: a zero inode makes the record free for reuse.
                 adytumfs_write_le64(adytumfs_dir_scratch + offset, 0);
                 adytumfs_dir_touch(&dir);
-                return adytumfs_inode_remap(device, super, &dir, dir_inode,
+                return adytumfs_inode_remap(device, super, store, &dir, dir_inode,
                                             logical, adytumfs_dir_scratch);
             }
             offset += rec_len;
@@ -168,7 +173,8 @@ int adytumfs_dir_remove(struct kernel_object *device,
 }
 
 int adytumfs_dir_iter(struct kernel_object *device,
-                      const struct adytumfs_superblock *super, u64 dir_inode,
+                      struct adytumfs_superblock *super,
+                      struct adytumfs_cas *store, u64 dir_inode,
                       u64 *cursor, char *name, u32 *name_len, u64 *inode_out,
                       u8 *type_out) {
     if (!cursor || !name || !name_len || !inode_out || !type_out) return -1;
@@ -181,7 +187,7 @@ int adytumfs_dir_iter(struct kernel_object *device,
         u64 logical = position / ADYTUMFS_BLOCK_SIZE;
         u32 within = (u32)(position % ADYTUMFS_BLOCK_SIZE);
         u64 physical;
-        if (adytumfs_inode_map(&dir, logical, &physical)) return -1;
+        if (adytumfs_inode_map(device, super, store, &dir, logical, &physical)) return -1;
         if (adytumfs_data_read(device, super, physical, adytumfs_dir_scratch))
             return -1;
         u64 entry_inode = adytumfs_read_le64(adytumfs_dir_scratch + within);

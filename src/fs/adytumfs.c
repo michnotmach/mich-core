@@ -1,5 +1,7 @@
 #include "adytumfs.h"
 #include "adytumfs_format.h"
+#include "adytumfs_cas.h"
+#include "adytumfs_tree.h"
 #include "vfs.h"
 #include "block.h"
 #include "cache.h"
@@ -64,6 +66,10 @@ static int cache_any(const u64 *mask) {
 struct adytumfs_mount {
     struct kernel_object *device;
     struct adytumfs_superblock super;
+    // The content store this volume's extent trees resolve through. It lives
+    // per mount because the index it caches sits at an address the superblock
+    // gives, and two volumes have two indexes.
+    struct adytumfs_cas store;
     struct adytumfs_slot slots[ADYTUMFS_INODE_MAX];
     struct adytumfs_cache cache[ADYTUMFS_INODE_MAX];
     u32 active;
@@ -153,7 +159,7 @@ static int walk_tree(struct adytumfs_mount *m, adytumfs_alias_sink sink) {
             u32 name_len = 0;
             u64 target = 0;
             u8 type = 0;
-            int step = adytumfs_dir_iter(m->device, &m->super, dir_inode,
+            int step = adytumfs_dir_iter(m->device, &m->super, &m->store, dir_inode,
                                          &cursor, name, &name_len, &target,
                                          &type);
             if (step == 1) break;
@@ -332,7 +338,7 @@ int adytumfs_pages_fault(u32 mount, u32 inode, u64 generation, u32 page) {
     // A page past the file size or past the allocated extents reads as
     // zeroes: the write path grows at sync, not at fault.
     if (page * 4096u >= in.size ||
-        adytumfs_inode_map(&in, page, &physical)) {
+        adytumfs_inode_map(m->device, &m->super, &m->store, &in, page, &physical)) {
         for (u32 index = 0; index < 4096; index++) bytes[index] = 0;
         cache_mark(slot->present, page);
         return 0;
@@ -381,83 +387,32 @@ int adytumfs_pages_sync(u32 mount, u32 inode, u64 generation) {
     u64 needed = in.size / ADYTUMFS_BLOCK_SIZE +
                  (in.size % ADYTUMFS_BLOCK_SIZE ? 1 : 0);
     if (needed > ADYTUMFS_FILE_PAGES) needed = ADYTUMFS_FILE_PAGES;
-    // Pages backed by blocks that predate this write-back are redirected to
-    // fresh copies; pages the grow is about to add are written directly.
-    u64 old_blocks = in.blocks;
-    if (needed > in.blocks) {
-        if (adytumfs_inode_grow(m->device, &m->super, &in, needed)) return -1;
-        if (adytumfs_inode_write(m->device, &m->super, m->slots[inode].inode,
-                                 &in))
+    if (needed > in.blocks &&
+        adytumfs_inode_grow(m->device, &m->super, &m->store, &in,
+                            m->slots[inode].inode, needed))
+        return -1;
+    // Every dirty page is remapped rather than written where it sits. The
+    // block a page maps to is named by content hash and may be shared with
+    // another file, or with a hole, so writing it in place would change bytes
+    // this file does not own. Remapping is what makes the sharing safe, and it
+    // is also why the old distinction between pages that predate this
+    // write-back and pages the grow just added is gone: both are remapped.
+    //
+    // Each remap commits the inode, because the tree root moves and an inode
+    // on disk that named the previous root has to be replaced before the old
+    // tree is let go. A flush of many pages therefore writes the inode once
+    // per page. That is the price of the crash argument holding after every
+    // step, and batching it is a separate change with its own rollback story.
+    struct page_resource *resource = page_resource_get(slot->pages);
+    if (!resource) return -1;
+    for (u32 page = 0; page < ADYTUMFS_FILE_PAGES; page++) {
+        if (!cache_test(slot->dirty, page)) continue;
+        u8 *bytes = (u8 *)(uptr_t)resource->physical[page];
+        if (!bytes) return -1;
+        if (adytumfs_inode_remap(m->device, &m->super, &m->store, &in,
+                                 m->slots[inode].inode, page, bytes))
             return -1;
-    }
-    u32 page = 0;
-    while (page < ADYTUMFS_FILE_PAGES) {
-        if (!(cache_test(slot->dirty, page))) {
-            page++;
-            continue;
-        }
-        u64 physical = 0;
-        if (adytumfs_inode_map(&in, page, &physical)) return -1;
-        // A redirected page moves alone: its fresh target shares no run with
-        // the neighbours, so batching stops at the redirect.
-        if (page < old_blocks) {
-            u64 stale = 0;
-            u64 fresh = 0;
-            if (adytumfs_redirect_stage(m->device, &m->super, &in, page,
-                                        &stale, &fresh))
-                return -1;
-            if (page_transfer(m, slot,
-                              (u32)(fresh * ADYTUMFS_SECTORS_PER_BLOCK), page,
-                              1, BLOCK_OP_WRITE))
-                return -1;
-            // The page reached the device through a direct transfer, so the
-            // new bytes are sealed into the checksum region here rather than
-            // through a staging block.
-            struct page_resource *resource = page_resource_get(slot->pages);
-            u8 *bytes = resource ?
-                (u8 *)(uptr_t)resource->physical[page] : 0;
-            if (!bytes ||
-                adytumfs_data_seal(m->device, &m->super, fresh, bytes))
-                return -1;
-            if (adytumfs_redirect_commit(m->device, &m->super, &in,
-                                         m->slots[inode].inode, page, stale,
-                                         fresh))
-                return -1;
-            cache_unmark(slot->dirty, page);
-            page++;
-            continue;
-        }
-        u32 count = 1;
-        // One transfer covers one physically contiguous run, so the batch
-        // ends where the next dirty page maps to a non-adjacent block.
-        while (count < ADYTUMFS_SG_PAGES &&
-               page + count < ADYTUMFS_FILE_PAGES &&
-               (cache_test(slot->dirty, page + count))) {
-            u64 next = 0;
-            if (adytumfs_inode_map(&in, page + count, &next) ||
-                next != physical + count)
-                break;
-            count++;
-        }
-        if (page_transfer(m, slot,
-                          (u32)(physical * ADYTUMFS_SECTORS_PER_BLOCK), page,
-                          count, BLOCK_OP_WRITE))
-            return -1;
-        // The pages reached the device through a direct transfer, so the new
-        // bytes are sealed into the checksum region here rather than through
-        // a staging block.
-        struct page_resource *resource = page_resource_get(slot->pages);
-        if (!resource) return -1;
-        for (u32 index = 0; index < count; index++) {
-            u8 *bytes = (u8 *)(uptr_t)resource->physical[page + index];
-            if (!bytes ||
-                adytumfs_data_seal(m->device, &m->super, physical + index,
-                                   bytes))
-                return -1;
-        }
-        for (u32 index = 0; index < count; index++)
-            cache_unmark(slot->dirty, page + index);
-        page += count;
+        cache_unmark(slot->dirty, page);
     }
     // Sync is the agreed commit boundary: the redirected pages and the
     // staged metadata land together or not at all.
@@ -520,6 +475,7 @@ int adytumfs_attach(u32 mount, struct kernel_object *device,
     }
     m->super = super;
     m->device = device;
+    adytumfs_cas_open(&m->store, super.index_start, super.index_blocks);
     if (walk_tree(m, sink)) {
         m->device = 0;
         object_release(device);
@@ -708,6 +664,7 @@ int adytumfs_dir_read(u32 mount, u32 inode, u64 generation, u64 *cursor,
     u64 target = 0;
     u8 disk_type = 0;
     int result = adytumfs_dir_iter(m->device, &m->super,
+                                    &m->store,
                                    m->slots[inode].inode, cursor, name,
                                    name_len, &target, &disk_type);
     if (result) return result;
@@ -750,7 +707,8 @@ int adytumfs_inode_create(u32 mount, const char *name, u32 parent, u32 type,
         ADYTUMFS_MODE_DIR : type == VFS_NODE_SYMLINK ?
         ADYTUMFS_MODE_LNK : ADYTUMFS_MODE_REG));
     u64 target = 0;
-    if (adytumfs_create_at(m->device, &m->super, m->slots[parent].inode, name,
+    if (adytumfs_create_at(m->device, &m->super, &m->store,
+                           m->slots[parent].inode, name,
                            name_len, disk_mode, &target))
         return -1;
     // The allocator stamps a fresh generation into the on-disk inode, and the
@@ -807,7 +765,7 @@ int adytumfs_inode_link(u32 mount, u32 inode, u64 generation, u32 parent,
     if (adytumfs_inode_write(m->device, &m->super, m->slots[inode].inode,
                              &in))
         return -1;
-    if (adytumfs_dir_add(m->device, &m->super, m->slots[parent].inode, name,
+    if (adytumfs_dir_add(m->device, &m->super, &m->store, m->slots[parent].inode, name,
                          name_len, m->slots[inode].inode,
                          ADYTUMFS_DTYPE_REG)) {
         // The name could not land, so the count goes back down; a failed
@@ -830,7 +788,7 @@ static int inode_reclaim(u32 mount, struct adytumfs_mount *m, u32 inode) {
     struct adytumfs_inode in;
     if (slot_inode_read(m, inode, &in)) return -1;
     adytumfs_pages_detach(mount, inode, m->slots[inode].generation);
-    if (adytumfs_inode_truncate(m->device, &m->super, &in, 0)) return -1;
+    if (adytumfs_inode_truncate(m->device, &m->super, &m->store, &in, m->slots[inode].inode, 0)) return -1;
     in.size = 0;
     if (adytumfs_inode_write(m->device, &m->super, m->slots[inode].inode,
                              &in))
@@ -872,7 +830,7 @@ int adytumfs_unlink(u32 mount, u32 inode, u64 generation, u32 parent,
         u64 target = 0;
         u8 type = 0;
         u64 cursor = 0;
-        if (adytumfs_dir_iter(m->device, &m->super, m->slots[inode].inode,
+        if (adytumfs_dir_iter(m->device, &m->super, &m->store, m->slots[inode].inode,
                               &cursor, probe, &probe_len, &target,
                               &type) != 1)
             return -1;
@@ -880,7 +838,7 @@ int adytumfs_unlink(u32 mount, u32 inode, u64 generation, u32 parent,
     // The name goes before the count: a crash between the two leaves a
     // stale-high count, never a live name over blocks a later allocation
     // can reuse.
-    if (adytumfs_dir_remove(m->device, &m->super, m->slots[parent].inode,
+    if (adytumfs_dir_remove(m->device, &m->super, &m->store, m->slots[parent].inode,
                             name, name_len))
         return -1;
     adytumfs_touch(mount, parent, m->slots[parent].generation,
@@ -936,12 +894,12 @@ int adytumfs_rename(u32 mount, u32 inode, u64 generation, u32 old_parent,
     // The moved name must live under the old parent and point here, and the
     // new name must be free: anything else is a stale VFS view.
     u64 present = 0;
-    if (adytumfs_dir_lookup(m->device, &m->super, m->slots[old_parent].inode, name,
+    if (adytumfs_dir_lookup(m->device, &m->super, &m->store, m->slots[old_parent].inode, name,
                             name_len, &present) ||
         present != m->slots[inode].inode)
         return -1;
     u64 taken = 0;
-    if (adytumfs_dir_lookup(m->device, &m->super, m->slots[new_parent].inode, new_name,
+    if (adytumfs_dir_lookup(m->device, &m->super, &m->store, m->slots[new_parent].inode, new_name,
                             new_len, &taken) == 0)
         return -1;
     // A rename never touches the link count: the moved name keeps vouching
@@ -957,18 +915,18 @@ int adytumfs_rename(u32 mount, u32 inode, u64 generation, u32 old_parent,
     // The old name leaves before the new one lands: a crash between the
     // two leaves an orphan holding its data, never one inode under two
     // names the link count cannot vouch for.
-    if (adytumfs_dir_remove(m->device, &m->super, m->slots[old_parent].inode, name,
+    if (adytumfs_dir_remove(m->device, &m->super, &m->store, m->slots[old_parent].inode, name,
                             name_len))
         return -1;
     u8 dtype = bits == ADYTUMFS_MODE_DIR ? ADYTUMFS_DTYPE_DIR :
         bits == ADYTUMFS_MODE_LNK ? ADYTUMFS_DTYPE_LNK :
         ADYTUMFS_DTYPE_REG;
-    if (adytumfs_dir_add(m->device, &m->super, m->slots[new_parent].inode, new_name,
+    if (adytumfs_dir_add(m->device, &m->super, &m->store, m->slots[new_parent].inode, new_name,
                          new_len, m->slots[inode].inode, dtype)) {
         // The rename never happened, so put the old name back before
         // failing: the VFS view must keep matching the disk. A failed
         // rollback leaves the accepted orphan form.
-        adytumfs_dir_add(m->device, &m->super, m->slots[old_parent].inode, name,
+        adytumfs_dir_add(m->device, &m->super, &m->store, m->slots[old_parent].inode, name,
                          name_len, m->slots[inode].inode, dtype);
         return -1;
     }
@@ -1017,11 +975,12 @@ int adytumfs_symlink_write(u32 mount, u32 inode, u64 generation,
         adytumfs_backend_scratch[index] = 0;
     for (u32 index = 0; index < length; index++)
         adytumfs_backend_scratch[index] = (u8)target[index];
-    if (adytumfs_inode_grow(m->device, &m->super, &in, 1)) return -1;
-    u64 physical = 0;
-    if (adytumfs_inode_map(&in, 0, &physical) ||
-        adytumfs_data_write(m->device, &m->super, physical,
-                            adytumfs_backend_scratch))
+    if (adytumfs_inode_grow(m->device, &m->super, &m->store, &in, m->slots[inode].inode, 1)) return -1;
+    // Through a remap and not into the mapping, because the block the grow
+    // added is the image of zeroes every hole on the volume shares.
+    if (adytumfs_inode_remap(m->device, &m->super, &m->store, &in,
+                             m->slots[inode].inode, 0,
+                             adytumfs_backend_scratch))
         return -1;
     u64 now = rtc64_wall_clock();
     u32 now_nsec = rtc64_wall_clock_nsec();
@@ -1049,7 +1008,7 @@ int adytumfs_symlink_target(u32 mount, u32 inode, u64 generation,
     if (bits != ADYTUMFS_MODE_LNK) return -1;
     if (!in.size || in.size >= VFS_PATH_MAX || !in.blocks) return -1;
     u64 physical = 0;
-    if (adytumfs_inode_map(&in, 0, &physical) ||
+    if (adytumfs_inode_map(m->device, &m->super, &m->store, &in, 0, &physical) ||
         adytumfs_data_read(m->device, &m->super, physical,
                            adytumfs_backend_scratch))
         return -1;
@@ -1091,7 +1050,7 @@ int adytumfs_inode_remove(u32 mount, u32 inode) {
         u64 target = 0;
         u8 type = 0;
         u64 cursor = 0;
-        if (adytumfs_dir_iter(m->device, &m->super, m->slots[inode].inode,
+        if (adytumfs_dir_iter(m->device, &m->super, &m->store, m->slots[inode].inode,
                               &cursor, name, &name_len, &target, &type) != 1)
             return -1;
     }
@@ -1099,7 +1058,7 @@ int adytumfs_inode_remove(u32 mount, u32 inode) {
     // The name goes before the reclaim, so a crash between the two leaves
     // an orphan with its data intact rather than a live name over blocks
     // a later allocation can reuse.
-    if (adytumfs_dir_remove(m->device, &m->super, m->slots[parent].inode,
+    if (adytumfs_dir_remove(m->device, &m->super, &m->store, m->slots[parent].inode,
                             m->slots[inode].name,
                             slot_name_len(&m->slots[inode])))
         return -1;
@@ -1116,23 +1075,23 @@ int adytumfs_truncate(u32 mount, u32 inode, u64 generation, u32 size,
     u64 blocks = size / ADYTUMFS_BLOCK_SIZE +
                  (size % ADYTUMFS_BLOCK_SIZE ? 1 : 0);
     if (blocks > in.blocks) {
-        if (adytumfs_inode_grow(m->device, &m->super, &in, blocks)) return -1;
+        if (adytumfs_inode_grow(m->device, &m->super, &m->store, &in, m->slots[inode].inode, blocks)) return -1;
     } else if (blocks < in.blocks) {
-        if (adytumfs_inode_truncate(m->device, &m->super, &in, blocks))
+        if (adytumfs_inode_truncate(m->device, &m->super, &m->store, &in, m->slots[inode].inode, blocks))
             return -1;
     }
     if (size % ADYTUMFS_BLOCK_SIZE) {
         // Reads clamp to size but a mapping exposes the whole page, so the
         // bytes past the new size inside the kept tail block read as zeroes.
         u64 physical = 0;
-        if (adytumfs_inode_map(&in, blocks - 1, &physical)) return -1;
+        if (adytumfs_inode_map(m->device, &m->super, &m->store, &in, blocks - 1, &physical)) return -1;
         if (adytumfs_data_read(m->device, &m->super, physical,
                                adytumfs_backend_scratch))
             return -1;
         for (u32 index = size % ADYTUMFS_BLOCK_SIZE;
              index < ADYTUMFS_BLOCK_SIZE; index++)
             adytumfs_backend_scratch[index] = 0;
-        if (adytumfs_inode_remap(m->device, &m->super, &in,
+        if (adytumfs_inode_remap(m->device, &m->super, &m->store, &in,
                                  m->slots[inode].inode, blocks - 1,
                                  adytumfs_backend_scratch))
             return -1;

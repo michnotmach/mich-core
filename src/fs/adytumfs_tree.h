@@ -103,6 +103,10 @@ int adytumfs_tree_branch_split(const u8 *full, u8 *left, u8 *right,
 // A zero root is an empty tree, so inserting into a fresh volume needs no
 // special case and node_check stays strict about count.
 #define ADYTUMFS_TREE_DEPTH_MAX 12u
+// How much of a walk one step of a full drop takes. Large enough that a
+// single file's tree goes in one pass almost always, small enough that the
+// loop is real rather than a formality on a deep one.
+#define ADYTUMFS_TREE_DROP_BUDGET 1024u
 
 int adytumfs_tree_root_empty(const u8 root[ADYTUMFS_CAS_HASH_SIZE]);
 
@@ -181,6 +185,16 @@ int adytumfs_tree_discard(struct kernel_object *device,
                           struct adytumfs_cas *store,
                           const u8 root[ADYTUMFS_CAS_HASH_SIZE],
                           u32 budget, u32 *remaining);
+// Let go of a whole tree and everything only it reached. A caller that is
+// finished with a root, because the inode now names a newer one or the file is
+// gone, uses this rather than driving the walk itself: the budget exists so a
+// long walk can be split across scheduler turns, and a caller with nowhere to
+// resume from would leak the tail by stopping early.
+int adytumfs_tree_drop(struct kernel_object *device,
+                       struct adytumfs_superblock *super,
+                       struct adytumfs_cas *store,
+                       const u8 root[ADYTUMFS_CAS_HASH_SIZE]);
+
 int adytumfs_tree_discard_resume(struct kernel_object *device,
                                  struct adytumfs_superblock *super,
                                  struct adytumfs_cas *store,

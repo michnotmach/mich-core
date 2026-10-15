@@ -1,8 +1,10 @@
 #include "adytumfs_format.h"
+#include "adytumfs_tree.h"
 
 int adytumfs_path_resolve(struct kernel_object *device,
-                          const struct adytumfs_superblock *super,
-                          const char *path, u64 *out_inode) {
+                          struct adytumfs_superblock *super,
+                          struct adytumfs_cas *store, const char *path,
+                          u64 *out_inode) {
     if (!path || !out_inode || path[0] != '/') return -1;
     u64 current = super->root_inode;
     u32 index = 1;
@@ -14,7 +16,7 @@ int adytumfs_path_resolve(struct kernel_object *device,
         // Empty components (a leading, trailing, or doubled slash) are skipped.
         if (length > 0) {
             u64 child;
-            if (adytumfs_dir_lookup(device, super, current, path + start, length,
+            if (adytumfs_dir_lookup(device, super, store, current, path + start, length,
                                     &child))
                 return -1;
             current = child;
@@ -26,7 +28,8 @@ int adytumfs_path_resolve(struct kernel_object *device,
 }
 
 int adytumfs_create_at(struct kernel_object *device,
-                       struct adytumfs_superblock *super, u64 parent_inode,
+                       struct adytumfs_superblock *super,
+                       struct adytumfs_cas *store, u64 parent_inode,
                        const char *name, u32 name_len, u16 mode,
                        u64 *out_inode) {
     if (mode == 0 || name_len == 0 || name_len > ADYTUMFS_NAME_MAX) return -1;
@@ -41,7 +44,7 @@ int adytumfs_create_at(struct kernel_object *device,
         (u8)ADYTUMFS_DTYPE_REG;
     // dir_add rejects a duplicate name; roll the inode back so a failed create
     // does not leak an allocated slot.
-    if (adytumfs_dir_add(device, super, parent_inode, name, name_len, target,
+    if (adytumfs_dir_add(device, super, store, parent_inode, name, name_len, target,
                          type)) {
         adytumfs_inode_free(device, super, target);
         return -1;
@@ -51,11 +54,12 @@ int adytumfs_create_at(struct kernel_object *device,
 }
 
 int adytumfs_unlink_at(struct kernel_object *device,
-                       struct adytumfs_superblock *super, u64 parent_inode,
+                       struct adytumfs_superblock *super,
+                       struct adytumfs_cas *store, u64 parent_inode,
                        const char *name, u32 name_len) {
     if (name_len == 0 || name_len > ADYTUMFS_NAME_MAX) return -1;
     u64 target;
-    if (adytumfs_dir_lookup(device, super, parent_inode, name, name_len,
+    if (adytumfs_dir_lookup(device, super, store, parent_inode, name, name_len,
                             &target))
         return -1;
     struct adytumfs_inode inode;
@@ -64,8 +68,9 @@ int adytumfs_unlink_at(struct kernel_object *device,
     // path handles regular files only.
     if ((inode.mode & ADYTUMFS_MODE_REG) == 0) return -1;
     // Reclaim the file's data blocks before the directory entry and inode go.
-    if (adytumfs_inode_truncate(device, super, &inode, 0)) return -1;
-    if (adytumfs_dir_remove(device, super, parent_inode, name, name_len))
+    if (adytumfs_inode_truncate(device, super, store, &inode, target, 0))
+        return -1;
+    if (adytumfs_dir_remove(device, super, store, parent_inode, name, name_len))
         return -1;
     return adytumfs_inode_free(device, super, target);
 }

@@ -2,6 +2,7 @@
 #include "object.h"
 #include "block.h"
 #include "adytumfs_format.h"
+#include "adytumfs_cas.h"
 
 int test_adytumfs_diriter64(void) {
     u32 objects = object_active_count();
@@ -12,19 +13,23 @@ int test_adytumfs_diriter64(void) {
     // threaded, so the scratch block is static.
     static u8 block[ADYTUMFS_BLOCK_SIZE];
     struct adytumfs_superblock super;
+    // The content store every extent tree resolves through. A test that
+    // touches a file's blocks needs one, exactly as a mount does.
+    static struct adytumfs_cas store;
     int valid = dev && adytumfs_make(dev) == 0 &&
         adytumfs_block_read(dev, 0, block) == 0 &&
         adytumfs_super_unpack(&super, block) == 0;
+    adytumfs_cas_open(&store, super.index_start, super.index_blocks);
 
     // A directory with four entries, one of which is then removed.
     u64 dir = 0;
     valid = valid &&
         adytumfs_inode_alloc(dev, &super, ADYTUMFS_MODE_DIR | 0755u, &dir) == 0 &&
-        adytumfs_dir_add(dev, &super, dir, "one", 3, 21, ADYTUMFS_DTYPE_REG) == 0 &&
-        adytumfs_dir_add(dev, &super, dir, "two", 3, 22, ADYTUMFS_DTYPE_DIR) == 0 &&
-        adytumfs_dir_add(dev, &super, dir, "three", 5, 23, ADYTUMFS_DTYPE_REG) == 0 &&
-        adytumfs_dir_add(dev, &super, dir, "four", 4, 24, ADYTUMFS_DTYPE_REG) == 0 &&
-        adytumfs_dir_remove(dev, &super, dir, "two", 3) == 0;
+        adytumfs_dir_add(dev, &super, &store, dir, "one", 3, 21, ADYTUMFS_DTYPE_REG) == 0 &&
+        adytumfs_dir_add(dev, &super, &store, dir, "two", 3, 22, ADYTUMFS_DTYPE_DIR) == 0 &&
+        adytumfs_dir_add(dev, &super, &store, dir, "three", 5, 23, ADYTUMFS_DTYPE_REG) == 0 &&
+        adytumfs_dir_add(dev, &super, &store, dir, "four", 4, 24, ADYTUMFS_DTYPE_REG) == 0 &&
+        adytumfs_dir_remove(dev, &super, &store, dir, "two", 3) == 0;
 
     char name[ADYTUMFS_NAME_MAX + 1];
     u32 name_len = 0;
@@ -37,7 +42,7 @@ int test_adytumfs_diriter64(void) {
     int saw_four = 0;
     int saw_two = 0;
     int result;
-    while (valid && (result = adytumfs_dir_iter(dev, &super, dir, &cursor, name,
+    while (valid && (result = adytumfs_dir_iter(dev, &super, &store, dir, &cursor, name,
                                                 &name_len, &inode, &type)) == 0) {
         count++;
         if (inode == 21) saw_one = 1;
@@ -56,13 +61,13 @@ int test_adytumfs_diriter64(void) {
     for (u32 index = 0; index < sizeof(longname); index++) longname[index] = 'q';
     for (u32 index = 0; index < 40 && valid; index++) {
         longname[0] = (u8)('a' + index);
-        valid = valid && adytumfs_dir_add(dev, &super, big,
+        valid = valid && adytumfs_dir_add(dev, &super, &store, big,
             (const char *)longname, sizeof(longname), 500 + index,
             ADYTUMFS_DTYPE_REG) == 0;
     }
     cursor = 0;
     count = 0;
-    while (valid && (result = adytumfs_dir_iter(dev, &super, big, &cursor, name,
+    while (valid && (result = adytumfs_dir_iter(dev, &super, &store, big, &cursor, name,
                                                 &name_len, &inode, &type)) == 0)
         count++;
     valid = valid && result == 1 && count == 40;

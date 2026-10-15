@@ -1,4 +1,6 @@
 #include "adytumfs_format.h"
+#include "adytumfs_tree.h"
+#include "blake2b.h"
 #include "crc32c.h"
 #include "rtc64.h"
 
@@ -15,14 +17,8 @@ void adytumfs_inode_pack(u8 *slot, const struct adytumfs_inode *inode) {
     adytumfs_write_le64(slot + 40, inode->mtime);
     adytumfs_write_le64(slot + 48, inode->ctime);
     adytumfs_write_le64(slot + 56, inode->generation);
-    for (u32 index = 0; index < ADYTUMFS_DIRECT_EXTENTS; index++) {
-        u8 *extent = slot + 64 + index * ADYTUMFS_EXTENT_SIZE;
-        adytumfs_write_le64(extent + 0, inode->direct[index].start_block);
-        adytumfs_write_le32(extent + 8, inode->direct[index].length);
-        adytumfs_write_le32(extent + 12, inode->direct[index].flags);
-    }
-    adytumfs_write_le64(slot + 224, inode->indirect1);
-    adytumfs_write_le64(slot + 232, inode->indirect2);
+    for (u32 index = 0; index < ADYTUMFS_HASH_SIZE; index++)
+        slot[64 + index] = inode->extent_root[index];
     adytumfs_write_le32(slot + 240, inode->atime_nsec);
     adytumfs_write_le32(slot + 244, inode->mtime_nsec);
     adytumfs_write_le32(slot + 248, inode->ctime_nsec);
@@ -47,14 +43,8 @@ int adytumfs_inode_unpack(struct adytumfs_inode *inode, const u8 *slot) {
     inode->mtime = adytumfs_read_le64(slot + 40);
     inode->ctime = adytumfs_read_le64(slot + 48);
     inode->generation = adytumfs_read_le64(slot + 56);
-    for (u32 index = 0; index < ADYTUMFS_DIRECT_EXTENTS; index++) {
-        const u8 *extent = slot + 64 + index * ADYTUMFS_EXTENT_SIZE;
-        inode->direct[index].start_block = adytumfs_read_le64(extent + 0);
-        inode->direct[index].length = adytumfs_read_le32(extent + 8);
-        inode->direct[index].flags = adytumfs_read_le32(extent + 12);
-    }
-    inode->indirect1 = adytumfs_read_le64(slot + 224);
-    inode->indirect2 = adytumfs_read_le64(slot + 232);
+    for (u32 index = 0; index < ADYTUMFS_HASH_SIZE; index++)
+        inode->extent_root[index] = slot[64 + index];
     inode->atime_nsec = adytumfs_read_le32(slot + 240);
     inode->mtime_nsec = adytumfs_read_le32(slot + 244);
     inode->ctime_nsec = adytumfs_read_le32(slot + 248);
@@ -139,221 +129,135 @@ int adytumfs_inode_free(struct kernel_object *device,
     return 0;
 }
 
-int adytumfs_inode_map(const struct adytumfs_inode *inode, u64 logical_block,
-                       u64 *physical_block) {
-    if (!inode || !physical_block) return -1;
-    u64 base = 0;
-    // Extents are packed from the front; a zero-length extent ends the list.
-    for (u32 index = 0; index < ADYTUMFS_DIRECT_EXTENTS; index++) {
-        u32 length = inode->direct[index].length;
-        if (length == 0) break;
-        if (logical_block < base + length) {
-            *physical_block =
-                inode->direct[index].start_block + (logical_block - base);
-            return 0;
-        }
-        base += length;
+static void root_copy(u8 *to, const u8 *from) {
+    for (u32 index = 0; index < ADYTUMFS_HASH_SIZE; index++)
+        to[index] = from[index];
+}
+
+// Commit a new extent root into the inode and let go of the one it named
+// before. The order is the whole of the crash argument: the inode reaches the
+// disk first, so a crash before the drop leaves the old tree unreferenced and
+// the garbage walk reclaims it, while the reverse order would leave an inode
+// naming blocks that already went back to the pool.
+static int root_commit(struct kernel_object *device,
+                       struct adytumfs_superblock *super,
+                       struct adytumfs_cas *store, struct adytumfs_inode *inode,
+                       u64 inode_num, const u8 *previous, u64 blocks) {
+    if (adytumfs_inode_write(device, super, inode_num, inode)) {
+        // The on-disk inode still names the previous root, so the in-memory
+        // copy goes back to it and the root just built is the garbage.
+        root_copy(inode->extent_root, previous);
+        inode->blocks = blocks;
+        return adytumfs_tree_drop(device, super, store, inode->extent_root) ?
+            -1 : -1;
     }
-    return -1;
+    return adytumfs_tree_drop(device, super, store, previous);
+}
+
+int adytumfs_inode_map(struct kernel_object *device,
+                       struct adytumfs_superblock *super,
+                       struct adytumfs_cas *store,
+                       const struct adytumfs_inode *inode, u64 logical_block,
+                       u64 *physical_block) {
+    if (!device || !super || !store || !inode || !physical_block) return -1;
+    struct adytumfs_tree_span span;
+    // Every block an entry covers holds the same bytes, so the entry's single
+    // hash resolves to one block that serves all of them. A run of a thousand
+    // holes is one mapping, and the caller needs no offset arithmetic because
+    // there is nothing to add to the block number.
+    if (adytumfs_tree_find(device, super, store, inode->extent_root,
+                           logical_block * ADYTUMFS_BLOCK_SIZE, &span))
+        return -1;
+    return adytumfs_cas_lookup(device, super, store, span.hash,
+                               physical_block);
+}
+
+// Land content in the store and hand back its hash. Placing rather than
+// acquiring is deliberate: the tree takes the reference when it packs the
+// entry that names this hash, so a reference taken here as well would be one
+// nobody ever releases.
+static int content_place(struct kernel_object *device,
+                         struct adytumfs_superblock *super,
+                         struct adytumfs_cas *store, const u8 *content,
+                         u8 hash[ADYTUMFS_HASH_SIZE], u64 *number) {
+    if (blake2b(hash, ADYTUMFS_HASH_SIZE, content, ADYTUMFS_BLOCK_SIZE))
+        return -1;
+    if (adytumfs_cas_place(device, super, store, hash, number)) return -1;
+    return adytumfs_data_write(device, super, *number, content);
 }
 
 int adytumfs_inode_grow(struct kernel_object *device,
                         struct adytumfs_superblock *super,
-                        struct adytumfs_inode *inode, u64 new_blocks) {
-    if (!super || !inode) return -1;
+                        struct adytumfs_cas *store,
+                        struct adytumfs_inode *inode, u64 inode_num,
+                        u64 new_blocks) {
+    if (!device || !super || !store || !inode) return -1;
     if (new_blocks <= inode->blocks) return 0;
-    u64 add = new_blocks - inode->blocks;
-    u64 start;
-    if (adytumfs_alloc_run(device, super, add, &start)) return -1;
-
-    u32 last = 0;
-    int have = 0;
-    for (u32 index = 0; index < ADYTUMFS_DIRECT_EXTENTS; index++) {
-        if (inode->direct[index].length == 0) break;
-        last = index;
-        have = 1;
-    }
-    if (have && inode->direct[last].start_block + inode->direct[last].length ==
-        start) {
-        inode->direct[last].length += (u32)add;
-    } else {
-        u32 slot = have ? last + 1 : 0;
-        if (slot >= ADYTUMFS_DIRECT_EXTENTS) {
-            // No direct slot left; indirect blocks are not implemented yet, so
-            // give the run back rather than lose track of it.
-            adytumfs_free_run(device, super, start, add);
-            return -1;
-        }
-        inode->direct[slot].start_block = start;
-        inode->direct[slot].length = (u32)add;
-        inode->direct[slot].flags = 0;
-    }
+    u64 blocks = inode->blocks;
+    struct adytumfs_tree_value value;
+    u64 number = 0;
+    if (adytumfs_zero_hash(value.hash)) return -1;
+    // One entry covers the whole growth whatever its length, because a hole is
+    // a run of identical blocks and the format says the hash repeats every
+    // block of them.
+    value.length = (new_blocks - blocks) * ADYTUMFS_BLOCK_SIZE;
+    if (adytumfs_cas_place(device, super, store, value.hash, &number))
+        return -1;
+    if (adytumfs_block_zero(device, super, number)) return -1;
+    struct adytumfs_tree_key key;
+    u8 next[ADYTUMFS_HASH_SIZE];
+    key.end = new_blocks * ADYTUMFS_BLOCK_SIZE;
+    if (adytumfs_tree_insert(device, super, store, inode->extent_root, &key,
+                             &value, next))
+        return -1;
+    u8 previous[ADYTUMFS_HASH_SIZE];
+    root_copy(previous, inode->extent_root);
+    root_copy(inode->extent_root, next);
     inode->blocks = new_blocks;
-    // A reallocated block still holds the previous file's bytes. Reads clamp
-    // to size, but a mapping exposes whole pages and a write that skipped
-    // pages must read back as zeroes, so every freshly allocated block is
-    // zeroed here. The zeroing is direct I/O on purpose: the pages path moves
-    // file data with direct transfers, and a cached zero would be flushed
-    // over the real bytes later.
-    for (u64 block = start; block < start + add; block++)
-        if (adytumfs_block_zero(device, super, block)) return -1;
-    return 0;
+    return root_commit(device, super, store, inode, inode_num, previous, blocks);
 }
 
 int adytumfs_inode_truncate(struct kernel_object *device,
                             struct adytumfs_superblock *super,
-                            struct adytumfs_inode *inode, u64 new_blocks) {
-    if (!super || !inode) return -1;
+                            struct adytumfs_cas *store,
+                            struct adytumfs_inode *inode, u64 inode_num,
+                            u64 new_blocks) {
+    if (!device || !super || !store || !inode) return -1;
     if (new_blocks >= inode->blocks) return 0;
-    u64 base = 0;
-    for (u32 index = 0; index < ADYTUMFS_DIRECT_EXTENTS; index++) {
-        u32 length = inode->direct[index].length;
-        if (length == 0) break;
-        u64 end = base + length;
-        if (base >= new_blocks) {
-            if (adytumfs_free_run(device, super, inode->direct[index].start_block,
-                                  length))
-                return -1;
-            inode->direct[index].start_block = 0;
-            inode->direct[index].length = 0;
-            inode->direct[index].flags = 0;
-        } else if (end > new_blocks) {
-            u64 keep = new_blocks - base;
-            if (adytumfs_free_run(device, super,
-                                  inode->direct[index].start_block + keep,
-                                  length - keep))
-                return -1;
-            inode->direct[index].length = (u32)keep;
-        }
-        base = end;
-    }
+    u64 blocks = inode->blocks;
+    u8 next[ADYTUMFS_HASH_SIZE];
+    if (adytumfs_tree_truncate(device, super, store, inode->extent_root,
+                               new_blocks * ADYTUMFS_BLOCK_SIZE, next))
+        return -1;
+    u8 previous[ADYTUMFS_HASH_SIZE];
+    root_copy(previous, inode->extent_root);
+    root_copy(inode->extent_root, next);
     inode->blocks = new_blocks;
-    return 0;
-}
-
-// Point one mapped logical block at a different physical block. The covering
-// extent splits into up to three pieces and neighbours that stay physically
-// adjacent merge back, so the array remains packed from the front. Fails
-// closed when the split would need more than the direct slots.
-static int adytumfs_extent_reroute(struct adytumfs_inode *inode, u64 logical,
-                                   u64 fresh) {
-    u32 extents = 0;
-    while (extents < ADYTUMFS_DIRECT_EXTENTS && inode->direct[extents].length)
-        extents++;
-
-    u64 base = 0;
-    for (u32 index = 0; index < extents; index++) {
-        u32 length = inode->direct[index].length;
-        if (logical < base || logical >= base + length) {
-            base += length;
-            continue;
-        }
-        u64 start = inode->direct[index].start_block;
-        u64 offset = logical - base;
-        struct adytumfs_extent pieces[3];
-        u32 count = 0;
-        if (offset) {
-            pieces[count].start_block = start;
-            pieces[count].length = (u32)offset;
-            pieces[count].flags = 0;
-            count++;
-        }
-        pieces[count].start_block = fresh;
-        pieces[count].length = 1;
-        pieces[count].flags = 0;
-        count++;
-        if (offset + 1 < length) {
-            pieces[count].start_block = start + offset + 1;
-            pieces[count].length = (u32)(length - offset - 1);
-            pieces[count].flags = 0;
-            count++;
-        }
-        if (extents - 1u + count > ADYTUMFS_DIRECT_EXTENTS) return -1;
-
-        struct adytumfs_extent rebuilt[ADYTUMFS_DIRECT_EXTENTS];
-        u32 used = 0;
-        for (u32 scan = 0; scan < index; scan++)
-            rebuilt[used++] = inode->direct[scan];
-        for (u32 piece = 0; piece < count; piece++)
-            rebuilt[used++] = pieces[piece];
-        for (u32 scan = index + 1; scan < extents; scan++)
-            rebuilt[used++] = inode->direct[scan];
-
-        // Consecutive slots are logically adjacent, so merging on physical
-        // adjacency is representation preserving and undoes the split when
-        // the allocator handed out a neighbouring block.
-        u32 compact = 0;
-        for (u32 scan = 0; scan < used; scan++) {
-            if (compact &&
-                rebuilt[scan].start_block ==
-                    rebuilt[compact - 1].start_block +
-                        rebuilt[compact - 1].length) {
-                rebuilt[compact - 1].length += rebuilt[scan].length;
-                continue;
-            }
-            rebuilt[compact++] = rebuilt[scan];
-        }
-        for (u32 scan = 0; scan < ADYTUMFS_DIRECT_EXTENTS; scan++) {
-            if (scan < compact) {
-                inode->direct[scan] = rebuilt[scan];
-            } else {
-                inode->direct[scan].start_block = 0;
-                inode->direct[scan].length = 0;
-                inode->direct[scan].flags = 0;
-            }
-        }
-        return 0;
-    }
-    return -1;
-}
-
-int adytumfs_redirect_stage(struct kernel_object *device,
-                            struct adytumfs_superblock *super,
-                            struct adytumfs_inode *inode, u64 logical,
-                            u64 *old_block, u64 *fresh_block) {
-    if (!super || !inode || !old_block || !fresh_block) return -1;
-    if (adytumfs_inode_map(inode, logical, old_block)) return -1;
-    // The old block is still marked allocated here, so the fresh run can
-    // never land on it; nothing else moves until commit.
-    return adytumfs_alloc_run(device, super, 1, fresh_block);
-}
-
-int adytumfs_redirect_commit(struct kernel_object *device,
-                             struct adytumfs_superblock *super,
-                             struct adytumfs_inode *inode, u64 inode_num,
-                             u64 logical, u64 old_block, u64 fresh_block) {
-    if (!super || !inode) return -1;
-    struct adytumfs_extent saved[ADYTUMFS_DIRECT_EXTENTS];
-    for (u32 index = 0; index < ADYTUMFS_DIRECT_EXTENTS; index++)
-        saved[index] = inode->direct[index];
-    if (adytumfs_extent_reroute(inode, logical, fresh_block)) {
-        if (adytumfs_free_run(device, super, fresh_block, 1)) return -1;
-        return -1;
-    }
-    if (adytumfs_inode_write(device, super, inode_num, inode)) {
-        for (u32 index = 0; index < ADYTUMFS_DIRECT_EXTENTS; index++)
-            inode->direct[index] = saved[index];
-        if (adytumfs_free_run(device, super, fresh_block, 1)) return -1;
-        return -1;
-    }
-    // The old block leaves the pool only after the new mapping is on disk,
-    // so the mapping a later boot reads never names a free block.
-    return adytumfs_free_run(device, super, old_block, 1);
+    return root_commit(device, super, store, inode, inode_num, previous, blocks);
 }
 
 int adytumfs_inode_remap(struct kernel_object *device,
                          struct adytumfs_superblock *super,
+                         struct adytumfs_cas *store,
                          struct adytumfs_inode *inode, u64 inode_num,
                          u64 logical, const u8 *content) {
-    u64 old_block = 0;
-    u64 fresh_block = 0;
-    if (adytumfs_redirect_stage(device, super, inode, logical, &old_block,
-                                &fresh_block))
+    if (!device || !super || !store || !inode || !content) return -1;
+    struct adytumfs_tree_value value;
+    u64 number = 0;
+    u64 blocks = inode->blocks;
+    if (content_place(device, super, store, content, value.hash, &number))
         return -1;
-    if (adytumfs_data_write(device, super, fresh_block, content)) {
-        if (adytumfs_free_run(device, super, fresh_block, 1)) return -1;
+    // One block, so the entry covers exactly the block being rewritten and
+    // splits any run it sat inside without the caller saying so.
+    value.length = ADYTUMFS_BLOCK_SIZE;
+    struct adytumfs_tree_key key;
+    u8 next[ADYTUMFS_HASH_SIZE];
+    key.end = (logical + 1u) * ADYTUMFS_BLOCK_SIZE;
+    if (adytumfs_tree_insert(device, super, store, inode->extent_root, &key,
+                             &value, next))
         return -1;
-    }
-    return adytumfs_redirect_commit(device, super, inode, inode_num, logical,
-                                    old_block, fresh_block);
+    u8 previous[ADYTUMFS_HASH_SIZE];
+    root_copy(previous, inode->extent_root);
+    root_copy(inode->extent_root, next);
+    return root_commit(device, super, store, inode, inode_num, previous, blocks);
 }

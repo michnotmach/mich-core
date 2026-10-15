@@ -1,6 +1,7 @@
 #include "adytumfs_format.h"
 #include "adytumfs_index.h"
 #include "crc32c.h"
+#include "blake2b.h"
 #include "block.h"
 #include "cache.h"
 #include "rtc64.h"
@@ -70,6 +71,25 @@ int adytumfs_data_write(struct kernel_object *device,
                         u64 block, const u8 *buffer) {
     if (adytumfs_block_write(device, block, buffer)) return -1;
     return adytumfs_data_seal(device, super, block, buffer);
+}
+
+// The hash of the sealed zero image, which is what every hole on the volume
+// names. Computed once rather than per hole: it is the same 4096 zero bytes
+// every time, and hashing them on every grow of every file is work with no
+// output that changes.
+int adytumfs_zero_hash(u8 hash[ADYTUMFS_HASH_SIZE]) {
+    static u8 cached[ADYTUMFS_HASH_SIZE];
+    static int ready;
+    if (!hash) return -1;
+    if (!ready) {
+        if (blake2b(cached, ADYTUMFS_HASH_SIZE, adytumfs_zero_block,
+                    ADYTUMFS_BLOCK_SIZE))
+            return -1;
+        ready = 1;
+    }
+    for (u32 index = 0; index < ADYTUMFS_HASH_SIZE; index++)
+        hash[index] = cached[index];
+    return 0;
 }
 
 int adytumfs_block_zero(struct kernel_object *device,

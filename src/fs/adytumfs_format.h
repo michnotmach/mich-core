@@ -3,6 +3,10 @@
 
 #include "types.h"
 
+// The content store an inode's extent tree resolves through. Declared here
+// rather than included because the store is built on top of this header.
+struct adytumfs_cas;
+
 // AdytumFS on-disk integers are little-endian and are read and written only
 // through these helpers, so the big-endian s390x port reads images correctly.
 // See mich-notes/adytumfs-format.md for the full layout.
@@ -41,8 +45,11 @@ static inline void adytumfs_write_le64(u8 *p, u64 value) {
 #define ADYTUMFS_INODE_SIZE 256u
 #define ADYTUMFS_INODES_PER_BLOCK 16u
 #define ADYTUMFS_NAME_MAX 255u
-#define ADYTUMFS_EXTENT_SIZE 16u
-#define ADYTUMFS_DIRECT_EXTENTS 10u
+// One hash space for the whole format: tree nodes, index entries and the
+// extent root an inode names are all BLAKE2b-512 over a block, so a node and
+// a block of file data can never be told apart by their hash alone and the
+// index needs no type field.
+#define ADYTUMFS_HASH_SIZE 64u
 #define ADYTUMFS_FORMAT_VERSION 3u
 #define ADYTUMFS_ROOT_INODE 1u
 // v1 bounds the inode table at sixteen blocks (256 inodes at sixteen per
@@ -130,12 +137,6 @@ int adytumfs_super_valid(const struct adytumfs_superblock *super,
 #define ADYTUMFS_MODE_LNK 0x2000u
 #define ADYTUMFS_INODE_CHECKSUM_OFFSET 252u
 
-struct adytumfs_extent {
-    u64 start_block;
-    u32 length;
-    u32 flags;
-};
-
 struct adytumfs_inode {
     u16 mode;
     u16 links;
@@ -148,12 +149,14 @@ struct adytumfs_inode {
     u64 mtime;
     u64 ctime;
     u64 generation;
-    struct adytumfs_extent direct[ADYTUMFS_DIRECT_EXTENTS];
-    u64 indirect1;
-    u64 indirect2;
-    // Nanoseconds inside the seconds fields above. The slot keeps twelve
-    // spare bytes between the last extent pair and the checksum, exactly
-    // three u32 values, and the checksum still covers the whole slot.
+    // Root of this file's extent tree. All zero is the empty tree, which is
+    // what a fresh inode and a truncated to nothing file both hold, so no
+    // separate "has extents" flag is needed. The root is a content hash and
+    // not a block number, so writing a file never rewrites the inode to point
+    // somewhere new until the root itself changes.
+    u8 extent_root[ADYTUMFS_HASH_SIZE];
+    // Nanoseconds inside the seconds fields above, kept where v2 had them so
+    // the checksum offset does not move.
     u32 atime_nsec;
     u32 mtime_nsec;
     u32 ctime_nsec;
@@ -279,42 +282,49 @@ int adytumfs_inode_free(struct kernel_object *device,
 // must agree with the extents exactly, and the superblock counters must match
 // what a full scan of the table and the bitmap finds. Returns 0 only when the
 // three views of the volume agree.
-int adytumfs_verify(struct kernel_object *device,
-                    const struct adytumfs_superblock *super);
+// The hash of the block of zeroes every hole names. One block serves every
+// hole on the volume, so a sparse file costs nothing per hole and a read of
+// one resolves through the tree like any other mapping.
+int adytumfs_zero_hash(u8 hash[ADYTUMFS_HASH_SIZE]);
 
-// Map a logical file block to its physical block through the inode's extents.
-int adytumfs_inode_map(const struct adytumfs_inode *inode, u64 logical_block,
+int adytumfs_verify(struct kernel_object *device,
+                    struct adytumfs_superblock *super);
+
+// Map a logical file block to its physical block. The inode names the root of
+// its extent tree, the tree resolves the block to a content hash, and the
+// store resolves the hash to a block number, so no physical address is ever
+// recorded in the inode.
+int adytumfs_inode_map(struct kernel_object *device,
+                       struct adytumfs_superblock *super,
+                       struct adytumfs_cas *store,
+                       const struct adytumfs_inode *inode, u64 logical_block,
                        u64 *physical_block);
-// Copy-on-write redirect of one mapped block. Stage reserves a fresh block
-// for the caller to land the new bytes in (a page transfer or a staging
-// block); commit reroutes the extent to it, persists the inode, and returns
-// the old block to the pool. The old bytes are never overwritten while the
-// on-disk mapping still names them, so a later boot reads either the old
-// block with its old checksum or the new one, never a mix. A failed commit
-// rolls the extent array back and releases the fresh block.
-int adytumfs_redirect_stage(struct kernel_object *device,
-                            struct adytumfs_superblock *super,
-                            struct adytumfs_inode *inode, u64 logical,
-                            u64 *old_block, u64 *fresh_block);
-int adytumfs_redirect_commit(struct kernel_object *device,
-                             struct adytumfs_superblock *super,
-                             struct adytumfs_inode *inode, u64 inode_num,
-                             u64 logical, u64 old_block, u64 fresh_block);
-// The staging-block form of a redirect: land content in the fresh block and
-// commit in one call.
+// Replace one block of a file. The new content lands in a block of its own, is
+// hashed, and is inserted into the tree; whatever the entry named before loses
+// the tree's reference and returns to the pool when nothing else names it. The
+// old root stays valid until the new one reaches the inode, so a later boot
+// reads either the old tree or the new one and never a mix. That is the whole
+// of the atomicity argument, which is why the two-phase redirect this replaces
+// is gone.
 int adytumfs_inode_remap(struct kernel_object *device,
                          struct adytumfs_superblock *super,
+                         struct adytumfs_cas *store,
                          struct adytumfs_inode *inode, u64 inode_num,
                          u64 logical, const u8 *content);
-// Grow the file to new_blocks mapped blocks (allocating a run and appending or
-// coalescing an extent), or truncate it down (freeing and reclaiming the tail).
-// Direct extents only for now; indirect blocks come later.
+// Grow the file to new_blocks mapped blocks, or truncate it down. Every new
+// block gets the sealed zero content, so a hole costs one shared block for the
+// whole file rather than one per block, and a read of a hole needs no special
+// case.
 int adytumfs_inode_grow(struct kernel_object *device,
                         struct adytumfs_superblock *super,
-                        struct adytumfs_inode *inode, u64 new_blocks);
+                        struct adytumfs_cas *store,
+                        struct adytumfs_inode *inode, u64 inode_num,
+                        u64 new_blocks);
 int adytumfs_inode_truncate(struct kernel_object *device,
                             struct adytumfs_superblock *super,
-                            struct adytumfs_inode *inode, u64 new_blocks);
+                            struct adytumfs_cas *store,
+                            struct adytumfs_inode *inode, u64 inode_num,
+                            u64 new_blocks);
 
 // Directory entries live in the directory's data blocks: an 8-byte target inode,
 // a 2-byte record length, a 1-byte name length, a 1-byte type, then the name.
@@ -325,20 +335,24 @@ int adytumfs_inode_truncate(struct kernel_object *device,
 #define ADYTUMFS_DTYPE_LNK 3u
 
 int adytumfs_dir_lookup(struct kernel_object *device,
-                        const struct adytumfs_superblock *super, u64 dir_inode,
+                        struct adytumfs_superblock *super,
+                        struct adytumfs_cas *store, u64 dir_inode,
                         const char *name, u32 name_len, u64 *out_inode);
 int adytumfs_dir_add(struct kernel_object *device,
-                     struct adytumfs_superblock *super, u64 dir_inode,
+                     struct adytumfs_superblock *super,
+                     struct adytumfs_cas *store, u64 dir_inode,
                      const char *name, u32 name_len, u64 target_inode, u8 type);
 int adytumfs_dir_remove(struct kernel_object *device,
-                        struct adytumfs_superblock *super, u64 dir_inode,
+                        struct adytumfs_superblock *super,
+                        struct adytumfs_cas *store, u64 dir_inode,
                         const char *name, u32 name_len);
 // Iterate directory entries: start with *cursor = 0, get one used entry per call
 // (name needs an ADYTUMFS_NAME_MAX + 1 buffer, it comes back NUL-terminated)
 // plus its length, inode, and type, and an advanced cursor; returns 0 for an
 // entry, 1 at the end, -1 on error.
 int adytumfs_dir_iter(struct kernel_object *device,
-                      const struct adytumfs_superblock *super, u64 dir_inode,
+                      struct adytumfs_superblock *super,
+                      struct adytumfs_cas *store, u64 dir_inode,
                       u64 *cursor, char *name, u32 *name_len, u64 *inode_out,
                       u8 *type_out);
 
@@ -346,10 +360,12 @@ int adytumfs_dir_iter(struct kernel_object *device,
 // the current end grows the file (allocating blocks); size is updated. Returns 0
 // with the transferred count, or -1 on error.
 int adytumfs_file_read(struct kernel_object *device,
-                       const struct adytumfs_superblock *super, u64 inode_num,
+                       struct adytumfs_superblock *super,
+                       struct adytumfs_cas *store, u64 inode_num,
                        u64 offset, void *buffer, u64 length, u64 *out_read);
 int adytumfs_file_write(struct kernel_object *device,
-                        struct adytumfs_superblock *super, u64 inode_num,
+                        struct adytumfs_superblock *super,
+                        struct adytumfs_cas *store, u64 inode_num,
                         u64 offset, const void *buffer, u64 length,
                         u64 *out_written);
 
@@ -357,14 +373,17 @@ int adytumfs_file_write(struct kernel_object *device,
 // root. Create a named child (a fresh inode plus a directory entry) under a
 // parent directory, or unlink a regular file (reclaiming its data).
 int adytumfs_path_resolve(struct kernel_object *device,
-                          const struct adytumfs_superblock *super,
-                          const char *path, u64 *out_inode);
+                          struct adytumfs_superblock *super,
+                          struct adytumfs_cas *store, const char *path,
+                          u64 *out_inode);
 int adytumfs_create_at(struct kernel_object *device,
-                       struct adytumfs_superblock *super, u64 parent_inode,
+                       struct adytumfs_superblock *super,
+                       struct adytumfs_cas *store, u64 parent_inode,
                        const char *name, u32 name_len, u16 mode,
                        u64 *out_inode);
 int adytumfs_unlink_at(struct kernel_object *device,
-                       struct adytumfs_superblock *super, u64 parent_inode,
+                       struct adytumfs_superblock *super,
+                       struct adytumfs_cas *store, u64 parent_inode,
                        const char *name, u32 name_len);
 
 #endif
