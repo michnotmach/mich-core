@@ -299,6 +299,24 @@ int adytumfs_inode_map(struct kernel_object *device,
                        struct adytumfs_cas *store,
                        const struct adytumfs_inode *inode, u64 logical_block,
                        u64 *physical_block);
+
+// The content hash a logical file block is stored under. Readers that bring
+// their own buffer, which the page cache has to because it fills the faulted
+// page in place, take the hash and verify against it themselves.
+int adytumfs_inode_hash(struct kernel_object *device,
+                        struct adytumfs_superblock *super,
+                        struct adytumfs_cas *store,
+                        const struct adytumfs_inode *inode, u64 logical_block,
+                        u8 hash[ADYTUMFS_HASH_SIZE]);
+
+// Map a logical file block and read it, checking the bytes against the hash
+// the extent tree named. Readers that want the content take this rather than
+// the mapping, so the check is not something a call site has to remember.
+int adytumfs_inode_fetch(struct kernel_object *device,
+                         struct adytumfs_superblock *super,
+                         struct adytumfs_cas *store,
+                         const struct adytumfs_inode *inode, u64 logical_block,
+                         u8 *buffer);
 // Replace one block of a file. The new content lands in a block of its own, is
 // hashed, and is inserted into the tree; whatever the entry named before loses
 // the tree's reference and returns to the pool when nothing else names it. The

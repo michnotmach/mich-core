@@ -97,4 +97,19 @@ int adytumfs_cas_relocate(struct kernel_object *device,
                           struct adytumfs_cas *store,
                           const u8 hash[ADYTUMFS_CAS_HASH_SIZE], u64 *block);
 
+// Resolve a hash and read the block it names, checking the bytes against that
+// hash on the way in. The parent promised the hash and nothing else covers the
+// block once the checksum region is gone, so the check lives here rather than
+// at each reader, where one could route around it by accident.
+int adytumfs_cas_read(struct kernel_object *device,
+                      const struct adytumfs_superblock *super,
+                      struct adytumfs_cas *store,
+                      const u8 hash[ADYTUMFS_CAS_HASH_SIZE], u8 *buffer);
+
+// Check bytes already in memory against the hash that named them. The page
+// cache transfers straight into the page it faulted, so it cannot go through
+// the read that carries this check with it.
+int adytumfs_cas_verify(const u8 hash[ADYTUMFS_CAS_HASH_SIZE],
+                        const u8 *buffer);
+
 #endif

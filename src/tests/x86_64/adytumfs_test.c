@@ -776,30 +776,24 @@ int test_adytumfs_policy64(void) {
         if (disk) object_release(disk);
         ok = ok && !vfs_unmount(point);
         struct adytumfs_superblock super;
-        u64 block = 0;
-        u32 at = 0;
+        // The name goes out through the format layer, the way the reclaim
+        // path drops it ahead of the inode. What survives is a real orphan
+        // in a consistent volume, not a dirent forged behind the tree.
         ok = ok && !policy_super(dev, &super) &&
-            !policy_find_record(dev, &super, "b", 1, &block, &at);
-        if (ok) adytumfs_write_le64(adytumfs_probe_block + at, 0);
-        // The tombstone is meant to be a valid on-disk state, so it has to
-        // seal the new dirent image like the format layer would; the
-        // corruption scenarios deliberately skip the seal and fail on the
-        // stale checksum instead.
-        ok = ok && !adytumfs_data_seal(dev, &super, block,
-                                       adytumfs_probe_block) &&
-            !policy_commit(dev, block) &&
-            !vfs_mount_adytumfs(point, dev);
-        struct kernel_object *fresh = ok ? vfs_lookup(root, "policy") : 0;
-        struct kernel_object *kept = fresh ? vfs_lookup(fresh, "a") : 0;
-        struct kernel_object *gone = fresh ? vfs_lookup(fresh, "b") : 0;
-        struct kernel_object *added = fresh ?
-            vfs_create(fresh, "c", VFS_NODE_REGULAR) : 0;
-        ok = ok && fresh && kept && added && !gone;
+            !adytumfs_dir_remove(dev, &super, &adytumfs_test_store,
+                                 super.root_inode, "b", 1) &&
+            !adytumfs_commit(dev, &super) && !block_cache_flush(dev);
+        if (dev) block_cache_drop_device((u32)dev->value);
+        ok = ok && !vfs_mount_adytumfs(point, dev);
+        disk = ok ? vfs_lookup(root, "policy") : 0;
+        struct kernel_object *kept = disk ? vfs_lookup(disk, "a") : 0;
+        struct kernel_object *added = disk ?
+            vfs_create(disk, "c", VFS_NODE_REGULAR) : 0;
+        ok = ok && disk && kept && added && !vfs_lookup(disk, "b");
         if (added) object_release(added);
-        if (gone) object_release(gone);
         if (kept) object_release(kept);
-        if (fresh) object_release(fresh);
-        ok = ok && point && !vfs_unmount(point);
+        if (disk) object_release(disk);
+        ok = ok && !vfs_unmount(point);
         valid = valid && ok;
         if (point) object_release(point);
         if (root) vfs_unlink(root, "policy");
@@ -1193,6 +1187,8 @@ static void integrity_cleanup(struct kernel_object *root,
     if (dev) object_release(dev);
 }
 
+
+
 int test_adytumfs_integrity64(void) {
     u32 objects = object_active_count();
     u32 nodes = vfs_node_active_count();
@@ -1208,10 +1204,8 @@ int test_adytumfs_integrity64(void) {
     struct kernel_object *dev = 0;
     struct kernel_object *point = 0;
     u64 claimed_block = 0;
-    u64 record_block = 0;
     u64 table = 0;
     u64 leak = 0;
-    u32 record_at = 0;
     u32 slot = 0;
     int ok = 0;
 
@@ -1373,16 +1367,14 @@ int test_adytumfs_integrity64(void) {
 
     // An orphaned file still owns its blocks, so a consistent volume with an
     // unreachable inode must keep mounting.
+    // The name goes out through the format layer, so the orphan is one the
+    // reclaim path could really have left behind: the tree and its hashes
+    // agree, and only the inode is unreachable.
     ok = !integrity_stage(root, &dev, &point, &super, &data_inode,
                           &other_inode) &&
-        !policy_find_record(dev, &super, "data", 4, &record_block,
-                            &record_at);
-    if (ok) adytumfs_write_le64(adytumfs_probe_block + record_at, 0);
-    // The tombstone is a valid on-disk state, so it is sealed like the
-    // format layer would; the volume below must mount despite the orphan.
-    ok = ok && !adytumfs_data_seal(dev, &super, record_block,
-                                   adytumfs_probe_block) &&
-        !policy_commit(dev, record_block) &&
+        !adytumfs_dir_remove(dev, &super, &adytumfs_test_store,
+                             super.root_inode, "data", 4) &&
+        !integrity_commit(dev, &super) &&
         !vfs_mount_adytumfs(point, dev);
     struct kernel_object *disk = ok ? vfs_lookup(root, "integrity") : 0;
     struct kernel_object *kept = disk ? vfs_lookup(disk, "other") : 0;
@@ -1397,24 +1389,22 @@ int test_adytumfs_integrity64(void) {
     // reachable or not.
     ok = !integrity_stage(root, &dev, &point, &super, &data_inode,
                           &other_inode) &&
-        !policy_find_record(dev, &super, "data", 4, &record_block,
-                            &record_at);
-    if (ok) adytumfs_write_le64(adytumfs_probe_block + record_at, 0);
+        !adytumfs_dir_remove(dev, &super, &adytumfs_test_store,
+                             super.root_inode, "data", 4) &&
+        !integrity_commit(dev, &super);
     table = adytumfs_table_block(
         &super, (u32)(data_inode / ADYTUMFS_INODES_PER_BLOCK));
     slot = (u32)(data_inode % ADYTUMFS_INODES_PER_BLOCK) *
            ADYTUMFS_INODE_SIZE;
-    // Seal the tombstone so the walk reads the directory cleanly and the
-    // failure lands on the broken inode slot, which is what this scenario
-    // is about.
-    ok = ok && !adytumfs_data_seal(dev, &super, record_block,
-                                   adytumfs_probe_block) &&
-        !adytumfs_block_write(dev, record_block,
-                              adytumfs_probe_block) &&
-        !adytumfs_block_read(dev, table, adytumfs_probe_block);
+    // The name is out and landed before the slot is touched, so no staged
+    // table image can land over the edit: the broken slot is the only lie
+    // left on the volume and the failure has to belong to it.
+    ok = ok && !adytumfs_block_read(dev, table, adytumfs_probe_block);
     if (ok) adytumfs_probe_block[slot + 100] ^= 0xffu;
     ok = ok && !adytumfs_block_write(dev, table, adytumfs_probe_block) &&
-        !integrity_commit(dev, &super) && vfs_mount_adytumfs(point, dev) < 0;
+        !block_cache_flush(dev);
+    if (dev) block_cache_drop_device((u32)dev->value);
+    ok = ok && vfs_mount_adytumfs(point, dev) < 0;
     valid = valid && ok;
     integrity_cleanup(root, point, dev);
 
@@ -1436,6 +1426,7 @@ int test_adytumfs_integrity64(void) {
         block_active_count() == devices;
     return valid ? 0 : -1;
 }
+
 
 int test_adytumfs_checksum64(void) {
     u32 objects = object_active_count();
@@ -1485,8 +1476,10 @@ int test_adytumfs_checksum64(void) {
         !adytumfs_file_read(dev, &super, &adytumfs_test_store, data_inode, 0, received, 16,
                             &moved);
 
-    // Flip the region entry instead: the data is intact, but the region no
-    // longer vouches for it, so the read fails the same way.
+    // Flip the region entry instead. The region no longer vouches for
+    // content, the hash the parent records does, and the bytes below are
+    // intact, so the read has to serve them. A later step drops the region
+    // from the format altogether; until then this pins where authority sits.
     u64 index = physical - super.data_start;
     u64 region_block = super.data_checksum_region +
         index / ADYTUMFS_CHECKSUMS_PER_BLOCK;
@@ -1497,8 +1490,9 @@ int test_adytumfs_checksum64(void) {
     valid = valid && !adytumfs_block_write(dev, region_block,
                                            adytumfs_probe_block) &&
         !integrity_commit(dev, &super) &&
-        adytumfs_file_read(dev, &super, &adytumfs_test_store, data_inode, 0, received, 16,
-                           &moved) < 0;
+        !adytumfs_file_read(dev, &super, &adytumfs_test_store, data_inode, 0,
+                            received, 16, &moved) &&
+        moved == 16 && reuse_matches(received, 16, 0x60);
     if (valid) adytumfs_probe_block[entry] ^= 0x1u;
     valid = valid && !adytumfs_block_write(dev, region_block,
                                            adytumfs_probe_block) &&

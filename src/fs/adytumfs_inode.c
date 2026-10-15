@@ -154,22 +154,58 @@ static int root_commit(struct kernel_object *device,
     return adytumfs_tree_drop(device, super, store, previous);
 }
 
+// Every block an entry covers holds the same bytes, so the entry's single
+// hash resolves to one block that serves all of them. A run of a thousand
+// holes is one mapping, and the caller needs no offset arithmetic because
+// there is nothing to add to the block number.
+static int inode_span(struct kernel_object *device,
+                      struct adytumfs_superblock *super,
+                      struct adytumfs_cas *store,
+                      const struct adytumfs_inode *inode, u64 logical_block,
+                      struct adytumfs_tree_span *span) {
+    return adytumfs_tree_find(device, super, store, inode->extent_root,
+                              logical_block * ADYTUMFS_BLOCK_SIZE, span);
+}
+
+int adytumfs_inode_hash(struct kernel_object *device,
+                        struct adytumfs_superblock *super,
+                        struct adytumfs_cas *store,
+                        const struct adytumfs_inode *inode, u64 logical_block,
+                        u8 hash[ADYTUMFS_HASH_SIZE]) {
+    if (!device || !super || !store || !inode || !hash) return -1;
+    struct adytumfs_tree_span span;
+    if (inode_span(device, super, store, inode, logical_block, &span))
+        return -1;
+    for (u32 index = 0; index < ADYTUMFS_HASH_SIZE; index++)
+        hash[index] = span.hash[index];
+    return 0;
+}
+
 int adytumfs_inode_map(struct kernel_object *device,
                        struct adytumfs_superblock *super,
                        struct adytumfs_cas *store,
                        const struct adytumfs_inode *inode, u64 logical_block,
                        u64 *physical_block) {
     if (!device || !super || !store || !inode || !physical_block) return -1;
-    struct adytumfs_tree_span span;
-    // Every block an entry covers holds the same bytes, so the entry's single
-    // hash resolves to one block that serves all of them. A run of a thousand
-    // holes is one mapping, and the caller needs no offset arithmetic because
-    // there is nothing to add to the block number.
-    if (adytumfs_tree_find(device, super, store, inode->extent_root,
-                           logical_block * ADYTUMFS_BLOCK_SIZE, &span))
+    u8 hash[ADYTUMFS_HASH_SIZE];
+    if (adytumfs_inode_hash(device, super, store, inode, logical_block, hash))
         return -1;
-    return adytumfs_cas_lookup(device, super, store, span.hash,
-                               physical_block);
+    return adytumfs_cas_lookup(device, super, store, hash, physical_block);
+}
+
+// Map a logical block and read it in one step. Every content reader wants the
+// pair, and going through here is what makes the hash check the block is read
+// under impossible to leave out by taking the mapping alone.
+int adytumfs_inode_fetch(struct kernel_object *device,
+                         struct adytumfs_superblock *super,
+                         struct adytumfs_cas *store,
+                         const struct adytumfs_inode *inode, u64 logical_block,
+                         u8 *buffer) {
+    if (!device || !super || !store || !inode || !buffer) return -1;
+    u8 hash[ADYTUMFS_HASH_SIZE];
+    if (adytumfs_inode_hash(device, super, store, inode, logical_block, hash))
+        return -1;
+    return adytumfs_cas_read(device, super, store, hash, buffer);
 }
 
 // Land content in the store and hand back its hash. Placing rather than

@@ -13,11 +13,23 @@
 // A distinct key per index, derived with the same hash the filesystem uses, so
 // the cache is exercised on real digests rather than on hand written byte
 // patterns that could accidentally collide.
+//
+// A key is the digest of the block image it names, because a read now checks
+// the bytes against the hash that found them. Hashing anything shorter would
+// produce a key no block can satisfy and the check would fail instead of
+// testing.
+static void cas_image(u32 index, u8 *block) {
+    u32 state = index * 2654435761u + 1u;
+    for (u32 byte = 0; byte < ADYTUMFS_BLOCK_SIZE; byte++) {
+        state = state * 1103515245u + 12345u;
+        block[byte] = (u8)(state >> 16);
+    }
+}
+
 static void cas_key(u32 index, u8 hash[ADYTUMFS_CAS_HASH_SIZE]) {
-    u8 seed[4];
-    for (u32 byte = 0; byte < 4; byte++)
-        seed[byte] = (u8)(index >> (byte * 8));
-    blake2b(hash, ADYTUMFS_CAS_HASH_SIZE, seed, 4);
+    static u8 image[ADYTUMFS_BLOCK_SIZE];
+    cas_image(index, image);
+    blake2b(hash, ADYTUMFS_CAS_HASH_SIZE, image, ADYTUMFS_BLOCK_SIZE);
 }
 
 static u64 cas_live(struct kernel_object *device,
@@ -84,8 +96,7 @@ int test_adytumfs_cas64(void) {
         block_b != block_a && super.free_blocks == free0 - 2 &&
         cas_live(dev, &super, &store) == 2;
 
-    for (u32 index = 0; index < ADYTUMFS_BLOCK_SIZE; index++)
-        block[index] = (u8)(index * 7u + 3u);
+    cas_image(1, block);
     valid = valid && adytumfs_data_write(dev, &super, block_a, block) == 0;
 
     // Relocation moves the content and repoints the index. The key is an
@@ -101,7 +112,7 @@ int test_adytumfs_cas64(void) {
         found == moved &&
         adytumfs_data_read(dev, &super, moved, readback) == 0;
     for (u32 index = 0; valid && index < ADYTUMFS_BLOCK_SIZE; index++)
-        valid = readback[index] == (u8)(index * 7u + 3u);
+        valid = readback[index] == block[index];
 
     // Refcounting: the first release only drops a reference, the second frees
     // the block exactly once.

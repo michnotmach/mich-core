@@ -335,10 +335,12 @@ int adytumfs_pages_fault(u32 mount, u32 inode, u64 generation, u32 page) {
     u8 *bytes = (u8 *)(uptr_t)resource->physical[page];
     if (!bytes) return -1;
     u64 physical = 0;
+    u8 hash[ADYTUMFS_HASH_SIZE];
     // A page past the file size or past the allocated extents reads as
     // zeroes: the write path grows at sync, not at fault.
     if (page * 4096u >= in.size ||
-        adytumfs_inode_map(m->device, &m->super, &m->store, &in, page, &physical)) {
+        adytumfs_inode_hash(m->device, &m->super, &m->store, &in, page, hash) ||
+        adytumfs_cas_lookup(m->device, &m->super, &m->store, hash, &physical)) {
         for (u32 index = 0; index < 4096; index++) bytes[index] = 0;
         cache_mark(slot->present, page);
         return 0;
@@ -346,9 +348,9 @@ int adytumfs_pages_fault(u32 mount, u32 inode, u64 generation, u32 page) {
     if (page_transfer(m, slot, (u32)(physical * ADYTUMFS_SECTORS_PER_BLOCK),
                       page, 1, BLOCK_OP_READ))
         return -1;
-    // The transfer filled the page from the device, so the region must vouch
-    // for those bytes exactly like the read path demands.
-    if (adytumfs_data_check(m->device, &m->super, physical, bytes)) return -1;
+    // The transfer filled the page straight from the device, so the hash the
+    // tree named is the only thing left that can vouch for those bytes.
+    if (adytumfs_cas_verify(hash, bytes)) return -1;
     cache_mark(slot->present, page);
     return 0;
 }
@@ -1007,10 +1009,8 @@ int adytumfs_symlink_target(u32 mount, u32 inode, u64 generation,
                           ADYTUMFS_MODE_LNK);
     if (bits != ADYTUMFS_MODE_LNK) return -1;
     if (!in.size || in.size >= VFS_PATH_MAX || !in.blocks) return -1;
-    u64 physical = 0;
-    if (adytumfs_inode_map(m->device, &m->super, &m->store, &in, 0, &physical) ||
-        adytumfs_data_read(m->device, &m->super, physical,
-                           adytumfs_backend_scratch))
+    if (adytumfs_inode_fetch(m->device, &m->super, &m->store, &in, 0,
+                             adytumfs_backend_scratch))
         return -1;
     for (u32 index = 0; index < in.size; index++)
         target[index] = (char)adytumfs_backend_scratch[index];
@@ -1083,10 +1083,8 @@ int adytumfs_truncate(u32 mount, u32 inode, u64 generation, u32 size,
     if (size % ADYTUMFS_BLOCK_SIZE) {
         // Reads clamp to size but a mapping exposes the whole page, so the
         // bytes past the new size inside the kept tail block read as zeroes.
-        u64 physical = 0;
-        if (adytumfs_inode_map(m->device, &m->super, &m->store, &in, blocks - 1, &physical)) return -1;
-        if (adytumfs_data_read(m->device, &m->super, physical,
-                               adytumfs_backend_scratch))
+        if (adytumfs_inode_fetch(m->device, &m->super, &m->store, &in,
+                                 blocks - 1, adytumfs_backend_scratch))
             return -1;
         for (u32 index = size % ADYTUMFS_BLOCK_SIZE;
              index < ADYTUMFS_BLOCK_SIZE; index++)

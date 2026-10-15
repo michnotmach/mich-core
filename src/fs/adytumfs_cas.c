@@ -1,4 +1,5 @@
 #include "adytumfs_cas.h"
+#include "blake2b.h"
 #include "crypto.h"
 
 _Static_assert((ADYTUMFS_CAS_SLOTS & (ADYTUMFS_CAS_SLOTS - 1u)) == 0u,
@@ -82,6 +83,28 @@ int adytumfs_cas_lookup(struct kernel_object *device,
         return -1;
     cas_install(store, hash, number, refs);
     *block = number;
+    return 0;
+}
+
+int adytumfs_cas_read(struct kernel_object *device,
+                      const struct adytumfs_superblock *super,
+                      struct adytumfs_cas *store,
+                      const u8 hash[ADYTUMFS_CAS_HASH_SIZE], u8 *buffer) {
+    if (!buffer) return -1;
+    u64 number = 0;
+    if (adytumfs_cas_lookup(device, super, store, hash, &number)) return -1;
+    if (adytumfs_block_read(device, number, buffer)) return -1;
+    return adytumfs_cas_verify(hash, buffer);
+}
+
+int adytumfs_cas_verify(const u8 hash[ADYTUMFS_CAS_HASH_SIZE],
+                        const u8 *buffer) {
+    if (!hash || !buffer) return -1;
+    u8 check[ADYTUMFS_CAS_HASH_SIZE];
+    if (blake2b(check, ADYTUMFS_CAS_HASH_SIZE, buffer, ADYTUMFS_BLOCK_SIZE))
+        return -1;
+    for (u32 index = 0; index < ADYTUMFS_CAS_HASH_SIZE; index++)
+        if (check[index] != hash[index]) return -1;
     return 0;
 }
 
@@ -189,7 +212,7 @@ int adytumfs_cas_relocate(struct kernel_object *device,
         return -1;
     u64 to = 0;
     if (adytumfs_alloc_run(device, super, 1, &to)) return -1;
-    if (adytumfs_data_read(device, super, from, cas_copy_scratch) ||
+    if (adytumfs_cas_read(device, super, store, hash, cas_copy_scratch) ||
         adytumfs_data_write(device, super, to, cas_copy_scratch)) {
         adytumfs_free_run(device, super, to, 1);
         return -1;

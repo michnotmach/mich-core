@@ -258,25 +258,6 @@ int adytumfs_tree_root_empty(const u8 root[ADYTUMFS_CAS_HASH_SIZE]) {
     return 1;
 }
 
-// Resolve a hash to a block and read it. The caller checks the level, because
-// the root declares its own while every child must be exactly one below its
-// parent.
-static int tree_fetch(struct kernel_object *device,
-                      struct adytumfs_superblock *super,
-                      struct adytumfs_cas *store,
-                      const u8 hash[ADYTUMFS_CAS_HASH_SIZE], u8 *block) {
-    u64 number = 0;
-    if (adytumfs_cas_lookup(device, super, store, hash, &number)) return -1;
-    if (adytumfs_data_read(device, super, number, block)) return -1;
-    // Compare against the hash the parent stored. Skipping this would make
-    // that hash decorative: a block silently holding something else would be
-    // walked as if it were the node that was promised.
-    u8 actual[ADYTUMFS_CAS_HASH_SIZE];
-    if (adytumfs_tree_node_hash(block, actual)) return -1;
-    if (!crypto_equal(actual, hash, ADYTUMFS_CAS_HASH_SIZE)) return -1;
-    return 0;
-}
-
 static int tree_store(struct kernel_object *device,
                       struct adytumfs_superblock *super,
                       struct adytumfs_cas *store, const u8 *block,
@@ -329,7 +310,7 @@ static int tree_descend(struct kernel_object *device,
     hash_copy(current, root);
     u32 level = 0;
     for (u32 step = 0; step < ADYTUMFS_TREE_DEPTH_MAX; step++) {
-        if (tree_fetch(device, super, store, current, tree_node)) return -1;
+        if (adytumfs_cas_read(device, super, store, current, tree_node)) return -1;
         if (!step) level = adytumfs_read_le32(tree_node + 4);
         else if (adytumfs_read_le32(tree_node + 4) != level) return -1;
         if (level > ADYTUMFS_TREE_DEPTH_MAX) return -1;
@@ -539,7 +520,7 @@ int adytumfs_tree_lookup(struct kernel_object *device,
     if (tree_descend(device, super, store, root, key, path, &depth, &found))
         return -1;
     if (found < 0) return -1;
-    if (tree_fetch(device, super, store, path[depth - 1u].hash, tree_node))
+    if (adytumfs_cas_read(device, super, store, path[depth - 1u].hash, tree_node))
         return -1;
     static struct adytumfs_tree_key keys[ADYTUMFS_TREE_LEAF_MAX];
     static struct adytumfs_tree_value values[ADYTUMFS_TREE_LEAF_MAX];
@@ -576,7 +557,7 @@ static int tree_insert(struct kernel_object *device,
     // being rewritten, because the rewrite writes its result back into that
     // same buffer. Static for the same reason the node buffers are.
     static u8 node_copy[ADYTUMFS_BLOCK_SIZE];
-    if (tree_fetch(device, super, store, path[depth - 1u].hash, tree_node))
+    if (adytumfs_cas_read(device, super, store, path[depth - 1u].hash, tree_node))
         return -1;
     // The leaf is copied out of the shared buffer because the insert writes its
     // result back into that same buffer.
@@ -585,7 +566,7 @@ static int tree_insert(struct kernel_object *device,
     if (leaf_insert(device, super, store, node_copy, key, value, &below))
         return -1;
     for (u32 step = depth - 1u; step > 0; step--) {
-        if (tree_fetch(device, super, store, path[step - 1u].hash, tree_node))
+        if (adytumfs_cas_read(device, super, store, path[step - 1u].hash, tree_node))
             return -1;
         for (u32 index = 0; index < ADYTUMFS_BLOCK_SIZE; index++)
             node_copy[index] = tree_node[index];
@@ -714,14 +695,14 @@ static int tree_remove(struct kernel_object *device,
     struct adytumfs_tree_shrink below;
     struct adytumfs_tree_shrink above;
     static u8 node_copy[ADYTUMFS_BLOCK_SIZE];
-    if (tree_fetch(device, super, store, path[depth - 1u].hash, tree_node))
+    if (adytumfs_cas_read(device, super, store, path[depth - 1u].hash, tree_node))
         return -1;
     for (u32 index = 0; index < ADYTUMFS_BLOCK_SIZE; index++)
         node_copy[index] = tree_node[index];
     if (leaf_remove(device, super, store, node_copy, (u32)found, &below))
         return -1;
     for (u32 step = depth - 1u; step > 0; step--) {
-        if (tree_fetch(device, super, store, path[step - 1u].hash, tree_node))
+        if (adytumfs_cas_read(device, super, store, path[step - 1u].hash, tree_node))
             return -1;
         for (u32 index = 0; index < ADYTUMFS_BLOCK_SIZE; index++)
             node_copy[index] = tree_node[index];
@@ -760,7 +741,7 @@ static int tree_find(struct kernel_object *device,
     int found = -1;
     if (tree_descend(device, super, store, root, &probe, path, &depth, &found))
         return -1;
-    if (tree_fetch(device, super, store, path[depth - 1u].hash, tree_node))
+    if (adytumfs_cas_read(device, super, store, path[depth - 1u].hash, tree_node))
         return -1;
     static struct adytumfs_tree_key keys[ADYTUMFS_TREE_LEAF_MAX];
     static struct adytumfs_tree_value values[ADYTUMFS_TREE_LEAF_MAX];
@@ -874,13 +855,13 @@ static int tree_truncate(struct kernel_object *device,
     struct adytumfs_tree_shrink below;
     struct adytumfs_tree_shrink above;
     static u8 node_copy[ADYTUMFS_BLOCK_SIZE];
-    if (tree_fetch(device, super, store, path[depth - 1u].hash, tree_node))
+    if (adytumfs_cas_read(device, super, store, path[depth - 1u].hash, tree_node))
         return -1;
     for (u32 index = 0; index < ADYTUMFS_BLOCK_SIZE; index++)
         node_copy[index] = tree_node[index];
     if (leaf_truncate(device, super, store, node_copy, at, &below)) return -1;
     for (u32 step = depth - 1u; step > 0; step--) {
-        if (tree_fetch(device, super, store, path[step - 1u].hash, tree_node))
+        if (adytumfs_cas_read(device, super, store, path[step - 1u].hash, tree_node))
             return -1;
         for (u32 index = 0; index < ADYTUMFS_BLOCK_SIZE; index++)
             node_copy[index] = tree_node[index];
@@ -924,7 +905,7 @@ static int discard_run(struct kernel_object *device,
         u32 refs = 0;
         if (adytumfs_cas_refs(device, super, store, hash, &refs)) return -1;
         if (!refs) return -1;
-        if (tree_fetch(device, super, store, hash, tree_node)) return -1;
+        if (adytumfs_cas_read(device, super, store, hash, tree_node)) return -1;
         u32 level = adytumfs_read_le32(tree_node + 4);
         if (level > 1u) return -1;
         if (adytumfs_tree_node_check(tree_node, level)) return -1;
