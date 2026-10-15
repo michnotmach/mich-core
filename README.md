@@ -1,6 +1,6 @@
 # Mich Core
 
-[![build](https://github.com/ukdaemonz/mich-core/actions/workflows/build.yml/badge.svg)](https://github.com/ukdaemonz/mich-core/actions/workflows/build.yml)
+[![build](https://github.com/michnotmach/mich-core/actions/workflows/build.yml/badge.svg)](https://github.com/michnotmach/mich-core/actions/workflows/build.yml)
 
 ## License
 
@@ -752,7 +752,7 @@ yours lives somewhere else.
 ## Build
 
 ```bash
-git clone --recurse-submodules https://github.com/ukdaemonz/mich-core.git
+git clone --recurse-submodules https://github.com/michnotmach/mich-core.git
 cd mich-core
 make -j2
 ```
