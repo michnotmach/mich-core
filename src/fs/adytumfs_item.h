@@ -125,6 +125,11 @@ int adytumfs_item_lookup(struct kernel_object *device,
 // Insert is copy on write, so superseding a root leaves the old one whole, and
 // nothing reclaims it until this runs. A node still named by another root keeps
 // its block and its subtree, which is what lets two committed roots coexist.
+//
+// Releasing the root's own entry directly instead frees one block and quietly
+// abandons the rest: the children it named stay allocated with nobody able to
+// reach them, and the children it shared with the new root stay held once too
+// often, so even this walk cannot finish reclaiming the survivor afterwards.
 int adytumfs_item_drop(struct kernel_object *device,
                        struct adytumfs_superblock *super,
                        struct adytumfs_cas *store,
