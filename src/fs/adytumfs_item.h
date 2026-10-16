@@ -61,7 +61,10 @@ struct adytumfs_item_key {
 int adytumfs_item_leaf_pack(u8 *block, u32 count,
                             const struct adytumfs_item_key *keys,
                             const u8 *const *data, const u32 *sizes);
-int adytumfs_item_branch_pack(u8 *block, u32 count,
+// The level is a parameter rather than a constant because the tree has to grow
+// past two levels: a branch over branches is level two, and a format that can
+// only say level one caps every tree at one branchful of leaves.
+int adytumfs_item_branch_pack(u8 *block, u32 level, u32 count,
                               const struct adytumfs_item_key *keys,
                               const u8 (*children)[ADYTUMFS_ITEM_CHILD_SIZE]);
 
@@ -99,12 +102,33 @@ int adytumfs_item_node_search(const u8 *block,
 // A zero root is an empty tree, so a fresh volume needs no special case.
 int adytumfs_item_root_empty(const u8 root[ADYTUMFS_ITEM_CHILD_SIZE]);
 
+// Insert or replace, copy on write. Only the nodes on the path to the key are
+// rewritten, and the caller gets the new root back because the old one may
+// still be committed and in use. A node names its children by hash, so the
+// rewrite above a changed child is what moves the change up to the root.
+int adytumfs_item_insert(struct kernel_object *device,
+                         struct adytumfs_superblock *super,
+                         struct adytumfs_cas *store,
+                         const u8 root[ADYTUMFS_ITEM_CHILD_SIZE],
+                         const struct adytumfs_item_key *key, const u8 *data,
+                         u32 size,
+                         u8 new_root[ADYTUMFS_ITEM_CHILD_SIZE]);
+
 int adytumfs_item_lookup(struct kernel_object *device,
                          struct adytumfs_superblock *super,
                          struct adytumfs_cas *store,
                          const u8 root[ADYTUMFS_ITEM_CHILD_SIZE],
                          const struct adytumfs_item_key *key, u8 *buffer,
                          u32 buffer_size, u32 *size);
+
+// Drop a root the caller is finished with and everything only it reached.
+// Insert is copy on write, so superseding a root leaves the old one whole, and
+// nothing reclaims it until this runs. A node still named by another root keeps
+// its block and its subtree, which is what lets two committed roots coexist.
+int adytumfs_item_drop(struct kernel_object *device,
+                       struct adytumfs_superblock *super,
+                       struct adytumfs_cas *store,
+                       const u8 root[ADYTUMFS_ITEM_CHILD_SIZE]);
 
 // Walk every item in the tree in key order. The callback returns 0 to carry
 // on and anything else to stop, and that value is what the walk returns. A
