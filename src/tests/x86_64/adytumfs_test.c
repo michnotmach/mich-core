@@ -1216,7 +1216,7 @@ int test_adytumfs_integrity64(void) {
                           &other_inode) &&
         !adytumfs_inode_read(dev, &super, data_inode, &in) && in.blocks == 1 &&
         !integrity_first_block(dev, &super, data_inode, &claimed_block, key) &&
-        !adytumfs_index_repoint(dev, &super, &adytumfs_test_store.index, key,
+        !adytumfs_index_repoint(dev, &adytumfs_test_store.index, key,
                                 0) &&
         // The lie is confined to the index: the block still holds the content
         // its own hash names, so the mount rebuilds the mapping and takes the
@@ -1231,7 +1231,7 @@ int test_adytumfs_integrity64(void) {
     ok = !integrity_stage(root, &dev, &point, &super, &data_inode,
                           &other_inode) &&
         !integrity_first_block(dev, &super, data_inode, &claimed_block, key) &&
-        !adytumfs_index_repoint(dev, &super, &adytumfs_test_store.index, key,
+        !adytumfs_index_repoint(dev, &adytumfs_test_store.index, key,
                                 super.total_blocks - 1) &&
         // Same shape as the prefix forgery: the shadow tail is outside the
         // span the rebuild scans, so the true mapping is what comes back.
@@ -1251,7 +1251,7 @@ int test_adytumfs_integrity64(void) {
         !integrity_first_block(dev, &super, data_inode, &claimed_block, key);
     if (ok) key[0] ^= 0xffu;
     ok = ok &&
-        !adytumfs_index_insert(dev, &super, &adytumfs_test_store.index, key,
+        !adytumfs_index_insert(dev, &adytumfs_test_store.index, key,
                                claimed_block) &&
         !integrity_commit(dev, &super) && vfs_mount_adytumfs(point, dev) == 0 &&
         !vfs_unmount(point);

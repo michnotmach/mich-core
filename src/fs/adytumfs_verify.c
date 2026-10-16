@@ -203,7 +203,7 @@ static int rebuild_index(struct kernel_object *device,
     static u8 block[ADYTUMFS_BLOCK_SIZE];
     u8 hash[ADYTUMFS_HASH_SIZE];
     u64 index_end = super->index_start + super->index_blocks;
-    if (adytumfs_index_format(device, super, &store->index)) return -1;
+    if (adytumfs_index_format(device, &store->index)) return -1;
     // Formatting leaves the store cache describing an index that no longer
     // exists, and a stale hit would resolve a hash to a block nothing maps.
     adytumfs_cas_open(store, super->index_start, super->index_blocks);
@@ -221,7 +221,7 @@ static int rebuild_index(struct kernel_object *device,
         // A content address names one block, so a second allocated block
         // hashing to a value already mapped is corruption. Inserting refuses
         // the duplicate instead of repointing it, which fails the rebuild.
-        if (adytumfs_index_insert(device, super, &store->index, hash, number))
+        if (adytumfs_index_insert(device, &store->index, hash, number))
             return -1;
     }
     // Every mapping now sits at zero references. The trees put the real count

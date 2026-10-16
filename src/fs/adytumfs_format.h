@@ -207,20 +207,8 @@ int adytumfs_block_zero(struct kernel_object *device, u64 block);
 // vouches for, so it keeps the region until it carries its own crc32c.
 // Content blocks go through the raw block calls above and answer to the
 // hash their parent records instead.
-int adytumfs_data_read(struct kernel_object *device,
-                       const struct adytumfs_superblock *super,
-                       u64 block, u8 *buffer);
-int adytumfs_data_write(struct kernel_object *device,
-                        const struct adytumfs_superblock *super,
-                        u64 block, const u8 *buffer);
 // Compare an index block's bytes against its region entry, or seal new
 // bytes into it.
-int adytumfs_data_check(struct kernel_object *device,
-                        const struct adytumfs_superblock *super,
-                        u64 block, const u8 *bytes);
-int adytumfs_data_seal(struct kernel_object *device,
-                       const struct adytumfs_superblock *super,
-                       u64 block, const u8 *bytes);
 // Format a device: lay out the regions and write the superblock (and its
 // backup), the block bitmap, and an empty root directory.
 int adytumfs_make(struct kernel_object *device);

@@ -59,7 +59,7 @@ int test_adytumfs_cas64(void) {
     u64 fresh = 1;
     adytumfs_index_init(&layout, super.index_start, super.index_blocks);
     valid = valid && super.index_blocks > 1 &&
-        adytumfs_index_live(dev, &super, &layout, &fresh) == 0 && fresh == 0;
+        adytumfs_index_live(dev, &layout, &fresh) == 0 && fresh == 0;
     adytumfs_cas_open(&store, super.index_start, super.index_blocks);
 
     u8 key_a[ADYTUMFS_CAS_HASH_SIZE];

@@ -10,6 +10,11 @@
 #define ADYTUMFS_INDEX_VERSION 1u
 #define ADYTUMFS_INDEX_HASH_SIZE ADYTUMFS_HASH_SIZE
 #define ADYTUMFS_INDEX_HEADER_SIZE 16u
+// Where each block keeps its own crc32c. Entry blocks carry magic and their
+// position in the first two words, the superblock carries magic, version,
+// capacity, and the live count, so the two offsets differ.
+#define ADYTUMFS_INDEX_CRC_ENTRY 8u
+#define ADYTUMFS_INDEX_CRC_SUPER 24u
 #define ADYTUMFS_INDEX_ENTRY_SIZE (ADYTUMFS_INDEX_HASH_SIZE + 16u)
 #define ADYTUMFS_INDEX_PER_BLOCK \
     ((ADYTUMFS_BLOCK_SIZE - ADYTUMFS_INDEX_HEADER_SIZE) / \
@@ -51,17 +56,14 @@ void adytumfs_index_init(struct adytumfs_index *index, u64 start, u64 blocks);
 
 // Wipe the run and write an empty header.
 int adytumfs_index_format(struct kernel_object *device,
-                          const struct adytumfs_superblock *super,
                           const struct adytumfs_index *index);
 
 // How many mappings are live, read from the header rather than counted by
 // walking, because the walk is the thing this exists to avoid.
 int adytumfs_index_live(struct kernel_object *device,
-                        const struct adytumfs_superblock *super,
                         const struct adytumfs_index *index, u64 *live);
 
 int adytumfs_index_lookup(struct kernel_object *device,
-                          const struct adytumfs_superblock *super,
                           const struct adytumfs_index *index,
                           const u8 hash[ADYTUMFS_INDEX_HASH_SIZE],
                           u64 *block);
@@ -70,7 +72,6 @@ int adytumfs_index_lookup(struct kernel_object *device,
 // the location and the reference count together, and two lookups would walk
 // the same chain twice over the device.
 int adytumfs_index_fetch(struct kernel_object *device,
-                         const struct adytumfs_superblock *super,
                          const struct adytumfs_index *index,
                          const u8 hash[ADYTUMFS_INDEX_HASH_SIZE], u64 *block,
                          u32 *refs);
@@ -80,12 +81,10 @@ int adytumfs_index_fetch(struct kernel_object *device,
 // content: moving a block is one entry here and no hash changes, so nothing
 // that points at the content has to be rewritten.
 int adytumfs_index_repoint(struct kernel_object *device,
-                           const struct adytumfs_superblock *super,
                            const struct adytumfs_index *index,
                            const u8 hash[ADYTUMFS_INDEX_HASH_SIZE], u64 block);
 
 int adytumfs_index_refs(struct kernel_object *device,
-                        const struct adytumfs_superblock *super,
                         const struct adytumfs_index *index,
                         const u8 hash[ADYTUMFS_INDEX_HASH_SIZE], u32 *refs);
 
@@ -94,12 +93,10 @@ int adytumfs_index_refs(struct kernel_object *device,
 // refused rather than silently repointed, because two blocks claiming one
 // content is exactly the disagreement this table is supposed to settle.
 int adytumfs_index_insert(struct kernel_object *device,
-                          struct adytumfs_superblock *super,
                           const struct adytumfs_index *index,
                           const u8 hash[ADYTUMFS_INDEX_HASH_SIZE], u64 block);
 
 int adytumfs_index_retain(struct kernel_object *device,
-                          const struct adytumfs_superblock *super,
                           const struct adytumfs_index *index,
                           const u8 hash[ADYTUMFS_INDEX_HASH_SIZE]);
 

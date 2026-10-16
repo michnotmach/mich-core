@@ -1,6 +1,5 @@
 #include "adytumfs_format.h"
 #include "adytumfs_index.h"
-#include "crc32c.h"
 #include "blake2b.h"
 #include "block.h"
 #include "cache.h"
@@ -23,55 +22,10 @@ static u8 adytumfs_zero_block[ADYTUMFS_BLOCK_SIZE];
 
 // One staging block for the checksum region's read-modify-write; the data
 // paths are single-CPU, like the rest of the format layer.
-static u8 adytumfs_checksum_scratch[ADYTUMFS_BLOCK_SIZE];
 
-int adytumfs_data_check(struct kernel_object *device,
-                        const struct adytumfs_superblock *super,
-                        u64 block, const u8 *bytes) {
-    if (block < super->data_start || block >= super->data_checksum_region)
-        return -1;
-    u64 index = block - super->data_start;
-    u64 region_block =
-        super->data_checksum_region + index / ADYTUMFS_CHECKSUMS_PER_BLOCK;
-    if (adytumfs_block_read(device, region_block, adytumfs_checksum_scratch))
-        return -1;
-    const u8 *entry = adytumfs_checksum_scratch +
-                      (index % ADYTUMFS_CHECKSUMS_PER_BLOCK) * 4u;
-    return adytumfs_read_le32(entry) == crc32c(bytes, ADYTUMFS_BLOCK_SIZE)
-               ? 0
-               : -1;
-}
 
-int adytumfs_data_seal(struct kernel_object *device,
-                       const struct adytumfs_superblock *super,
-                       u64 block, const u8 *bytes) {
-    if (block < super->data_start || block >= super->data_checksum_region)
-        return -1;
-    u64 index = block - super->data_start;
-    u64 region_block =
-        super->data_checksum_region + index / ADYTUMFS_CHECKSUMS_PER_BLOCK;
-    if (adytumfs_block_read(device, region_block, adytumfs_checksum_scratch))
-        return -1;
-    adytumfs_write_le32(adytumfs_checksum_scratch +
-                            (index % ADYTUMFS_CHECKSUMS_PER_BLOCK) * 4u,
-                        crc32c(bytes, ADYTUMFS_BLOCK_SIZE));
-    return adytumfs_block_write(device, region_block,
-                                adytumfs_checksum_scratch);
-}
 
-int adytumfs_data_read(struct kernel_object *device,
-                       const struct adytumfs_superblock *super,
-                       u64 block, u8 *buffer) {
-    if (adytumfs_block_read(device, block, buffer)) return -1;
-    return adytumfs_data_check(device, super, block, buffer);
-}
 
-int adytumfs_data_write(struct kernel_object *device,
-                        const struct adytumfs_superblock *super,
-                        u64 block, const u8 *buffer) {
-    if (adytumfs_block_write(device, block, buffer)) return -1;
-    return adytumfs_data_seal(device, super, block, buffer);
-}
 
 // The hash of the sealed zero image, which is what every hole on the volume
 // names. Computed once rather than per hole: it is the same 4096 zero bytes
@@ -243,7 +197,7 @@ int adytumfs_make(struct kernel_object *device) {
     // will read.
     struct adytumfs_index index;
     adytumfs_index_init(&index, index_start, index_blocks);
-    if (adytumfs_index_format(device, &super, &index)) return -1;
+    if (adytumfs_index_format(device, &index)) return -1;
 
     return block_cache_flush(device);
 }

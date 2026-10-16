@@ -75,7 +75,7 @@ static int tree_index_empty(struct kernel_object *device,
     struct adytumfs_index index;
     u64 live = 1;
     adytumfs_index_init(&index, super->index_start, super->index_blocks);
-    if (adytumfs_index_live(device, super, &index, &live)) return -1;
+    if (adytumfs_index_live(device, &index, &live)) return -1;
     if (live) return -1;
     adytumfs_cas_open(store, super->index_start, super->index_blocks);
     return 0;
@@ -1033,6 +1033,7 @@ int test_adytumfs_tree_reclaim64(void) {
 // the contents a leaf names is work too, so it counts against the budget like
 // anything else; a walk that quietly overran its own limit would be a stall in
 // the caller that asked for a bounded step.
+
 int test_adytumfs_tree_budget64(void) {
     static struct adytumfs_cas store;
     static u8 scratch[ADYTUMFS_BLOCK_SIZE];

@@ -63,7 +63,7 @@ int adytumfs_cas_count(struct kernel_object *device,
                        const struct adytumfs_superblock *super,
                        struct adytumfs_cas *store, u64 *count) {
     if (!device || !super || !store || !count) return -1;
-    return adytumfs_index_live(device, super, &store->index, count);
+    return adytumfs_index_live(device, &store->index, count);
 }
 
 int adytumfs_cas_lookup(struct kernel_object *device,
@@ -78,7 +78,7 @@ int adytumfs_cas_lookup(struct kernel_object *device,
     }
     u64 number = 0;
     u32 refs = 0;
-    if (adytumfs_index_fetch(device, super, &store->index, hash, &number,
+    if (adytumfs_index_fetch(device, &store->index, hash, &number,
                              &refs))
         return -1;
     cas_install(store, hash, number, refs);
@@ -120,7 +120,7 @@ int adytumfs_cas_refs(struct kernel_object *device,
     }
     u64 number = 0;
     u32 index_refs = 0;
-    if (adytumfs_index_fetch(device, super, &store->index, hash, &number,
+    if (adytumfs_index_fetch(device, &store->index, hash, &number,
                              &index_refs))
         return -1;
     cas_install(store, hash, number, index_refs);
@@ -135,7 +135,7 @@ int adytumfs_cas_place(struct kernel_object *device,
     if (!device || !super || !store || !hash || !block) return -1;
     u64 number = 0;
     u32 refs = 0;
-    if (adytumfs_index_fetch(device, super, &store->index, hash, &number,
+    if (adytumfs_index_fetch(device, &store->index, hash, &number,
                              &refs) == 0) {
         cas_install(store, hash, number, refs);
         *block = number;
@@ -143,7 +143,7 @@ int adytumfs_cas_place(struct kernel_object *device,
     }
     u64 start = 0;
     if (adytumfs_alloc_run(device, super, 1, &start)) return -1;
-    if (adytumfs_index_insert(device, super, &store->index, hash, start)) {
+    if (adytumfs_index_insert(device, &store->index, hash, start)) {
         adytumfs_free_run(device, super, start, 1);
         return -1;
     }
@@ -165,10 +165,10 @@ int adytumfs_cas_retain(struct kernel_object *device,
                         struct adytumfs_cas *store,
                         const u8 hash[ADYTUMFS_CAS_HASH_SIZE]) {
     if (!device || !super || !store || !hash) return -1;
-    if (adytumfs_index_retain(device, super, &store->index, hash)) return -1;
+    if (adytumfs_index_retain(device, &store->index, hash)) return -1;
     u64 number = 0;
     u32 refs = 0;
-    if (adytumfs_index_fetch(device, super, &store->index, hash, &number,
+    if (adytumfs_index_fetch(device, &store->index, hash, &number,
                              &refs))
         return -1;
     cas_install(store, hash, number, refs);
@@ -189,7 +189,7 @@ int adytumfs_cas_release(struct kernel_object *device,
     }
     u64 number = 0;
     u32 refs = 0;
-    if (adytumfs_index_fetch(device, super, &store->index, hash, &number,
+    if (adytumfs_index_fetch(device, &store->index, hash, &number,
                              &refs))
         return -1;
     cas_install(store, hash, number, refs);
@@ -208,7 +208,7 @@ int adytumfs_cas_relocate(struct kernel_object *device,
     if (!device || !super || !store || !hash || !block) return -1;
     u64 from = 0;
     u32 refs = 0;
-    if (adytumfs_index_fetch(device, super, &store->index, hash, &from, &refs))
+    if (adytumfs_index_fetch(device, &store->index, hash, &from, &refs))
         return -1;
     u64 to = 0;
     if (adytumfs_alloc_run(device, super, 1, &to)) return -1;
@@ -220,7 +220,7 @@ int adytumfs_cas_relocate(struct kernel_object *device,
     // The entry is repointed before the old block goes back, so a failure
     // here leaks a block rather than leaving a live mapping aimed at one the
     // allocator has already handed to somebody else.
-    if (adytumfs_index_repoint(device, super, &store->index, hash, to)) {
+    if (adytumfs_index_repoint(device, &store->index, hash, to)) {
         adytumfs_free_run(device, super, to, 1);
         return -1;
     }

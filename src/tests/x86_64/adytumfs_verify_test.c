@@ -100,12 +100,12 @@ int test_adytumfs_verify64(void) {
     u64 resolved = 0;
     u32 refs = 0;
     valid = valid &&
-        adytumfs_index_repoint(dev, &super, &store.index, key,
+        adytumfs_index_repoint(dev, &store.index, key,
                                super.index_start) == 0 &&
         adytumfs_verify(dev, &super) == 0;
     adytumfs_cas_open(&probe_store, super.index_start, super.index_blocks);
     valid = valid &&
-        adytumfs_index_fetch(dev, &super, &probe_store.index, key, &resolved,
+        adytumfs_index_fetch(dev, &probe_store.index, key, &resolved,
                              &refs) == 0 &&
         resolved == claimed && refs == 1u &&
         adytumfs_verify(dev, &super) == 0;
@@ -206,13 +206,13 @@ int test_adytumfs_verify64(void) {
     block[0] ^= 0x5au;
     valid = valid &&
         blake2b(twin, ADYTUMFS_HASH_SIZE, block, ADYTUMFS_BLOCK_SIZE) == 0 &&
-        adytumfs_index_live(dev, &super, &store.index, &live_before) == 0 &&
-        adytumfs_index_insert(dev, &super, &store.index, twin, claimed) == 0 &&
+        adytumfs_index_live(dev, &store.index, &live_before) == 0 &&
+        adytumfs_index_insert(dev, &store.index, twin, claimed) == 0 &&
         adytumfs_cas_retain(dev, &super, &store, twin) == 0 &&
         adytumfs_verify(dev, &super) == 0;
     adytumfs_cas_open(&probe_store, super.index_start, super.index_blocks);
     valid = valid &&
-        adytumfs_index_live(dev, &super, &probe_store.index, &live_after) == 0 &&
+        adytumfs_index_live(dev, &probe_store.index, &live_after) == 0 &&
         live_after == live_before &&
         adytumfs_cas_lookup(dev, &super, &probe_store, twin, &resolved) != 0;
 
