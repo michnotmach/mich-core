@@ -201,7 +201,7 @@ static int branch_checks(void) {
         for (u32 byte = 0; byte < ADYTUMFS_ITEM_CHILD_SIZE; byte++)
             children[index][byte] = (u8)(index * 13u + byte);
     }
-    if (adytumfs_item_branch_pack(block, 3, keys, children)) return -1;
+    if (adytumfs_item_branch_pack(block, 1u, 3, keys, children)) return -1;
     if (adytumfs_item_node_check(block, 1)) return -1;
     if (adytumfs_item_node_check(block, 0) == 0) return -1;
     for (u32 index = 0; index < 3; index++) {
@@ -246,7 +246,7 @@ static int search_checks(void) {
 // Where the walk leaves its keys, so the callback can prove the order it was
 // called in. Static because the visitor gets no storage of its own beyond the
 // context pointer, and the harness has no allocator to hand it one.
-static struct adytumfs_item_key walked[24];
+static struct adytumfs_item_key walked[256];
 static u32 walked_count;
 static int walk_stop;
 
@@ -260,7 +260,7 @@ static u32 payload_index_for(u64 objectid) {
 static int walk_record(const struct adytumfs_item_key *key, const u8 *data,
                        u32 size, void *context) {
     u32 *expected = context;
-    if (walked_count >= 24) return -1;
+    if (walked_count >= 256u) return -1;
     walked[walked_count] = *key;
     u32 which = payload_index_for(key->objectid);
     // The bytes come back too, so checking one proves the data area survived
@@ -329,7 +329,7 @@ int test_adytumfs_item64(void) {
             children[0][byte] = hash_a[byte];
             children[1][byte] = hash_b[byte];
         }
-        valid = adytumfs_item_branch_pack(branch, 2, separators,
+        valid = adytumfs_item_branch_pack(branch, 1u, 2, separators,
                                           children) == 0 &&
             adytumfs_item_node_check(branch, 1) == 0 &&
             node_place(dev, &super, &store, branch, root) == 0;
@@ -398,6 +398,253 @@ int test_adytumfs_item64(void) {
         adytumfs_cas_release(dev, &super, &store, hash_a) == 0 &&
         adytumfs_cas_release(dev, &super, &store, hash_b) == 0;
 
+    adytumfs_window_discard(dev);
+    if (dev) object_release(dev);
+    valid = valid && object_active_count() == objects &&
+        block_active_count() == devices;
+    return valid ? 0 : -1;
+}
+
+// Levels below the root, counted by following the first child down. A split
+// that always cuts after the first item is still correct but degenerates into
+// a chain, and correctness alone would not notice.
+static u32 tree_depth(struct kernel_object *dev,
+                      struct adytumfs_superblock *super,
+                      struct adytumfs_cas *store,
+                      const u8 root[ADYTUMFS_ITEM_CHILD_SIZE]) {
+    static u8 node[ADYTUMFS_BLOCK_SIZE];
+    u8 child[ADYTUMFS_ITEM_CHILD_SIZE];
+    for (u32 byte = 0; byte < ADYTUMFS_ITEM_CHILD_SIZE; byte++)
+        child[byte] = root[byte];
+    u32 depth = 0;
+    while (depth < ADYTUMFS_ITEM_DEPTH_MAX) {
+        if (adytumfs_cas_read(dev, super, store, child, node)) return 0;
+        u32 level = adytumfs_read_le32(node + 8);
+        if (adytumfs_item_node_check(node, level)) return 0;
+        depth++;
+        if (!level) return depth;
+        if (adytumfs_item_branch_get(node, 0, 0, child)) return 0;
+    }
+    return 0;
+}
+
+// Insert is exercised in the order that stresses it: reverse, so every new key
+// lands at the front of a leaf, and then again in forward order over the same
+// tree, so the descent has to cross separators rather than always landing in
+// the first child.
+static int insert_series(struct kernel_object *dev,
+                         struct adytumfs_superblock *super,
+                         struct adytumfs_cas *store, u8 *root, u32 count,
+                         int reverse) {
+    static u8 payload[64];
+    for (u32 step = 0; step < count; step++) {
+        u32 index = reverse ? count - 1u - step : step;
+        struct adytumfs_item_key key =
+            item_key(index + 1u, ADYTUMFS_ITEM_INODE, 0);
+        u32 size = payload_size(index);
+        payload_at(index, payload, size);
+        u8 next[ADYTUMFS_ITEM_CHILD_SIZE];
+        if (adytumfs_item_insert(dev, super, store, root, &key, payload, size,
+                                 next))
+            return -1;
+        // The caller owns the root it passed in, so the previous one is dropped
+        // here rather than left for the volume to reclaim. Leaking it would
+        // keep every superseded node alive and hide a reference bug.
+        if (!adytumfs_item_root_empty(root))
+            if (adytumfs_cas_release(dev, super, store, root)) return -1;
+        for (u32 byte = 0; byte < ADYTUMFS_ITEM_CHILD_SIZE; byte++)
+            root[byte] = next[byte];
+    }
+    return 0;
+}
+
+static int series_check(struct kernel_object *dev,
+                        struct adytumfs_superblock *super,
+                        struct adytumfs_cas *store, const u8 *root, u32 count) {
+    static u8 buffer[80];
+    for (u32 index = 0; index < count; index++) {
+        struct adytumfs_item_key key =
+            item_key(index + 1u, ADYTUMFS_ITEM_INODE, 0);
+        u32 size = 0;
+        if (adytumfs_item_lookup(dev, super, store, root, &key, buffer,
+                                 sizeof(buffer), &size))
+            return -1;
+        if (size != payload_size(index)) return -1;
+        for (u32 byte = 0; byte < size; byte++) {
+            u8 want = (u8)(index * 31u + byte * 7u + 1u);
+            if (buffer[byte] != want) return -1;
+        }
+    }
+    return 0;
+}
+
+static int walk_order_record(const struct adytumfs_item_key *key,
+                             const u8 *data, u32 size, void *context) {
+    u32 *expected = context;
+    if (walked_count >= 256u) return -1;
+    walked[walked_count] = *key;
+    walked_count++;
+    (*expected)++;
+    return data && size ? 0 : -1;
+}
+
+int test_adytumfs_item_insert64(void) {
+    static struct adytumfs_cas store;
+    static u8 scratch[ADYTUMFS_BLOCK_SIZE];
+    static u8 root[ADYTUMFS_ITEM_CHILD_SIZE];
+    static u8 buffer[80];
+    struct adytumfs_superblock super;
+    u32 objects = object_active_count();
+    u32 devices = block_active_count();
+    struct kernel_object *dev = block_create(4096, 0);
+    int valid = dev && adytumfs_make(dev) == 0 &&
+        adytumfs_block_read(dev, 0, scratch) == 0 &&
+        adytumfs_super_unpack(&super, scratch) == 0;
+    adytumfs_cas_open(&store, super.index_start, super.index_blocks);
+    crypto_zero(root, ADYTUMFS_ITEM_CHILD_SIZE);
+
+    // Past what one leaf holds, so the tree has to split and grow a branch
+    // root rather than stay a single node.
+    valid = valid && insert_series(dev, &super, &store, root, 120u, 1) == 0;
+    valid = valid && series_check(dev, &super, &store, root, 120u) == 0;
+
+    // A key that was never inserted still fails, which is the check that the
+    // splits did not smear one item over another.
+    struct adytumfs_item_key absent = item_key(5000u, ADYTUMFS_ITEM_INODE, 0);
+    u32 size = 0;
+    valid = valid &&
+        adytumfs_item_lookup(dev, &super, &store, root, &absent, buffer,
+                             sizeof(buffer), &size) != 0;
+
+    // Replacing an item with one of a different size rebuilds the leaf, so the
+    // old bytes must be gone and not merely shadowed.
+    static u8 bigger[80];
+    struct adytumfs_item_key target = item_key(7u, ADYTUMFS_ITEM_INODE, 0);
+    u32 replaced = 77u;
+    payload_at(200u, bigger, replaced);
+    u8 next[ADYTUMFS_ITEM_CHILD_SIZE];
+    valid = valid &&
+        adytumfs_item_insert(dev, &super, &store, root, &target, bigger,
+                             replaced, next) == 0;
+    if (valid) {
+        valid = adytumfs_cas_release(dev, &super, &store, root) == 0;
+        for (u32 byte = 0; byte < ADYTUMFS_ITEM_CHILD_SIZE; byte++)
+            root[byte] = next[byte];
+    }
+    valid = valid &&
+        adytumfs_item_lookup(dev, &super, &store, root, &target, buffer,
+                             sizeof(buffer), &size) == 0 &&
+        size == replaced;
+    if (valid) {
+        int matches = 1;
+        for (u32 byte = 0; byte < replaced; byte++)
+            if (buffer[byte] != bigger[byte]) matches = 0;
+        valid = matches;
+    }
+
+    // The walk still sees every item exactly once and in ascending order after
+    // all the splitting and the replacement.
+    walked_count = 0;
+    walk_stop = 0;
+    u32 expected = 0;
+    valid = valid &&
+        adytumfs_item_walk(dev, &super, &store, root, walk_order_record,
+                           &expected) == 0;
+    valid = valid && expected == 120u;
+    // Depth is asserted as well as contents: a split that always cuts after
+    // the first item returns every item correctly and still builds a chain.
+    valid = valid && tree_depth(dev, &super, &store, root) > 0 &&
+        tree_depth(dev, &super, &store, root) <= 5u;
+    if (valid) {
+        for (u32 index = 1; index < walked_count; index++)
+            if (walked[index - 1].objectid >= walked[index].objectid) {
+                valid = 0;
+                break;
+            }
+    }
+
+    valid = valid && adytumfs_item_drop(dev, &super, &store, root) == 0;
+    adytumfs_window_discard(dev);
+    if (dev) object_release(dev);
+    valid = valid && object_active_count() == objects &&
+        block_active_count() == devices;
+    return valid ? 0 : -1;
+}
+
+// Depth is forced with large items rather than many of them: an item of two
+// thousand bytes leaves room for two per leaf, so sixty leaves and a branch
+// split arrive after a hundred and twenty inserts instead of a few thousand.
+// The branch split is the path a shallow test never reaches, and it is where a
+// separator can be written into the wrong half.
+int test_adytumfs_item_depth64(void) {
+    static struct adytumfs_cas store;
+    static u8 scratch[ADYTUMFS_BLOCK_SIZE];
+    static u8 root[ADYTUMFS_ITEM_CHILD_SIZE];
+    static u8 node[ADYTUMFS_BLOCK_SIZE];
+    static u8 payload[2048];
+    struct adytumfs_superblock super;
+    u32 objects = object_active_count();
+    u32 devices = block_active_count();
+    struct kernel_object *dev = block_create(4096, 0);
+    int valid = dev && adytumfs_make(dev) == 0 &&
+        adytumfs_block_read(dev, 0, scratch) == 0 &&
+        adytumfs_super_unpack(&super, scratch) == 0;
+    adytumfs_cas_open(&store, super.index_start, super.index_blocks);
+    crypto_zero(root, ADYTUMFS_ITEM_CHILD_SIZE);
+
+    for (u32 index = 0; index < 120u; index++) {
+        struct adytumfs_item_key key =
+            item_key(index + 1u, ADYTUMFS_ITEM_INODE, 0);
+        payload_at(index, payload, sizeof(payload));
+        u8 next[ADYTUMFS_ITEM_CHILD_SIZE];
+        if (adytumfs_item_insert(dev, &super, &store, root, &key, payload,
+                                 sizeof(payload), next)) {
+            valid = 0;
+            break;
+        }
+        if (!adytumfs_item_root_empty(root))
+            if (adytumfs_cas_release(dev, &super, &store, root)) {
+                valid = 0;
+                break;
+            }
+        for (u32 byte = 0; byte < ADYTUMFS_ITEM_CHILD_SIZE; byte++)
+            root[byte] = next[byte];
+    }
+
+    // Sixty leaves over a branch that holds forty six means the branch split at
+    // least once, so the root must now be above level one.
+    valid = valid &&
+        adytumfs_cas_read(dev, &super, &store, root, node) == 0 &&
+        adytumfs_read_le32(node + 8) >= 2u;
+
+    // Every item is still findable through the deeper tree, at both ends and
+    // either side of where the branch split.
+    static u8 buffer[2048];
+    for (u32 index = 0; index < 120u; index += 7u) {
+        struct adytumfs_item_key key =
+            item_key(index + 1u, ADYTUMFS_ITEM_INODE, 0);
+        u32 size = 0;
+        if (adytumfs_item_lookup(dev, &super, &store, root, &key, buffer,
+                                 sizeof(buffer), &size) ||
+            size != sizeof(payload)) {
+            valid = 0;
+            break;
+        }
+        // The expectation is rebuilt for the item being checked. Comparing
+        // against the buffer the inserts last wrote would only ever match the
+        // final item and quietly pass on every other one.
+        static u8 want_payload[2048];
+        payload_at(index, want_payload, sizeof(want_payload));
+        int matches = 1;
+        for (u32 byte = 0; byte < size; byte += 53u)
+            if (buffer[byte] != want_payload[byte]) matches = 0;
+        if (!matches) {
+            valid = 0;
+            break;
+        }
+    }
+
+    valid = valid && adytumfs_item_drop(dev, &super, &store, root) == 0;
     adytumfs_window_discard(dev);
     if (dev) object_release(dev);
     valid = valid && object_active_count() == objects &&

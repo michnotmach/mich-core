@@ -135,6 +135,14 @@ int tests64_run(const struct test64_env *env) {
     if (test_report_record(TEST_ID_ADYTUMFS_ITEM, test_adytumfs_item64()))
         return -1;
     serial64_write("Mich test64: adytumfs item tree pass\n");
+    if (test_report_record(TEST_ID_ADYTUMFS_ITEM_INSERT,
+                           test_adytumfs_item_insert64()))
+        return -1;
+    serial64_write("Mich test64: adytumfs item insert pass\n");
+    if (test_report_record(TEST_ID_ADYTUMFS_ITEM_DEPTH,
+                           test_adytumfs_item_depth64()))
+        return -1;
+    serial64_write("Mich test64: adytumfs item depth pass\n");
     if (test_report_record(TEST_ID_ADYTUMFS_INDEX, test_adytumfs_index64()))
         return -1;
     serial64_write("Mich test64: adytumfs disk index pass\n");
