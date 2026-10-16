@@ -448,10 +448,12 @@ static int insert_series(struct kernel_object *dev,
                                  next))
             return -1;
         // The caller owns the root it passed in, so the previous one is dropped
-        // here rather than left for the volume to reclaim. Leaking it would
-        // keep every superseded node alive and hide a reference bug.
+        // here rather than left for the volume to reclaim. Dropping means
+        // adytumfs_item_drop, not cas_release: once the root is a branch,
+        // releasing only its block orphans every child it named and leaves the
+        // children it shared with the new root over-retained forever.
         if (!adytumfs_item_root_empty(root))
-            if (adytumfs_cas_release(dev, super, store, root)) return -1;
+            if (adytumfs_item_drop(dev, super, store, root)) return -1;
         for (u32 byte = 0; byte < ADYTUMFS_ITEM_CHILD_SIZE; byte++)
             root[byte] = next[byte];
     }
@@ -527,7 +529,7 @@ int test_adytumfs_item_insert64(void) {
         adytumfs_item_insert(dev, &super, &store, root, &target, bigger,
                              replaced, next) == 0;
     if (valid) {
-        valid = adytumfs_cas_release(dev, &super, &store, root) == 0;
+        valid = adytumfs_item_drop(dev, &super, &store, root) == 0;
         for (u32 byte = 0; byte < ADYTUMFS_ITEM_CHILD_SIZE; byte++)
             root[byte] = next[byte];
     }
@@ -603,7 +605,7 @@ int test_adytumfs_item_depth64(void) {
             break;
         }
         if (!adytumfs_item_root_empty(root))
-            if (adytumfs_cas_release(dev, &super, &store, root)) {
+            if (adytumfs_item_drop(dev, &super, &store, root)) {
                 valid = 0;
                 break;
             }
@@ -645,6 +647,99 @@ int test_adytumfs_item_depth64(void) {
     }
 
     valid = valid && adytumfs_item_drop(dev, &super, &store, root) == 0;
+    adytumfs_window_discard(dev);
+    if (dev) object_release(dev);
+    valid = valid && object_active_count() == objects &&
+        block_active_count() == devices;
+    return valid ? 0 : -1;
+}
+
+// Copy on write means two roots can be live at once, and drop has to reclaim
+// exactly what the dropped root alone reached. Taking too little leaves the
+// volume filling up with unreachable nodes; taking too much frees blocks the
+// surviving root still reads, which shows up as the survivor failing.
+int test_adytumfs_item_drop64(void) {
+    static struct adytumfs_cas store;
+    static u8 scratch[ADYTUMFS_BLOCK_SIZE];
+    static u8 root_a[ADYTUMFS_ITEM_CHILD_SIZE];
+    static u8 root_b[ADYTUMFS_ITEM_CHILD_SIZE];
+    static u8 buffer[80];
+    struct adytumfs_superblock super;
+    u32 objects = object_active_count();
+    u32 devices = block_active_count();
+    struct kernel_object *dev = block_create(4096, 0);
+    int valid = dev && adytumfs_make(dev) == 0 &&
+        adytumfs_block_read(dev, 0, scratch) == 0 &&
+        adytumfs_super_unpack(&super, scratch) == 0;
+    adytumfs_cas_open(&store, super.index_start, super.index_blocks);
+    crypto_zero(root_a, ADYTUMFS_ITEM_CHILD_SIZE);
+    crypto_zero(root_b, ADYTUMFS_ITEM_CHILD_SIZE);
+
+    u64 baseline = 0;
+    valid = valid && adytumfs_cas_count(dev, &super, &store, &baseline) == 0;
+
+    // Build the first tree and keep its root.
+    valid = valid && insert_series(dev, &super, &store, root_a, 80u, 0) == 0;
+    valid = valid && adytumfs_cas_retain(dev, &super, &store, root_a) == 0;
+    for (u32 byte = 0; byte < ADYTUMFS_ITEM_CHILD_SIZE; byte++)
+        root_b[byte] = root_a[byte];
+    // Extend past it without dropping, so both roots are live and share the
+    // nodes the first forty items live in.
+    static u8 payload[64];
+    for (u32 index = 80u; index < 120u; index++) {
+        struct adytumfs_item_key key =
+            item_key(index + 1u, ADYTUMFS_ITEM_INODE, 0);
+        u32 size = payload_size(index);
+        payload_at(index, payload, size);
+        u8 next[ADYTUMFS_ITEM_CHILD_SIZE];
+        if (adytumfs_item_insert(dev, &super, &store, root_b, &key, payload,
+                                 size, next)) {
+            valid = 0;
+            break;
+        }
+        if (!adytumfs_item_root_empty(root_b))
+            if (adytumfs_item_drop(dev, &super, &store, root_b)) {
+                valid = 0;
+                break;
+            }
+        for (u32 byte = 0; byte < ADYTUMFS_ITEM_CHILD_SIZE; byte++)
+            root_b[byte] = next[byte];
+    }
+
+    u64 both = 0;
+    valid = valid && adytumfs_cas_count(dev, &super, &store, &both) == 0 &&
+        both > baseline;
+
+    // Dropping the older root must leave the newer one entirely readable. A
+    // drop that frees shared nodes breaks this immediately.
+    valid = valid && adytumfs_item_drop(dev, &super, &store, root_a) == 0;
+    if (valid) {
+        for (u32 index = 0; index < 120u; index++) {
+            struct adytumfs_item_key key =
+                item_key(index + 1u, ADYTUMFS_ITEM_INODE, 0);
+            u32 size = 0;
+            if (adytumfs_item_lookup(dev, &super, &store, root_b, &key, buffer,
+                                     sizeof(buffer), &size) ||
+                size != payload_size(index)) {
+                valid = 0;
+                break;
+            }
+        }
+    }
+    u64 after_a = 0;
+    valid = valid &&
+        adytumfs_cas_count(dev, &super, &store, &after_a) == 0 &&
+        after_a < both && after_a > baseline;
+
+    // Dropping the survivor returns everything, which is the check that a drop
+    // taking too little does not pass: nodes it failed to reach would still be
+    // counted here.
+    valid = valid && adytumfs_item_drop(dev, &super, &store, root_b) == 0;
+    u64 after_b = 0;
+    valid = valid &&
+        adytumfs_cas_count(dev, &super, &store, &after_b) == 0 &&
+        after_b == baseline;
+
     adytumfs_window_discard(dev);
     if (dev) object_release(dev);
     valid = valid && object_active_count() == objects &&
