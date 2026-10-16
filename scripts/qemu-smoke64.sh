@@ -3,7 +3,12 @@ set -eu
 image="${1:-bin/x86_64/disk.img}"
 memory="${2:-128M}"
 profile="${3:-default}"
-qemu_timeout=45
+# The default profile runs the whole kernel test battery, which has grown
+# well past the boot it was budgeted for. A passing run lands at seventy
+# seconds against a seventy second budget, so a good run and a killed one
+# differ by less than the host's jitter; the same truncation the tty profile
+# below already had.
+qemu_timeout=90
 # The crypto known-answer tests run before the profile-specific ones, and the
 # RSA modular exponentiations are the slowest thing in the boot under TCG.
 if [ "$profile" = "smp" ] || [ "$profile" = "iommu" ]; then qemu_timeout=130; fi
