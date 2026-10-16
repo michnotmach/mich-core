@@ -746,3 +746,205 @@ int test_adytumfs_item_drop64(void) {
         block_active_count() == devices;
     return valid ? 0 : -1;
 }
+static u64 remove_last_object;
+static int remove_first;
+
+// Removal leaves holes, so the walk is what proves the survivors still arrive
+// in order and with their own bytes, and that a removed key did not come back.
+static int remove_walk_record(const struct adytumfs_item_key *key,
+                              const u8 *data, u32 size, void *context) {
+    u32 *seen = context;
+    if (!remove_first && key->objectid <= remove_last_object) return -1;
+    remove_last_object = key->objectid;
+    remove_first = 0;
+    u32 which = (u32)(key->objectid - 1u);
+    if (size != payload_size(which)) return -1;
+    for (u32 byte = 0; byte < size; byte++) {
+        u8 want = (u8)(which * 31u + byte * 7u + 1u);
+        if (data[byte] != want) return -1;
+    }
+    (*seen)++;
+    return 0;
+}
+
+static u32 remove_walk(struct kernel_object *dev,
+                       struct adytumfs_superblock *super,
+                       struct adytumfs_cas *store, const u8 *root) {
+    u32 seen = 0;
+    remove_first = 1;
+    remove_last_object = 0;
+    if (adytumfs_item_walk(dev, super, store, root, remove_walk_record, &seen))
+        return 0;
+    return seen;
+}
+
+static u8 separator_node[ADYTUMFS_BLOCK_SIZE];
+static u8 separator_stack[64][ADYTUMFS_ITEM_CHILD_SIZE];
+static u32 separator_top;
+
+// A branch separator is a copy of the greatest key in the child below it, so
+// it has to name an item that is still there. A shrink that forgets to move
+// the separator leaves it naming a key that went, and nothing a walk or a
+// lookup of the survivors would notice, because every remaining key still
+// routes to a child that holds it.
+static int separators_live(struct kernel_object *dev,
+                           struct adytumfs_superblock *super,
+                           struct adytumfs_cas *store, const u8 *root) {
+    static u8 buffer[80];
+    if (adytumfs_item_root_empty(root)) return 1;
+    separator_top = 0;
+    for (u32 byte = 0; byte < ADYTUMFS_ITEM_CHILD_SIZE; byte++)
+        separator_stack[separator_top][byte] = root[byte];
+    separator_top++;
+    while (separator_top) {
+        separator_top--;
+        if (adytumfs_cas_read(dev, super, store, separator_stack[separator_top],
+                              separator_node))
+            return 0;
+        if (!adytumfs_read_le32(separator_node + 8)) continue;
+        u32 count = 0;
+        if (adytumfs_item_node_count(separator_node, &count)) return 0;
+        for (u32 index = 0; index < count; index++) {
+            struct adytumfs_item_key key;
+            u32 size = 0;
+            if (separator_top >= 64u) return 0;
+            if (adytumfs_item_branch_get(separator_node, index, &key,
+                                         separator_stack[separator_top]))
+                return 0;
+            separator_top++;
+            if (adytumfs_item_lookup(dev, super, store, root, &key, buffer,
+                                     sizeof(buffer), &size))
+                return 0;
+        }
+    }
+    return 1;
+}
+
+static int remove_one(struct kernel_object *dev,
+                      struct adytumfs_superblock *super,
+                      struct adytumfs_cas *store, u8 *root, u32 objectid) {
+    struct adytumfs_item_key key = item_key(objectid, ADYTUMFS_ITEM_INODE, 0);
+    u8 next[ADYTUMFS_ITEM_CHILD_SIZE];
+    if (adytumfs_item_remove(dev, super, store, root, &key, next)) return -1;
+    if (!adytumfs_item_root_empty(root))
+        if (adytumfs_item_drop(dev, super, store, root)) return -1;
+    for (u32 byte = 0; byte < ADYTUMFS_ITEM_CHILD_SIZE; byte++)
+        root[byte] = next[byte];
+    return 0;
+}
+
+// Removal is checked against the things it can get wrong silently: taking the
+// wrong item, a separator left describing a child that emptied, survivors
+// arriving out of order, and nodes left behind that no root can reach. The
+// count at the end is the last of those, and it is only meaningful because
+// every superseded root on the way was dropped rather than released.
+int test_adytumfs_item_remove64(void) {
+    static struct adytumfs_cas store;
+    static u8 scratch[ADYTUMFS_BLOCK_SIZE];
+    static u8 root[ADYTUMFS_ITEM_CHILD_SIZE];
+    static u8 buffer[80];
+    struct adytumfs_superblock super;
+    u32 objects = object_active_count();
+    u32 devices = block_active_count();
+    struct kernel_object *dev = block_create(4096, 0);
+    int valid = dev && adytumfs_make(dev) == 0 &&
+        adytumfs_block_read(dev, 0, scratch) == 0 &&
+        adytumfs_super_unpack(&super, scratch) == 0;
+    adytumfs_cas_open(&store, super.index_start, super.index_blocks);
+    crypto_zero(root, ADYTUMFS_ITEM_CHILD_SIZE);
+
+    u64 baseline = 0;
+    valid = valid &&
+        adytumfs_cas_count(dev, &super, &store, &baseline) == 0;
+
+    // An absent key is an error and not a no-op, on an empty tree and on a
+    // full one, because a caller asking for one named inode has to hear.
+    u8 next[ADYTUMFS_ITEM_CHILD_SIZE];
+    struct adytumfs_item_key absent = item_key(900u, ADYTUMFS_ITEM_INODE, 0);
+    valid = valid &&
+        adytumfs_item_remove(dev, &super, &store, root, &absent, next) != 0;
+
+    valid = valid && insert_series(dev, &super, &store, root, 120u, 0) == 0;
+    u64 built = 0;
+    valid = valid &&
+        adytumfs_cas_count(dev, &super, &store, &built) == 0 && built > 0;
+    valid = valid && remove_walk(dev, &super, &store, root) == 120u;
+
+    valid = valid &&
+        adytumfs_item_remove(dev, &super, &store, root, &absent, next) != 0;
+    u64 after_miss = 0;
+    valid = valid &&
+        adytumfs_cas_count(dev, &super, &store, &after_miss) == 0 &&
+        after_miss == built && remove_walk(dev, &super, &store, root) == 120u;
+
+    // A key in the middle of a leaf, then the two ends. The ends are the ones
+    // a branch names as separators, so a shrink that forgets to move the
+    // separator shows up here and nowhere else.
+    valid = valid && remove_one(dev, &super, &store, root, 60u) == 0;
+    u32 size = 0;
+    struct adytumfs_item_key gone = item_key(60u, ADYTUMFS_ITEM_INODE, 0);
+    valid = valid &&
+        adytumfs_item_lookup(dev, &super, &store, root, &gone, buffer,
+                             sizeof(buffer), &size) != 0;
+    valid = valid && remove_walk(dev, &super, &store, root) == 119u;
+
+    // A miss has to stay a miss when the key sorts between two that are there.
+    // The search is a lower bound, so without the exact match this would take
+    // the neighbour instead of refusing.
+    valid = valid &&
+        adytumfs_item_remove(dev, &super, &store, root, &gone, next) != 0;
+    valid = valid && remove_walk(dev, &super, &store, root) == 119u;
+    valid = valid && separators_live(dev, &super, &store, root) == 1;
+
+    valid = valid && remove_one(dev, &super, &store, root, 1u) == 0;
+    valid = valid && remove_one(dev, &super, &store, root, 120u) == 0;
+    valid = valid && remove_walk(dev, &super, &store, root) == 117u;
+    valid = valid && separators_live(dev, &super, &store, root) == 1;
+    for (u32 objectid = 2u; objectid < 120u; objectid++) {
+        if (objectid == 60u) continue;
+        struct adytumfs_item_key key =
+            item_key(objectid, ADYTUMFS_ITEM_INODE, 0);
+        u32 got = 0;
+        if (adytumfs_item_lookup(dev, &super, &store, root, &key, buffer,
+                                 sizeof(buffer), &got) ||
+            got != payload_size(objectid - 1u)) {
+            valid = 0;
+            break;
+        }
+    }
+    valid = valid && tree_depth(dev, &super, &store, root) > 0 &&
+        tree_depth(dev, &super, &store, root) <= 5u;
+
+    // A key that went can come back, which is what an inode number would need
+    // if the volume ever reused one.
+    static u8 payload[64];
+    struct adytumfs_item_key back = item_key(60u, ADYTUMFS_ITEM_INODE, 0);
+    u32 again = payload_size(59u);
+    payload_at(59u, payload, again);
+    valid = valid &&
+        adytumfs_item_insert(dev, &super, &store, root, &back, payload, again,
+                             next) == 0;
+    if (valid) {
+        valid = adytumfs_item_drop(dev, &super, &store, root) == 0;
+        for (u32 byte = 0; byte < ADYTUMFS_ITEM_CHILD_SIZE; byte++)
+            root[byte] = next[byte];
+    }
+    valid = valid && remove_walk(dev, &super, &store, root) == 118u;
+    valid = valid && separators_live(dev, &super, &store, root) == 1;
+
+    // Emptying the tree has to return every block it took. The last removal
+    // leaves the zero root, which is the only representation of empty.
+    for (u32 objectid = 2u; objectid < 120u && valid; objectid++)
+        valid = remove_one(dev, &super, &store, root, objectid) == 0;
+    valid = valid && adytumfs_item_root_empty(root) == 1;
+    u64 rest = 0;
+    valid = valid &&
+        adytumfs_cas_count(dev, &super, &store, &rest) == 0 &&
+        rest == baseline;
+
+    adytumfs_window_discard(dev);
+    if (dev) object_release(dev);
+    valid = valid && object_active_count() == objects &&
+        block_active_count() == devices;
+    return valid ? 0 : -1;
+}
