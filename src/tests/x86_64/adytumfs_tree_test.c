@@ -346,7 +346,7 @@ int test_adytumfs_tree_traverse64(void) {
     // already exclude it. A count that still includes the reservation reports
     // space the allocator will never hand out.
     valid = valid && super.free_blocks + super.index_blocks <=
-        super.data_checksum_region - super.data_start;
+        super.data_end - super.data_start;
 
     u8 root[ADYTUMFS_CAS_HASH_SIZE];
     u8 next[ADYTUMFS_CAS_HASH_SIZE];

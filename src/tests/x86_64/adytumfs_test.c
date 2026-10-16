@@ -1481,7 +1481,7 @@ int test_adytumfs_checksum64(void) {
     // intact, so the read has to serve them. A later step drops the region
     // from the format altogether; until then this pins where authority sits.
     u64 index = physical - super.data_start;
-    u64 region_block = super.data_checksum_region +
+    u64 region_block = super.data_end +
         index / ADYTUMFS_CHECKSUMS_PER_BLOCK;
     u32 entry = (u32)(index % ADYTUMFS_CHECKSUMS_PER_BLOCK) * 4u;
     valid = valid && !adytumfs_block_read(dev, region_block,

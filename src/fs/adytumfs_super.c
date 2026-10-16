@@ -23,7 +23,7 @@ void adytumfs_super_pack(u8 *block, const struct adytumfs_superblock *super) {
     adytumfs_write_le64(block + 104, super->feature_compat);
     adytumfs_write_le64(block + 112, super->feature_incompat);
     adytumfs_write_le64(block + 120, super->feature_ro_compat);
-    adytumfs_write_le64(block + 128, super->data_checksum_region);
+    adytumfs_write_le64(block + 128, super->data_end);
     adytumfs_write_le64(block + 136, super->index_start);
     adytumfs_write_le64(block + 144, super->index_blocks);
     adytumfs_write_le32(block + ADYTUMFS_SUPER_CHECKSUM_OFFSET,
@@ -56,7 +56,7 @@ int adytumfs_super_unpack(struct adytumfs_superblock *super, const u8 *block) {
     super->feature_compat = adytumfs_read_le64(block + 104);
     super->feature_incompat = adytumfs_read_le64(block + 112);
     super->feature_ro_compat = adytumfs_read_le64(block + 120);
-    super->data_checksum_region = adytumfs_read_le64(block + 128);
+    super->data_end = adytumfs_read_le64(block + 128);
     super->index_start = adytumfs_read_le64(block + 136);
     super->index_blocks = adytumfs_read_le64(block + 144);
     // The slot is runtime state, not on-disk state: the primary superblock is
@@ -72,7 +72,10 @@ int adytumfs_super_valid(const struct adytumfs_superblock *super,
     // a missing bit is a volume this build cannot interpret, and an extra bit
     // is one a future build wrote and this one must not guess at. A v2 mask is
     // a missing bit, which is the clean break: there is no migration path.
-    if (super->feature_incompat != ADYTUMFS_FEATURE_INCOMPAT_V3) return -1;
+    if (super->feature_incompat !=
+        (ADYTUMFS_FEATURE_INCOMPAT_V3 |
+         ADYTUMFS_FEATURE_INCOMPAT_NO_CKSUM_REGION))
+        return -1;
     if (super->block_size != ADYTUMFS_BLOCK_SIZE) return -1;
     if (super->total_blocks > device_blocks) return -1;
 
@@ -107,34 +110,23 @@ int adytumfs_super_valid(const struct adytumfs_superblock *super,
         return -1;
     if (super->root_inode == 0 || super->root_inode >= super->inode_count)
         return -1;
-    // The v2 tail grows backwards from the last block: shadow superblock,
-    // shadow bitmap, shadow table, then the checksum region. Every bound is
-    // derived with the prefix checks above already in place, so the
-    // subtraction cannot underflow.
+    // The tail grows backwards from the last block: shadow superblock,
+    // shadow bitmap, shadow table. Every bound is derived with the prefix
+    // checks above already in place, so the subtraction cannot underflow.
     u64 tail_base = super->total_blocks - 1 - super->block_bitmap_blocks -
                     super->inode_table_blocks;
-    if (super->data_checksum_region < super->data_start + 1 ||
-        super->data_checksum_region > tail_base)
+    if (super->data_end < super->data_start + 1 ||
+        super->data_end > tail_base)
         return -1;
-    u64 data_blocks = super->data_checksum_region - super->data_start;
-    u64 region_blocks = tail_base - super->data_checksum_region;
-    // The region must hold one u32 per data block; a larger region is a
-    // volume the formatter solved a different span for, but a smaller one
-    // leaves data blocks with nowhere to store their checksum.
-    if (region_blocks <
-        (data_blocks + ADYTUMFS_CHECKSUMS_PER_BLOCK - 1) /
-            ADYTUMFS_CHECKSUMS_PER_BLOCK)
-        return -1;
-
     // The index sits inside the data region, reserved at format time and
     // marked allocated in the bitmap. Block zero of the region is its header,
     // so a region of one block would hold no entries at all, and a region
-    // reaching past the checksum boundary would send the first tree lookup
-    // somewhere the volume never wrote.
+    // reaching past the data end would send the first tree lookup somewhere
+    // the volume never wrote.
     if (super->index_blocks < 2u) return -1;
     if (super->index_start < super->data_start ||
         super->index_blocks >
-            super->data_checksum_region - super->index_start)
+            super->data_end - super->index_start)
         return -1;
     return 0;
 }

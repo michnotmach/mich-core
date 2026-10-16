@@ -43,9 +43,9 @@ int test_adytumfs_volume64(void) {
     // excluded from the free count, so nothing can hand it out twice.
     valid = valid && super.index_blocks >= 2 &&
         super.index_start == super.data_start &&
-        super.index_start + super.index_blocks <= super.data_checksum_region &&
+        super.index_start + super.index_blocks <= super.data_end &&
         super.free_blocks + super.index_blocks ==
-            super.data_checksum_region - super.data_start;
+            super.data_end - super.data_start;
 
     // The root inode is a directory that owns no data yet.
     struct adytumfs_inode root;

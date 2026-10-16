@@ -137,7 +137,7 @@ int test_adytumfs_verify64(void) {
     valid = valid && adytumfs_block_read(dev, adytumfs_bitmap_block(&super, 0),
                                          block) == 0;
     for (u64 scan = super.data_start; valid &&
-         scan < super.data_checksum_region; scan++)
+         scan < super.data_end; scan++)
         if (!(block[scan / 8] & (u8)(1u << (scan % 8)))) {
             stray = scan;
             break;

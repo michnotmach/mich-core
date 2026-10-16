@@ -80,23 +80,13 @@ int adytumfs_make(struct kernel_object *device) {
     u64 data_start = inode_table_start + inode_table_blocks;
     // The tail from the last block backwards (shadow superblock, shadow
     // bitmap, shadow table) must leave room past the prefix for at least one
-    // data block beside the checksum region.
+    // data block.
     u64 tail_base = total_blocks - 1 - bitmap_blocks - inode_table_blocks;
     if (total_blocks < 1 || tail_base <= data_start) return -1;
 
     u64 inode_count = inode_table_blocks * ADYTUMFS_INODES_PER_BLOCK;
-    // The checksum region ends exactly where the data region ends; its size
-    // holds one u32 per data block, so region and data spans are solved
-    // together against the space the tail leaves.
-    u64 data_span = tail_base - data_start;
-    u64 region_blocks = 1;
-    while ((data_span - region_blocks + ADYTUMFS_CHECKSUMS_PER_BLOCK - 1) /
-               ADYTUMFS_CHECKSUMS_PER_BLOCK >
-           region_blocks)
-        region_blocks++;
-    u64 data_blocks = data_span - region_blocks;
+    u64 data_blocks = tail_base - data_start;
     if (data_blocks == 0) return -1;
-    u64 region_start = data_start + data_blocks;
     // The location index is reserved out of the data region rather than put in
     // the metadata prefix, so the prefix stays the size it was and the index
     // grows with the volume instead of being a second fixed table. It carries
@@ -131,9 +121,10 @@ int adytumfs_make(struct kernel_object *device) {
         .free_inodes = inode_count - 2,
         .generation = 1,
         .feature_compat = 0,
-        .feature_incompat = ADYTUMFS_FEATURE_INCOMPAT_V3,
+        .feature_incompat = ADYTUMFS_FEATURE_INCOMPAT_V3 |
+                            ADYTUMFS_FEATURE_INCOMPAT_NO_CKSUM_REGION,
         .feature_ro_compat = 0,
-        .data_checksum_region = region_start,
+        .data_end = tail_base,
         .index_start = index_start,
         .index_blocks = index_blocks,
     };
@@ -155,7 +146,7 @@ int adytumfs_make(struct kernel_object *device) {
         for (u32 index = 0; index < ADYTUMFS_BLOCK_SIZE; index++) block[index] = 0;
         u64 base = bitmap * bits_per_block;
         for (u64 used = 0; used < total_blocks; used++)
-            if ((used < data_start || used >= region_start ||
+            if ((used < data_start || used >= tail_base ||
                  (used >= index_start && used < index_start + index_blocks)) &&
                 used >= base && used - base < bits_per_block)
                 block[(used - base) / 8] |= (u8)(1u << ((used - base) % 8));
@@ -185,14 +176,8 @@ int adytumfs_make(struct kernel_object *device) {
             return -1;
     }
 
-    // A block nobody owns carries checksum zero: the first zeroing or write on
-    // allocation replaces it, and an unallocated block is never read.
-    for (u64 region = 0; region < region_blocks; region++)
-        if (adytumfs_block_write(device, region_start + region,
-                                 adytumfs_zero_block))
-            return -1;
 
-    // The index is formatted last, once the checksum region exists, because it
+    // The index is formatted last, once the bitmap and the table exist, so it
     // is written through the verified data path like everything else the tree
     // will read.
     struct adytumfs_index index;
@@ -401,7 +386,7 @@ int adytumfs_alloc_run(struct kernel_object *device,
     // Everything from the checksum region on is metadata (the region, the
     // shadow table, the shadow bitmap, the backup superblock), so it is never
     // allocatable.
-    u64 usable_end = super->data_checksum_region;
+    u64 usable_end = super->data_end;
     u64 run_start = 0;
     u64 run = 0;
     for (u64 block = super->data_start; block < usable_end; block++) {
@@ -442,8 +427,8 @@ int adytumfs_free_run(struct kernel_object *device,
     if (!super || length == 0) return -1;
     // Only data blocks are freeable; the metadata prefix and the tail from the
     // checksum region on must never be handed back to the allocator.
-    if (start < super->data_start || start >= super->data_checksum_region ||
-        length > super->data_checksum_region - start)
+    if (start < super->data_start || start >= super->data_end ||
+        length > super->data_end - start)
         return -1;
     for (u64 block = start; block < start + length; block++)
         if (adytumfs_bit_write(device, super, block, 0)) return -1;

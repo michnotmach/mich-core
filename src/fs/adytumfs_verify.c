@@ -170,7 +170,7 @@ static int verify_index(struct kernel_object *device,
             if (!adytumfs_read_le32(entry + ADYTUMFS_INDEX_HASH_SIZE + 8))
                 return -1;
             if (target < super->data_start ||
-                target >= super->data_checksum_region)
+                target >= super->data_end)
                 return -1;
             // A mapping reaching the index would let file content overwrite
             // the structure every hash lookup resolves through.
@@ -210,7 +210,7 @@ static int rebuild_index(struct kernel_object *device,
     verify_bitmap_window = ~(u64)0;
     // The reserved index region is allocated metadata no inode owns, so it is
     // outside the scan for the same reason it is outside the audit counts.
-    for (u64 number = super->data_start; number < super->data_checksum_region;
+    for (u64 number = super->data_start; number < super->data_end;
          number++) {
         if (number >= super->index_start && number < index_end) continue;
         int bit = verify_bit(device, super, number);
@@ -290,7 +290,7 @@ static int verify_volume(struct kernel_object *device,
         int bit = verify_bit(device, super, block);
         if (bit < 0) return -1;
         if (block < super->data_start ||
-            block >= super->data_checksum_region ||
+            block >= super->data_end ||
             (block >= super->index_start && block < index_end)) {
             if (!bit) return -1;
             continue;
@@ -304,7 +304,7 @@ static int verify_volume(struct kernel_object *device,
     // superblock, and the reserved index is not allocatable either, so the
     // free count is taken against the span the allocator can actually reach.
     if (super->free_blocks !=
-        super->data_checksum_region - super->data_start - super->index_blocks -
+        super->data_end - super->data_start - super->index_blocks -
             allocated)
         return -1;
     return 0;

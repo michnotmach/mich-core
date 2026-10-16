@@ -67,6 +67,11 @@ static inline void adytumfs_write_le64(u8 *p, u64 value) {
 // so a v2 mask is simply a volume this build formats over.
 #define ADYTUMFS_FEATURE_INCOMPAT_V2 0x1u
 #define ADYTUMFS_FEATURE_INCOMPAT_V3 0x3u
+// The CRC region left the layout, so the data span now runs to the
+// metadata tail. A volume formatted before that carries only the V3
+// bit and must refuse to mount rather than be read with the wrong
+// span.
+#define ADYTUMFS_FEATURE_INCOMPAT_NO_CKSUM_REGION 0x4u
 
 // The superblock lives in block 0 (a backup copy in the last block). Its
 // checksum is the last field and covers every byte before it, so it never has
@@ -80,7 +85,7 @@ static inline void adytumfs_write_le64(u8 *p, u64 value) {
 // block: the shadow superblock, the shadow bitmap, the shadow inode table,
 // then the data checksum region, which ends exactly where the data region
 // ends. Every block from the region start to the end of the volume is
-// metadata: the allocator hands out nothing at or past data_checksum_region.
+// metadata: the allocator hands out nothing at or past data_end.
 //
 // The shadow tail is a full second copy of the metadata (superblock, bitmap,
 // inode table) that the commit protocol writes while the active copy stays
@@ -106,7 +111,7 @@ struct adytumfs_superblock {
     u64 feature_compat;
     u64 feature_incompat;
     u64 feature_ro_compat;
-    u64 data_checksum_region;
+    u64 data_end;
     // Where the on disk location index lives. It is reserved at format time and
     // never handed to the allocator, because the tree cannot be read without
     // it: a volume that lost these blocks lost every hash to location mapping
@@ -232,7 +237,7 @@ int adytumfs_table_stage(struct kernel_object *device,
 
 // Allocate a contiguous run of length data blocks (first-fit) and return its
 // start block, or free a previously allocated run. Data blocks live in
-// [data_start, data_checksum_region); the metadata prefix and tail are never
+// [data_start, data_end); the metadata prefix and tail are never
 // handed out. Bitmap edits stage in the open window: the committed generation
 // on the device keeps every block the current window freed, so the allocator
 // skips a block that reads free in the staging but allocated in the committed
