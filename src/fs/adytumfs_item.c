@@ -699,6 +699,179 @@ int adytumfs_item_insert(struct kernel_object *device,
     return adytumfs_cas_retain(device, super, store, new_root);
 }
 
+// A leaf that loses its last item cannot be repacked, because both pack
+// functions reject an empty node and the format has no representation for one.
+// Removal therefore says upward that the child is gone rather than handing back
+// a smaller node, and a branch that loses its last child is gone the same way.
+// A root ending that way leaves the tree empty, which the zero root already
+// means, so no empty node is ever left behind to be found by a later walk.
+struct adytumfs_item_shrink {
+    u8 left[ADYTUMFS_ITEM_CHILD_SIZE];
+    struct adytumfs_item_key left_max;
+    int gone;
+};
+
+// Remove one item from a leaf. The leaf is rebuilt without it rather than
+// patched for the same reason an insert of a different size rebuilds: the data
+// area is packed with no gaps, so taking one item out moves every item after
+// it. No merging happens here or above, so a leaf keeps whatever it is left
+// with and the tree simply gets sparser.
+static int leaf_remove(struct kernel_object *device,
+                       struct adytumfs_superblock *super,
+                       struct adytumfs_cas *store, const u8 *node,
+                       const struct adytumfs_item_key *key,
+                       struct adytumfs_item_shrink *shrink) {
+    static u8 staged[ADYTUMFS_BLOCK_SIZE];
+    static struct adytumfs_item_key keys[ADYTUMFS_ITEM_LEAF_SLOT_MAX];
+    static const u8 *staged_at[ADYTUMFS_ITEM_LEAF_SLOT_MAX];
+    static u32 staged_size[ADYTUMFS_ITEM_LEAF_SLOT_MAX];
+    static struct adytumfs_item_key out_keys[ADYTUMFS_ITEM_LEAF_SLOT_MAX];
+    static const u8 *out_at[ADYTUMFS_ITEM_LEAF_SLOT_MAX];
+    static u32 out_size[ADYTUMFS_ITEM_LEAF_SLOT_MAX];
+    u32 count;
+    if (adytumfs_item_node_count(node, &count) || !count) return -1;
+    int at = adytumfs_item_node_search(node, key);
+    if (at < 0) return -1;
+    const u8 *probe;
+    u32 probe_size;
+    if (adytumfs_item_leaf_get(node, (u32)at, &keys[0], &probe, &probe_size))
+        return -1;
+    // Search is a lower bound, so the slot it lands on holds the key asked for
+    // only if the key really matches. A miss is an error and not a no-op: the
+    // caller asked for one named thing and has to hear when it is absent.
+    if (key_compare(&keys[0], key)) return -1;
+    u32 used = 0;
+    for (u32 index = 0; index < count; index++) {
+        if (index == (u32)at) continue;
+        const u8 *bytes;
+        u32 size;
+        if (adytumfs_item_leaf_get(node, index, &keys[index], &bytes, &size))
+            return -1;
+        if (used + size > ADYTUMFS_BLOCK_SIZE) return -1;
+        for (u32 byte = 0; byte < size; byte++)
+            staged[used + byte] = bytes[byte];
+        staged_at[index] = staged + used;
+        staged_size[index] = size;
+        used += size;
+    }
+    u32 total = 0;
+    for (u32 index = 0; index < count; index++) {
+        if (index == (u32)at) continue;
+        out_keys[total] = keys[index];
+        out_at[total] = staged_at[index];
+        out_size[total] = staged_size[index];
+        total++;
+    }
+    if (!total) {
+        shrink->gone = 1;
+        return 0;
+    }
+    if (adytumfs_item_leaf_pack(item_node, total, out_keys, out_at, out_size))
+        return -1;
+    shrink->gone = 0;
+    if (node_max_key(item_node, &shrink->left_max)) return -1;
+    return item_store(device, super, store, item_node, shrink->left);
+}
+
+// Rewrite one branch above a changed child, either naming the child's
+// replacement or dropping the slot when the child emptied. Dropping a slot
+// leaves the remaining separators correct without adjusting them: the separator
+// that went described the child that went, and no key it covered is in the tree
+// any more, so routing that would have landed there has nowhere left to go.
+static int branch_shrink(struct kernel_object *device,
+                         struct adytumfs_superblock *super,
+                         struct adytumfs_cas *store, const u8 *node, u32 at,
+                         const struct adytumfs_item_shrink *below,
+                         struct adytumfs_item_shrink *above) {
+    static struct adytumfs_item_key keys[ADYTUMFS_ITEM_BRANCH_SLOT_MAX];
+    static u8 children[ADYTUMFS_ITEM_BRANCH_SLOT_MAX]
+                      [ADYTUMFS_ITEM_CHILD_SIZE];
+    u32 count;
+    if (adytumfs_item_node_count(node, &count)) return -1;
+    if (!count || at >= count) return -1;
+    u32 level = adytumfs_read_le32(node + 8);
+    for (u32 index = 0; index < count; index++)
+        if (adytumfs_item_branch_get(node, index, &keys[index],
+                                     children[index]))
+            return -1;
+    u32 total;
+    if (below->gone) {
+        total = count - 1u;
+        for (u32 index = at; index < total; index++) {
+            keys[index] = keys[index + 1u];
+            hash_copy(children[index], children[index + 1u]);
+        }
+    } else {
+        total = count;
+        keys[at] = below->left_max;
+        hash_copy(children[at], below->left);
+    }
+    if (!total) {
+        above->gone = 1;
+        return 0;
+    }
+    if (adytumfs_item_branch_pack(item_node, level, total, keys, children))
+        return -1;
+    above->gone = 0;
+    if (node_max_key(item_node, &above->left_max)) return -1;
+    return item_store(device, super, store, item_node, above->left);
+}
+
+static int item_remove(struct kernel_object *device,
+                       struct adytumfs_superblock *super,
+                       struct adytumfs_cas *store,
+                       const u8 root[ADYTUMFS_ITEM_CHILD_SIZE],
+                       const struct adytumfs_item_key *key,
+                       u8 new_root[ADYTUMFS_ITEM_CHILD_SIZE]) {
+    if (!device || !super || !store || !root || !key || !new_root) return -1;
+    if (adytumfs_item_root_empty(root)) return -1;
+    static struct adytumfs_item_step path[ADYTUMFS_ITEM_DEPTH_MAX];
+    static u8 node_copy[ADYTUMFS_BLOCK_SIZE];
+    u32 depth = 0;
+    if (item_descend(device, super, store, root, key, path, &depth)) return -1;
+    struct adytumfs_item_shrink below;
+    struct adytumfs_item_shrink above;
+    if (adytumfs_cas_read(device, super, store, path[depth - 1u].hash,
+                          item_node))
+        return -1;
+    // The leaf is copied out of the shared buffer because the rebuild writes
+    // its result back into that same buffer.
+    for (u32 index = 0; index < ADYTUMFS_BLOCK_SIZE; index++)
+        node_copy[index] = item_node[index];
+    if (leaf_remove(device, super, store, node_copy, key, &below)) return -1;
+    for (u32 step = depth - 1u; step > 0; step--) {
+        if (adytumfs_cas_read(device, super, store, path[step - 1u].hash,
+                              item_node))
+            return -1;
+        for (u32 index = 0; index < ADYTUMFS_BLOCK_SIZE; index++)
+            node_copy[index] = item_node[index];
+        if (branch_shrink(device, super, store, node_copy,
+                          path[step - 1u].index, &below, &above))
+            return -1;
+        below = above;
+    }
+    if (below.gone) {
+        for (u32 byte = 0; byte < ADYTUMFS_ITEM_CHILD_SIZE; byte++)
+            new_root[byte] = 0;
+        return 0;
+    }
+    hash_copy(new_root, below.left);
+    return 0;
+}
+
+int adytumfs_item_remove(struct kernel_object *device,
+                         struct adytumfs_superblock *super,
+                         struct adytumfs_cas *store,
+                         const u8 root[ADYTUMFS_ITEM_CHILD_SIZE],
+                         const struct adytumfs_item_key *key,
+                         u8 new_root[ADYTUMFS_ITEM_CHILD_SIZE]) {
+    if (item_remove(device, super, store, root, key, new_root)) return -1;
+    // An emptied tree has no node left to hold and the zero root already means
+    // empty, so only a surviving root is handed back with a reference on it.
+    if (adytumfs_item_root_empty(new_root)) return 0;
+    return adytumfs_cas_retain(device, super, store, new_root);
+}
+
 // Depth first over an explicit stack for the same reason the walk is: the
 // descent is as deep as the tree and a recursive one would put that depth on
 // the kernel stack. The bound is the worst case, every level leaving its other

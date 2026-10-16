@@ -114,6 +114,21 @@ int adytumfs_item_insert(struct kernel_object *device,
                          u32 size,
                          u8 new_root[ADYTUMFS_ITEM_CHILD_SIZE]);
 
+// Remove one key, copy on write, and hand back the new root the same way an
+// insert does. A key that is not there is an error rather than a no-op, so a
+// caller asking for one named item hears when it is absent.
+//
+// Nothing merges on the way back up. A leaf keeps whatever items it is left
+// with, so removing from a full tree spends space it does not give back, which
+// is the trade the format accepts to keep a removal to one pass down and back.
+// Removing every item leaves the zero root, and no empty node is ever stored.
+int adytumfs_item_remove(struct kernel_object *device,
+                         struct adytumfs_superblock *super,
+                         struct adytumfs_cas *store,
+                         const u8 root[ADYTUMFS_ITEM_CHILD_SIZE],
+                         const struct adytumfs_item_key *key,
+                         u8 new_root[ADYTUMFS_ITEM_CHILD_SIZE]);
+
 int adytumfs_item_lookup(struct kernel_object *device,
                          struct adytumfs_superblock *super,
                          struct adytumfs_cas *store,
