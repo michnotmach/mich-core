@@ -339,7 +339,7 @@ int adytumfs_pages_fault(u32 mount, u32 inode, u64 generation, u32 page) {
     // A page past the file size or past the allocated extents reads as
     // zeroes: the write path grows at sync, not at fault.
     if (page * 4096u >= in.size ||
-        adytumfs_inode_hash(m->device, &m->super, &m->store, &in, page, hash) ||
+        adytumfs_inode_block_hash(m->device, &m->super, &m->store, &in, page, hash) ||
         adytumfs_cas_lookup(m->device, &m->super, &m->store, hash, &physical)) {
         for (u32 index = 0; index < 4096; index++) bytes[index] = 0;
         cache_mark(slot->present, page);

@@ -268,11 +268,11 @@ static int inode_span(struct kernel_object *device,
                               logical_block * ADYTUMFS_BLOCK_SIZE, span);
 }
 
-int adytumfs_inode_hash(struct kernel_object *device,
-                        struct adytumfs_superblock *super,
-                        struct adytumfs_cas *store,
-                        const struct adytumfs_inode *inode, u64 logical_block,
-                        u8 hash[ADYTUMFS_HASH_SIZE]) {
+int adytumfs_inode_block_hash(struct kernel_object *device,
+                              struct adytumfs_superblock *super,
+                              struct adytumfs_cas *store,
+                              const struct adytumfs_inode *inode,
+                              u64 logical_block, u8 hash[ADYTUMFS_HASH_SIZE]) {
     if (!device || !super || !store || !inode || !hash) return -1;
     struct adytumfs_tree_span span;
     if (inode_span(device, super, store, inode, logical_block, &span))
@@ -289,7 +289,8 @@ int adytumfs_inode_map(struct kernel_object *device,
                        u64 *physical_block) {
     if (!device || !super || !store || !inode || !physical_block) return -1;
     u8 hash[ADYTUMFS_HASH_SIZE];
-    if (adytumfs_inode_hash(device, super, store, inode, logical_block, hash))
+    if (adytumfs_inode_block_hash(device, super, store, inode, logical_block,
+                                  hash))
         return -1;
     return adytumfs_cas_lookup(device, super, store, hash, physical_block);
 }
@@ -304,7 +305,8 @@ int adytumfs_inode_fetch(struct kernel_object *device,
                          u8 *buffer) {
     if (!device || !super || !store || !inode || !buffer) return -1;
     u8 hash[ADYTUMFS_HASH_SIZE];
-    if (adytumfs_inode_hash(device, super, store, inode, logical_block, hash))
+    if (adytumfs_inode_block_hash(device, super, store, inode, logical_block,
+                                  hash))
         return -1;
     return adytumfs_cas_read(device, super, store, hash, buffer);
 }
