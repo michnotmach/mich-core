@@ -241,13 +241,25 @@ struct verify_scan {
     struct adytumfs_superblock *super;
     struct adytumfs_cas *store;
     u64 live;
+    // The largest inode number the tree holds. The high water mark in the
+    // superblock is only meaningful against this, because the check on the
+    // superblock itself can only bound it by the live count.
+    u64 highest;
 };
+
+// Both visitors need the number, so the shape check and the bound it makes
+// possible live in one place rather than being repeated per visitor.
+static int scan_number(struct verify_scan *scan, u64 number) {
+    if (number > scan->highest) scan->highest = number;
+    return 0;
+}
 
 static int scan_retain(const struct adytumfs_item_key *key, const u8 *data,
                        u32 size, void *context) {
     struct verify_scan *scan = context;
     struct adytumfs_inode in;
     if (scan_inode_item(key, data, size, &in)) return -1;
+    scan_number(scan, key->objectid);
     if (adytumfs_tree_root_empty(in.extent_root)) return 0;
     if (adytumfs_cas_retain(scan->device, scan->super, scan->store,
                             in.extent_root))
@@ -261,6 +273,7 @@ static int scan_audit(const struct adytumfs_item_key *key, const u8 *data,
     struct verify_scan *scan = context;
     struct adytumfs_inode in;
     if (scan_inode_item(key, data, size, &in)) return -1;
+    scan_number(scan, key->objectid);
     u32 bits = in.mode & (ADYTUMFS_MODE_DIR | ADYTUMFS_MODE_REG |
                           ADYTUMFS_MODE_LNK);
     if (bits != ADYTUMFS_MODE_DIR && bits != ADYTUMFS_MODE_REG &&
@@ -352,7 +365,7 @@ static int rebuild_index(struct kernel_object *device,
             roots[found][byte] = root[byte];
         found++;
     }
-    struct verify_scan scan = {device, super, store, 0};
+    struct verify_scan scan = {device, super, store, 0, 0};
     for (u32 index = 0; index < found; index++) {
         if (verify_item_refs(device, super, store, roots[index])) return -1;
         if (adytumfs_item_walk(device, super, store, roots[index], scan_retain,
@@ -377,7 +390,7 @@ static int verify_volume(struct kernel_object *device,
     // Every inode the tree holds is audited, not only the ones a mount walks:
     // an inode nothing references still owns blocks, and the ledger below only
     // balances when all of them are counted.
-    struct verify_scan scan = {device, super, store, 0};
+    struct verify_scan scan = {device, super, store, 0, 0};
     if (adytumfs_item_walk(device, super, store, super->inode_root, scan_audit,
                            &scan))
         return -1;
@@ -400,6 +413,11 @@ static int verify_volume(struct kernel_object *device,
     u64 live = 0;
     if (verify_index(device, super, index_end, allocated, &live)) return -1;
     if (super->live_inodes != scan.live) return -1;
+    // The high water mark has to sit above every number the tree holds. The
+    // check on the superblock bounds it by the live count, and freeing inodes
+    // opens a gap between the two that the allocator would walk back into,
+    // handing a live inode's number to a new one.
+    if (super->inode_next <= scan.highest) return -1;
     // The allocatable span ends at the checksum region, not at the backup
     // superblock, and the reserved index is not allocatable either, so the
     // free count is taken against the span the allocator can actually reach.

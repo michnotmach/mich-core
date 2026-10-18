@@ -239,6 +239,42 @@ int test_adytumfs_verify64(void) {
         adytumfs_verify(dev, &super) == 0;
 
 
+    // The high water mark is the only thing that stops the allocator from
+    // handing out a number a live inode already holds, and the superblock
+    // check bounds it by the live count, which is a different number: inodes
+    // get freed, so the mark sits above the highest number in use by however
+    // many were let go. Lowering it into that gap keeps every count the audit
+    // compares in agreement and still reuses a live inode on the next
+    // allocation, so the audit has to compare the mark against the numbers the
+    // tree actually holds.
+    u64 spare = 0;
+    u64 thrown = 0;
+    struct adytumfs_inode victim;
+    valid = valid &&
+        adytumfs_inode_alloc(dev, &super, &store, ADYTUMFS_MODE_REG | 0644u,
+                             &thrown) == 0 &&
+        adytumfs_inode_alloc(dev, &super, &store, ADYTUMFS_MODE_REG | 0644u,
+                             &thrown) == 0 &&
+        adytumfs_inode_alloc(dev, &super, &store, ADYTUMFS_MODE_REG | 0644u,
+                             &spare) == 0 &&
+        adytumfs_inode_read(dev, &super, &store, spare, &victim) == 0 &&
+        adytumfs_inode_free(dev, &super, &store, thrown) == 0 &&
+        adytumfs_commit(dev, &super, &store) == 0 &&
+        adytumfs_super_read(dev, &super) == 0;
+    // One inode survives above the forged mark and the live count still fits
+    // below it, which is exactly the gap the syntactic check cannot see.
+    struct adytumfs_superblock rewound = super;
+    rewound.inode_next = spare;
+    valid = valid &&
+        rewound.live_inodes < rewound.inode_next &&
+        rewound.root_inode < rewound.inode_next &&
+        super_rewrite(dev, &rewound, block) == 0 &&
+        adytumfs_super_read(dev, &probe) == 0 &&
+        probe.inode_next == spare &&
+        adytumfs_verify(dev, &probe) != 0 &&
+        super_rewrite(dev, &super, block) == 0 &&
+        adytumfs_verify(dev, &super) == 0;
+
     // Two mappings naming one block means two writers share a single
     // allocation. The bitmap counts the block once, so the mapping count is
     // what disagrees, and the audit needs no pairwise comparison to see it.
