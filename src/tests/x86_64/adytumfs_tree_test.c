@@ -69,16 +69,22 @@ static int value_place(struct kernel_object *dev,
 // The tree resolves a node by hash, so it runs against the index mkfs
 // reserved and recorded in the superblock. Nothing here allocates one, which
 // is the point: a formatted volume arrives with a working index.
-static int tree_index_empty(struct kernel_object *device,
+// A fresh volume's index is not empty: formatting builds the tree that holds
+// the root inode, and the leaf holding it is already mapped. Anything other
+// than that one mapping means the volume is not the one just formatted.
+//
+// The store is opened before the count is judged, not after. A caller that
+// fails this check still goes on to use the store, and an unopened one has a
+// zero capacity that divides by zero on the first lookup.
+static int tree_index_fresh(struct kernel_object *device,
                             const struct adytumfs_superblock *super,
                             struct adytumfs_cas *store) {
     struct adytumfs_index index;
-    u64 live = 1;
+    u64 live = 0;
     adytumfs_index_init(&index, super->index_start, super->index_blocks);
-    if (adytumfs_index_live(device, &index, &live)) return -1;
-    if (live) return -1;
     adytumfs_cas_open(store, super->index_start, super->index_blocks);
-    return 0;
+    if (adytumfs_index_live(device, &index, &live)) return -1;
+    return live == 1u ? 0 : -1;
 }
 
 // A failure has to be distinguishable from a real zero, so it reads as
@@ -341,7 +347,7 @@ int test_adytumfs_tree_traverse64(void) {
     int valid = dev && adytumfs_make(dev) == 0 &&
         adytumfs_block_read(dev, 0, scratch) == 0 &&
         adytumfs_super_unpack(&super, scratch) == 0;
-    valid = valid && tree_index_empty(dev, &super, &store) == 0;
+    valid = valid && tree_index_fresh(dev, &super, &store) == 0;
     // The index is reserved out of the data region, so the free count has to
     // already exclude it. A count that still includes the reservation reports
     // space the allocator will never hand out.
@@ -497,7 +503,7 @@ int test_adytumfs_tree_gc64(void) {
     int valid = dev && adytumfs_make(dev) == 0 &&
         adytumfs_block_read(dev, 0, scratch) == 0 &&
         adytumfs_super_unpack(&super, scratch) == 0;
-    valid = valid && tree_index_empty(dev, &super, &store) == 0;
+    valid = valid && tree_index_fresh(dev, &super, &store) == 0;
 
     u8 root[ADYTUMFS_CAS_HASH_SIZE];
     u8 next[ADYTUMFS_CAS_HASH_SIZE];
@@ -528,8 +534,10 @@ int test_adytumfs_tree_gc64(void) {
     // history. The content is part of that statement now: an entry that names
     // a block is a reason to keep it, so a collected tree keeps exactly the
     // blocks its live entries point at.
+    // One more than this tree holds: the leaf the root inode lives in is
+    // mapped from the moment the volume was formatted and is not part of it.
     u64 steady = tree_count(dev, &super, &store);
-    valid = valid && steady == ADYTUMFS_TREE_LEAF_MAX + 1u;
+    valid = valid && steady == ADYTUMFS_TREE_LEAF_MAX + 2u;
 
     // The point of the slice. Rewriting one key over and over has to leave the
     // table where it was. Without the discard every round leaked a node
@@ -580,7 +588,7 @@ int test_adytumfs_tree_gc64(void) {
     // why the halves are even and the last leaf runs up to nearly full before
     // it splits in turn.
     u64 grown = tree_count(dev, &super, &store);
-    valid = valid && grown == 2u * ADYTUMFS_TREE_LEAF_MAX + 4u;
+    valid = valid && grown == 2u * ADYTUMFS_TREE_LEAF_MAX + 5u;
 
     for (u32 round = 0; round < 20u; round++) {
         key = key_at(ADYTUMFS_TREE_LEAF_MAX);
@@ -755,7 +763,7 @@ int test_adytumfs_tree_find64(void) {
     int valid = dev && adytumfs_make(dev) == 0 &&
         adytumfs_block_read(dev, 0, scratch) == 0 &&
         adytumfs_super_unpack(&super, scratch) == 0;
-    valid = valid && tree_index_empty(dev, &super, &store) == 0;
+    valid = valid && tree_index_fresh(dev, &super, &store) == 0;
     u8 root[ADYTUMFS_CAS_HASH_SIZE];
     u8 next[ADYTUMFS_CAS_HASH_SIZE];
     crypto_zero(root, ADYTUMFS_CAS_HASH_SIZE);
@@ -974,7 +982,7 @@ int test_adytumfs_tree_reclaim64(void) {
     int valid = dev && adytumfs_make(dev) == 0 &&
         adytumfs_block_read(dev, 0, scratch) == 0 &&
         adytumfs_super_unpack(&super, scratch) == 0;
-    valid = valid && tree_index_empty(dev, &super, &store) == 0;
+    valid = valid && tree_index_fresh(dev, &super, &store) == 0;
 
     // The allocator's free count lives in the caller's copy of the superblock
     // and only reaches the disk on a commit, so the store's own count is what
@@ -1044,7 +1052,7 @@ int test_adytumfs_tree_budget64(void) {
     int valid = dev && adytumfs_make(dev) == 0 &&
         adytumfs_block_read(dev, 0, scratch) == 0 &&
         adytumfs_super_unpack(&super, scratch) == 0;
-    valid = valid && tree_index_empty(dev, &super, &store) == 0;
+    valid = valid && tree_index_fresh(dev, &super, &store) == 0;
 
     u64 base_count = 0;
     valid = valid && adytumfs_cas_count(dev, &super, &store, &base_count) == 0;
@@ -1117,7 +1125,7 @@ int test_adytumfs_tree_truncate64(void) {
     int valid = dev && adytumfs_make(dev) == 0 &&
         adytumfs_block_read(dev, 0, scratch) == 0 &&
         adytumfs_super_unpack(&super, scratch) == 0;
-    valid = valid && tree_index_empty(dev, &super, &store) == 0;
+    valid = valid && tree_index_fresh(dev, &super, &store) == 0;
 
     // Cuts at a boundary and inside the two block run, each keeping a
     // different number of leaves alive so both the drop and the collapse are
@@ -1189,7 +1197,7 @@ int test_adytumfs_tree_remove64(void) {
     int valid = dev && adytumfs_make(dev) == 0 &&
         adytumfs_block_read(dev, 0, scratch) == 0 &&
         adytumfs_super_unpack(&super, scratch) == 0;
-    valid = valid && tree_index_empty(dev, &super, &store) == 0;
+    valid = valid && tree_index_fresh(dev, &super, &store) == 0;
 
     u8 root[ADYTUMFS_CAS_HASH_SIZE];
     u8 next[ADYTUMFS_CAS_HASH_SIZE];

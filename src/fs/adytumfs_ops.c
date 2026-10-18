@@ -34,11 +34,12 @@ int adytumfs_create_at(struct kernel_object *device,
                        u64 *out_inode) {
     if (mode == 0 || name_len == 0 || name_len > ADYTUMFS_NAME_MAX) return -1;
     struct adytumfs_inode parent;
-    if (adytumfs_inode_read(device, super, parent_inode, &parent)) return -1;
+    if (adytumfs_inode_read(device, super, store, parent_inode, &parent))
+        return -1;
     if ((parent.mode & ADYTUMFS_MODE_DIR) == 0) return -1;
 
     u64 target;
-    if (adytumfs_inode_alloc(device, super, mode, &target)) return -1;
+    if (adytumfs_inode_alloc(device, super, store, mode, &target)) return -1;
     u8 type = (mode & ADYTUMFS_MODE_DIR) ? (u8)ADYTUMFS_DTYPE_DIR :
         (mode & ADYTUMFS_MODE_LNK) ? (u8)ADYTUMFS_DTYPE_LNK :
         (u8)ADYTUMFS_DTYPE_REG;
@@ -46,7 +47,7 @@ int adytumfs_create_at(struct kernel_object *device,
     // does not leak an allocated slot.
     if (adytumfs_dir_add(device, super, store, parent_inode, name, name_len, target,
                          type)) {
-        adytumfs_inode_free(device, super, target);
+        adytumfs_inode_free(device, super, store, target);
         return -1;
     }
     if (out_inode) *out_inode = target;
@@ -63,7 +64,7 @@ int adytumfs_unlink_at(struct kernel_object *device,
                             &target))
         return -1;
     struct adytumfs_inode inode;
-    if (adytumfs_inode_read(device, super, target, &inode)) return -1;
+    if (adytumfs_inode_read(device, super, store, target, &inode)) return -1;
     // Directory removal has its own emptiness rules and belongs to rmdir; this
     // path handles regular files only.
     if ((inode.mode & ADYTUMFS_MODE_REG) == 0) return -1;
@@ -72,5 +73,5 @@ int adytumfs_unlink_at(struct kernel_object *device,
         return -1;
     if (adytumfs_dir_remove(device, super, store, parent_inode, name, name_len))
         return -1;
-    return adytumfs_inode_free(device, super, target);
+    return adytumfs_inode_free(device, super, store, target);
 }

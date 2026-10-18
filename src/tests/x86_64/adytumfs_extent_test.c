@@ -31,8 +31,8 @@ int test_adytumfs_extent64(void) {
     struct adytumfs_inode a;
     struct adytumfs_inode b;
     valid = valid &&
-        adytumfs_inode_alloc(dev, &super, ADYTUMFS_MODE_REG | 0644u, &na) == 0 &&
-        adytumfs_inode_read(dev, &super, na, &a) == 0;
+        adytumfs_inode_alloc(dev, &super, &store, ADYTUMFS_MODE_REG | 0644u, &na) == 0 &&
+        adytumfs_inode_read(dev, &super, &store, na, &a) == 0;
 
     // A fresh inode names the empty tree, and a mapping through it fails
     // rather than inventing a block.
@@ -65,8 +65,8 @@ int test_adytumfs_extent64(void) {
     // it. Nothing about the physical layout is recorded in the inode, so
     // there is nothing else to survive.
     struct adytumfs_inode again;
-    valid = valid && adytumfs_inode_write(dev, &super, na, &a) == 0 &&
-        adytumfs_inode_read(dev, &super, na, &again) == 0 &&
+    valid = valid && adytumfs_inode_write(dev, &super, &store, na, &a) == 0 &&
+        adytumfs_inode_read(dev, &super, &store, na, &again) == 0 &&
         again.blocks == 5 &&
         adytumfs_inode_map(dev, &super, &store, &again, 3, &physical) == 0 &&
         physical == hole;
@@ -78,8 +78,8 @@ int test_adytumfs_extent64(void) {
     u64 bhole = 0;
     valid = valid &&
         adytumfs_cas_count(dev, &super, &store, &live_before) == 0 &&
-        adytumfs_inode_alloc(dev, &super, ADYTUMFS_MODE_REG | 0644u, &nb) == 0 &&
-        adytumfs_inode_read(dev, &super, nb, &b) == 0 &&
+        adytumfs_inode_alloc(dev, &super, &store, ADYTUMFS_MODE_REG | 0644u, &nb) == 0 &&
+        adytumfs_inode_read(dev, &super, &store, nb, &b) == 0 &&
         adytumfs_inode_grow(dev, &super, &store, &b, nb, 1) == 0 &&
         adytumfs_inode_map(dev, &super, &store, &b, 0, &bhole) == 0 &&
         bhole == hole;

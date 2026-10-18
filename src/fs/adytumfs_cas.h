@@ -9,6 +9,22 @@
 #define ADYTUMFS_CAS_HASH_SIZE ADYTUMFS_INDEX_HASH_SIZE
 #define ADYTUMFS_CAS_SLOTS 256u
 
+// How many inodes may sit written but unlanded between two commits.
+//
+// A tree node is named by the hash of its content, so rewriting one inode
+// means writing a whole new leaf, and the leaf it replaces cannot be freed
+// while the generation naming it is still the committed one. Charging a
+// block to every write made a large file unwritable: measured 2.12 blocks
+// per 512 byte chunk, so 1 GiB written in 4 KiB chunks leaves a gigabyte of
+// dead leaves behind before the first commit. btrfs and ZFS collapse this
+// the same way, writing a node once per transaction rather than once per
+// change.
+//
+// The bound is a memory budget and not a limit on anything: a full stage
+// lands its oldest image and carries on, which costs the block the write
+// would have cost before staging existed rather than failing.
+#define ADYTUMFS_INODE_STAGE 16u
+
 // In memory cache in front of the on disk index.
 //
 // This used to be the table itself, and that made it the ceiling on the whole
@@ -40,6 +56,19 @@ struct adytumfs_cas_entry {
 struct adytumfs_cas {
     struct adytumfs_index index;
     struct adytumfs_cas_entry entries[ADYTUMFS_CAS_SLOTS];
+    // Inodes written since the last commit, as images rather than as tree
+    // nodes. A number of zero marks an empty slot, which no inode can hold
+    // because numbering starts at one.
+    u64 staged_num[ADYTUMFS_INODE_STAGE];
+    u8 staged_image[ADYTUMFS_INODE_STAGE][ADYTUMFS_INODE_SIZE];
+    u32 staged_next;
+    // The tree root this transaction started from, which is the one the
+    // committed generation names. Every root built since is garbage as soon
+    // as the next one lands; this one is not, because the superblock on the
+    // device still points at it and has to keep resolving until the flip.
+    // Empty until the first landing captures it, and cleared by the commit
+    // that supersedes it.
+    u8 txn_root[ADYTUMFS_HASH_SIZE];
 };
 
 // Bind a cache to an index run and drop whatever it was holding. The index has

@@ -24,7 +24,7 @@ int test_adytumfs_diriter64(void) {
     // A directory with four entries, one of which is then removed.
     u64 dir = 0;
     valid = valid &&
-        adytumfs_inode_alloc(dev, &super, ADYTUMFS_MODE_DIR | 0755u, &dir) == 0 &&
+        adytumfs_inode_alloc(dev, &super, &store, ADYTUMFS_MODE_DIR | 0755u, &dir) == 0 &&
         adytumfs_dir_add(dev, &super, &store, dir, "one", 3, 21, ADYTUMFS_DTYPE_REG) == 0 &&
         adytumfs_dir_add(dev, &super, &store, dir, "two", 3, 22, ADYTUMFS_DTYPE_DIR) == 0 &&
         adytumfs_dir_add(dev, &super, &store, dir, "three", 5, 23, ADYTUMFS_DTYPE_REG) == 0 &&
@@ -56,7 +56,7 @@ int test_adytumfs_diriter64(void) {
     // Iteration walks across multiple directory blocks.
     u64 big = 0;
     valid = valid &&
-        adytumfs_inode_alloc(dev, &super, ADYTUMFS_MODE_DIR | 0755u, &big) == 0;
+        adytumfs_inode_alloc(dev, &super, &store, ADYTUMFS_MODE_DIR | 0755u, &big) == 0;
     u8 longname[100];
     for (u32 index = 0; index < sizeof(longname); index++) longname[index] = 'q';
     for (u32 index = 0; index < 40 && valid; index++) {

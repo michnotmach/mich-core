@@ -50,7 +50,7 @@ int test_adytumfs_dir64(void) {
     // A fresh directory grows into a second block once entries overflow one.
     u64 dirnum = 0;
     valid = valid &&
-        adytumfs_inode_alloc(dev, &super, ADYTUMFS_MODE_DIR | 0755u, &dirnum) == 0;
+        adytumfs_inode_alloc(dev, &super, &store, ADYTUMFS_MODE_DIR | 0755u, &dirnum) == 0;
     u8 longname[100];
     for (u32 index = 0; index < sizeof(longname); index++) longname[index] = 'z';
     for (u32 index = 0; index < 40 && valid; index++) {
@@ -61,7 +61,7 @@ int test_adytumfs_dir64(void) {
     }
     struct adytumfs_inode grown;
     longname[0] = (u8)('a' + 20);
-    valid = valid && adytumfs_inode_read(dev, &super, dirnum, &grown) == 0 &&
+    valid = valid && adytumfs_inode_read(dev, &super, &store, dirnum, &grown) == 0 &&
         grown.blocks >= 2 &&
         adytumfs_dir_lookup(dev, &super, &store, dirnum, (const char *)longname,
                             sizeof(longname), &got) == 0 && got == 1020;

@@ -17,9 +17,8 @@
 #define CRASH_DISK_SECTORS (CRASH_VOLUME_BLOCKS * ADYTUMFS_SECTORS_PER_BLOCK)
 
 #define CRASH_FAULT_NONE 0
-#define CRASH_FAULT_TABLE 1
-#define CRASH_FAULT_BITMAP 2
-#define CRASH_FAULT_SUPER 3
+#define CRASH_FAULT_BITMAP 1
+#define CRASH_FAULT_SUPER 2
 
 // The image is 160 KiB and reused by every window, so it lives next to the
 // probe buffers of the other adytumfs tests rather than on the stack.
@@ -128,12 +127,6 @@ static u64 crash_inactive_bitmap(const struct adytumfs_superblock *super) {
     return super->total_blocks - 1 - super->block_bitmap_blocks;
 }
 
-static u64 crash_inactive_table(const struct adytumfs_superblock *super) {
-    if (super->active_slot) return super->inode_table_start;
-    return super->total_blocks - 1 - super->block_bitmap_blocks -
-           super->inode_table_blocks;
-}
-
 static const u8 crash_seed_payload[16] = {
     0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a,
     0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a,
@@ -221,10 +214,8 @@ static int crash_window(struct kernel_object *root, u32 kind, u32 allow,
     struct adytumfs_superblock super;
     ok = ok && !adytumfs_super_read(dev, &super) && super.generation == 2;
     if (ok && kind != CRASH_FAULT_NONE) {
-        u64 block = kind == CRASH_FAULT_TABLE ?
-            crash_inactive_table(&super) :
-            kind == CRASH_FAULT_BITMAP ? crash_inactive_bitmap(&super) :
-            crash_inactive_super(&super);
+        u64 block = kind == CRASH_FAULT_BITMAP ?
+            crash_inactive_bitmap(&super) : crash_inactive_super(&super);
         crash_plan.page = (u32)(block * ADYTUMFS_SECTORS_PER_BLOCK);
         crash_plan.allow = allow;
         crash_plan.armed = 1;
@@ -263,10 +254,8 @@ int test_adytumfs_crash64(void) {
 
     // A clean flip commits the new generation.
     valid = valid && !crash_window(root, CRASH_FAULT_NONE, 0, 0, 3, 1);
-    // A staged table block that never lands fails the commit before the
+    // A staged bitmap block that never lands fails the commit before the
     // flip, so the old generation survives.
-    valid = valid && !crash_window(root, CRASH_FAULT_TABLE, 0, 0, 2, 0);
-    // So does a staged bitmap block.
     valid = valid && !crash_window(root, CRASH_FAULT_BITMAP, 0, 0, 2, 0);
     // A superblock torn after its first sector fails the flip itself.
     valid = valid && !crash_window(root, CRASH_FAULT_SUPER, 1, 0, 2, 0);

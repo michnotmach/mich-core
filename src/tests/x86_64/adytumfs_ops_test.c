@@ -46,13 +46,13 @@ int test_adytumfs_ops64(void) {
     struct adytumfs_inode dir_born;
     struct adytumfs_inode root_born;
     valid = valid &&
-        adytumfs_inode_read(dev, &super, root, &root_born) == 0 &&
+        adytumfs_inode_read(dev, &super, &store, root, &root_born) == 0 &&
         root_born.atime && root_born.atime == root_born.mtime &&
         root_born.mtime == root_born.ctime && root_born.links == 2 &&
-        adytumfs_inode_read(dev, &super, readme, &born) == 0 &&
+        adytumfs_inode_read(dev, &super, &store, readme, &born) == 0 &&
         born.atime && born.atime == born.mtime && born.mtime == born.ctime &&
         born.links == 1 && born.uid == 0 && born.gid == 0 &&
-        adytumfs_inode_read(dev, &super, etc, &dir_born) == 0 &&
+        adytumfs_inode_read(dev, &super, &store, etc, &dir_born) == 0 &&
         dir_born.links == 2;
 
     // Duplicate names are refused.

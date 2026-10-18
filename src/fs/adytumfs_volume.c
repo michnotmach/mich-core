@@ -1,5 +1,8 @@
+#include "adytumfs_cas.h"
 #include "adytumfs_format.h"
+#include "crypto.h"
 #include "adytumfs_index.h"
+#include "adytumfs_item.h"
 #include "blake2b.h"
 #include "block.h"
 #include "cache.h"
@@ -68,23 +71,12 @@ int adytumfs_make(struct kernel_object *device) {
     u64 total_blocks = info.sector_count / ADYTUMFS_SECTORS_PER_BLOCK;
     const u64 bits_per_block = (u64)ADYTUMFS_BLOCK_SIZE * 8;
     u64 bitmap_blocks = (total_blocks + bits_per_block - 1) / bits_per_block;
-    // The table is bounded: the VFS mounts at most sixteen files, so a table
-    // for a few hundred inodes is generous headroom, and the cap keeps the
-    // format cost proportional on large volumes instead of zeroing a full
-    // thirty-second of the device through the block cache.
-    u64 inode_table_blocks = total_blocks / 32;
-    if (inode_table_blocks > ADYTUMFS_INODE_TABLE_BLOCKS_MAX)
-        inode_table_blocks = ADYTUMFS_INODE_TABLE_BLOCKS_MAX;
-    if (inode_table_blocks == 0) inode_table_blocks = 1;
-    u64 inode_table_start = 1 + bitmap_blocks;
-    u64 data_start = inode_table_start + inode_table_blocks;
-    // The tail from the last block backwards (shadow superblock, shadow
-    // bitmap, shadow table) must leave room past the prefix for at least one
-    // data block.
-    u64 tail_base = total_blocks - 1 - bitmap_blocks - inode_table_blocks;
+    u64 data_start = 1 + bitmap_blocks;
+    // The tail from the last block backwards (shadow superblock, then shadow
+    // bitmap) must leave room past the prefix for at least one data block.
+    u64 tail_base = total_blocks - 1 - bitmap_blocks;
     if (total_blocks < 1 || tail_base <= data_start) return -1;
 
-    u64 inode_count = inode_table_blocks * ADYTUMFS_INODES_PER_BLOCK;
     u64 data_blocks = tail_base - data_start;
     if (data_blocks == 0) return -1;
     // The location index is reserved out of the data region rather than put in
@@ -96,13 +88,9 @@ int adytumfs_make(struct kernel_object *device) {
     u64 index_blocks = index_capacity / ADYTUMFS_INDEX_PER_BLOCK + 2u;
     if (index_blocks * 2u > data_blocks) return -1;
     u64 index_start = data_start;
-    // The tail packs upward from where the checksum region ends: shadow
-    // table, then shadow bitmap, then the backup superblock in the last
-    // block. Starting the table at tail_base rather than below it keeps the
-    // region's last block from doubling as the table's first; the overlap
-    // was latent until the generation pair made the tail readable.
-    u64 shadow_table_start = tail_base;
-    u64 shadow_bitmap_start = tail_base + inode_table_blocks;
+    // The tail packs upward from the last block: the backup superblock in the
+    // last block, then the shadow bitmap below it.
+    u64 shadow_bitmap_start = tail_base;
 
     struct adytumfs_superblock super = {
         .format_version = ADYTUMFS_FORMAT_VERSION,
@@ -110,79 +98,109 @@ int adytumfs_make(struct kernel_object *device) {
         .total_blocks = total_blocks,
         .block_bitmap_start = 1,
         .block_bitmap_blocks = bitmap_blocks,
-        .inode_table_start = inode_table_start,
-        .inode_table_blocks = inode_table_blocks,
-        .inode_count = inode_count,
+        // Numbering starts at 1 and the root takes that slot, so the next
+        // number to hand out is one past it.
+        .inode_next = ADYTUMFS_ROOT_INODE + 1,
         .root_inode = ADYTUMFS_ROOT_INODE,
         .data_start = data_start,
         .free_blocks = data_blocks - index_blocks,
-        // Slot 0 is the null inode and the root occupies slot 1, so the
-        // free count starts two below the table size.
-        .free_inodes = inode_count - 2,
+        .live_inodes = 1,
         .generation = 1,
         .feature_compat = 0,
         .feature_incompat = ADYTUMFS_FEATURE_INCOMPAT_V3 |
-                            ADYTUMFS_FEATURE_INCOMPAT_NO_CKSUM_REGION,
+                            ADYTUMFS_FEATURE_INCOMPAT_NO_CKSUM_REGION |
+                            ADYTUMFS_FEATURE_INCOMPAT_ITEM_INODES,
         .feature_ro_compat = 0,
         .data_end = tail_base,
         .index_start = index_start,
         .index_blocks = index_blocks,
     };
 
-    // A 4 KiB staging block is too big for a modest stack, and the format path is
-    // single threaded, so it is static.
+    // A 4 KiB staging block is too big for a modest stack, and the format
+    // path is single threaded, so it is static.
     static u8 block[ADYTUMFS_BLOCK_SIZE];
-
-    adytumfs_super_pack(block, &super);
-    if (adytumfs_block_write(device, 0, block) ||
-        adytumfs_block_write(device, total_blocks - 1, block))
-        return -1;
 
     // The metadata prefix [0, data_start) and the whole tail from the checksum
     // region on are allocated; an empty root directory owns no data blocks yet.
     // Both bitmap copies carry the same map, so the shadow side starts life as
     // an exact twin of the primary.
     for (u64 bitmap = 0; bitmap < bitmap_blocks; bitmap++) {
-        for (u32 index = 0; index < ADYTUMFS_BLOCK_SIZE; index++) block[index] = 0;
+        for (u32 index = 0; index < ADYTUMFS_BLOCK_SIZE; index++)
+            block[index] = 0;
         u64 base = bitmap * bits_per_block;
         for (u64 used = 0; used < total_blocks; used++)
             if ((used < data_start || used >= tail_base ||
                  (used >= index_start && used < index_start + index_blocks)) &&
                 used >= base && used - base < bits_per_block)
                 block[(used - base) / 8] |= (u8)(1u << ((used - base) % 8));
-        if (adytumfs_block_write(device, super.block_bitmap_start + bitmap, block) ||
+        if (adytumfs_block_write(device, super.block_bitmap_start + bitmap,
+                                 block) ||
             adytumfs_block_write(device, shadow_bitmap_start + bitmap, block))
             return -1;
     }
 
-    // Both table copies hold the root, so a future commit that flips the
-    // active superblock starts from a complete shadow set.
-    for (u64 table = 0; table < inode_table_blocks; table++) {
-        for (u32 index = 0; index < ADYTUMFS_BLOCK_SIZE; index++) block[index] = 0;
-        if (table == 0) {
-            struct adytumfs_inode root = {0};
-            root.mode = ADYTUMFS_MODE_DIR | 0755u;
-            root.links = 2;
-            root.generation = 1;
-            u64 now = rtc64_wall_clock();
-            root.atime = now;
-            root.mtime = now;
-            root.ctime = now;
-            adytumfs_inode_pack(
-                block + ADYTUMFS_ROOT_INODE * ADYTUMFS_INODE_SIZE, &root);
-        }
-        if (adytumfs_block_write(device, inode_table_start + table, block) ||
-            adytumfs_block_write(device, shadow_table_start + table, block))
-            return -1;
-    }
-
-
-    // The index is formatted last, once the bitmap and the table exist, so it
-    // is written through the verified data path like everything else the tree
-    // will read.
+    // The index is formatted before the tree because the tree writes through
+    // it: a node has nowhere to land until its hash has a location.
     struct adytumfs_index index;
     adytumfs_index_init(&index, index_start, index_blocks);
     if (adytumfs_index_format(device, &index)) return -1;
+
+    // The root directory is the first item in the tree. Inserting it allocates
+    // from the bitmap written above, so the counts the superblock carries are
+    // only final once this has run.
+    struct adytumfs_cas store;
+    adytumfs_cas_open(&store, index_start, index_blocks);
+    struct adytumfs_inode root = {0};
+    root.mode = ADYTUMFS_MODE_DIR | 0755u;
+    root.links = 2;
+    root.generation = 1;
+    u64 now = rtc64_wall_clock();
+    root.atime = now;
+    root.mtime = now;
+    root.ctime = now;
+    static u8 root_slot[ADYTUMFS_INODE_SIZE];
+    adytumfs_inode_pack(root_slot, &root);
+    struct adytumfs_item_key key = {0};
+    key.objectid = ADYTUMFS_ROOT_INODE;
+    key.type = ADYTUMFS_ITEM_INODE;
+    // An empty tree is named by all zero bytes, which is what the insert
+    // tests for. adytumfs_zero_hash means the hash of a zeroed block, not a
+    // cleared buffer, and passing that here sends the first insert down a
+    // tree that does not exist yet.
+    u8 empty_root[ADYTUMFS_HASH_SIZE];
+    for (u32 byte = 0; byte < ADYTUMFS_HASH_SIZE; byte++) empty_root[byte] = 0;
+    if (adytumfs_item_insert(device, &super, &store, empty_root, &key,
+                             root_slot, ADYTUMFS_INODE_SIZE,
+                             super.inode_root))
+        return -1;
+
+    // The insert took a block from the allocator, which only moves the staged
+    // bitmap: nothing commits during a format, so the map on the device still
+    // shows that block free and the next allocation would hand it out and
+    // overwrite the tree the superblock is about to name. Mark it in both
+    // copies before the superblock exists to be interrupted.
+    u64 root_block = 0;
+    if (adytumfs_cas_lookup(device, &super, &store, super.inode_root,
+                            &root_block))
+        return -1;
+    u64 map_block = root_block / bits_per_block;
+    u64 map_bit = root_block % bits_per_block;
+    if (adytumfs_block_read(device, super.block_bitmap_start + map_block,
+                            block))
+        return -1;
+    block[map_bit / 8] |= (u8)(1u << (map_bit % 8));
+    if (adytumfs_block_write(device, super.block_bitmap_start + map_block,
+                             block) ||
+        adytumfs_block_write(device, shadow_bitmap_start + map_block, block))
+        return -1;
+
+    // Both superblock copies are written last, so a format interrupted before
+    // this leaves no superblock at all rather than one naming a tree that was
+    // never built.
+    adytumfs_super_pack(block, &super);
+    if (adytumfs_block_write(device, 0, block) ||
+        adytumfs_block_write(device, total_blocks - 1, block))
+        return -1;
 
     return block_cache_flush(device);
 }
@@ -202,15 +220,13 @@ static u8 adytumfs_committed_scratch[ADYTUMFS_BLOCK_SIZE];
 // several mounted volumes can hold windows side by side, and by block index
 // within the set rather than by device location, because which set is active
 // changes at every commit while the image content is what the window owns.
-// The pool always holds a volume's complete inode table (the format caps it
-// at sixteen blocks) plus every bitmap block the window has touched;
-// exhaustion means a window more fragmented than that, which the format
-// layer refuses rather than half-staging.
+// The pool holds every bitmap block the window has touched; exhaustion means
+// a window more fragmented than that, which the format layer refuses rather
+// than half-staging.
 #define ADYTUMFS_STAGING_POOL 32u
 
 struct adytumfs_staged {
     struct kernel_object *device;
-    u8 is_table;
     u8 index;
     u8 image[ADYTUMFS_BLOCK_SIZE];
 };
@@ -228,12 +244,6 @@ static u64 bitmap_slot_base(const struct adytumfs_superblock *super, u8 slot) {
     return super->total_blocks - 1 - super->block_bitmap_blocks;
 }
 
-static u64 table_slot_base(const struct adytumfs_superblock *super, u8 slot) {
-    if (!slot) return super->inode_table_start;
-    return super->total_blocks - 1 - super->block_bitmap_blocks -
-           super->inode_table_blocks;
-}
-
 // The device location of one bitmap or table block of the ACTIVE set: the
 // mount, the verify pass, and device-level tests all address the generation
 // that currently won, never a fixed copy.
@@ -245,15 +255,10 @@ u64 adytumfs_bitmap_block(const struct adytumfs_superblock *super, u32 index) {
     return bitmap_slot_base(super, super->active_slot) + index;
 }
 
-u64 adytumfs_table_block(const struct adytumfs_superblock *super, u32 index) {
-    return table_slot_base(super, super->active_slot) + index;
-}
-
 static struct adytumfs_staged *staging_find(struct kernel_object *device,
-                                            int is_table, u32 index) {
+                                            u32 index) {
     for (u32 entry = 0; entry < ADYTUMFS_STAGING_POOL; entry++)
         if (adytumfs_staging[entry].device == device &&
-            adytumfs_staging[entry].is_table == (u8)is_table &&
             adytumfs_staging[entry].index == (u8)index)
             return &adytumfs_staging[entry];
     return 0;
@@ -264,22 +269,18 @@ static struct adytumfs_staged *staging_find(struct kernel_object *device,
 // full or the device read fails.
 static struct adytumfs_staged *staging_claim(struct kernel_object *device,
                                              const struct adytumfs_superblock
-                                                 *super,
-                                             int is_table, u32 index) {
+                                                 *super, u32 index) {
     // The index travels in a byte; a bitmap block count beyond that belongs
     // to a volume larger than any device this kernel drives.
     if (index > 255u) return 0;
-    struct adytumfs_staged *entry = staging_find(device, is_table, index);
+    struct adytumfs_staged *entry = staging_find(device, index);
     if (entry) return entry;
     for (u32 scan = 0; scan < ADYTUMFS_STAGING_POOL; scan++) {
         entry = &adytumfs_staging[scan];
         if (entry->device) continue;
-        u64 block = is_table
-                        ? table_slot_base(super, super->active_slot) + index
-                        : bitmap_slot_base(super, super->active_slot) + index;
+        u64 block = bitmap_slot_base(super, super->active_slot) + index;
         if (adytumfs_block_read(device, block, entry->image)) return 0;
         entry->device = device;
-        entry->is_table = (u8)is_table;
         entry->index = (u8)index;
         return entry;
     }
@@ -292,36 +293,7 @@ void adytumfs_window_discard(struct kernel_object *device) {
             adytumfs_staging[entry].device = 0;
 }
 
-// Read one metadata block of the active set through the staging: a staged
-// block answers from the window's image, anything else from the device.
-int adytumfs_table_read(struct kernel_object *device,
-                        const struct adytumfs_superblock *super,
-                        u32 index, u8 *buffer) {
-    struct adytumfs_staged *entry = staging_find(device, 1, index);
-    if (entry) {
-        for (u32 byte = 0; byte < ADYTUMFS_BLOCK_SIZE; byte++)
-            buffer[byte] = entry->image[byte];
-        return 0;
-    }
-    return adytumfs_block_read(device, table_slot_base(super,
-                                                       super->active_slot) +
-                                          index,
-                               buffer);
-}
-
-// Write one inode table block into the staging. The device copy belongs to
-// the committed generation and is only replaced whole, by the commit.
-int adytumfs_table_stage(struct kernel_object *device,
-                         const struct adytumfs_superblock *super,
-                         u32 index, const u8 *buffer) {
-    struct adytumfs_staged *entry = staging_claim(device, super, 1, index);
-    if (!entry) return -1;
-    for (u32 byte = 0; byte < ADYTUMFS_BLOCK_SIZE; byte++)
-        entry->image[byte] = buffer[byte];
-    return 0;
-}
-
-// Read one allocation bit through the staging (see adytumfs_table_read).
+// Read one allocation bit through the staging.
 static int adytumfs_bit_test(struct kernel_object *device,
                              const struct adytumfs_superblock *super,
                              u64 block) {
@@ -329,7 +301,7 @@ static int adytumfs_bit_test(struct kernel_object *device,
     u64 bitmap = block / bits_per_block;
     u64 offset = block % bits_per_block;
     if (bitmap >= super->block_bitmap_blocks) return -1;
-    struct adytumfs_staged *entry = staging_find(device, 0, (u32)bitmap);
+    struct adytumfs_staged *entry = staging_find(device, (u32)bitmap);
     if (entry) {
         return (entry->image[offset / 8] >> (offset % 8)) & 1;
     }
@@ -370,7 +342,7 @@ static int adytumfs_bit_write(struct kernel_object *device,
     u64 offset = block % bits_per_block;
     if (bitmap >= super->block_bitmap_blocks) return -1;
     struct adytumfs_staged *entry =
-        staging_claim(device, super, 0, (u32)bitmap);
+        staging_claim(device, super, (u32)bitmap);
     if (!entry) return -1;
     if (used)
         entry->image[offset / 8] |= (u8)(1u << (offset % 8));
@@ -399,7 +371,7 @@ int adytumfs_alloc_run(struct kernel_object *device,
         // The staging may have freed this block within the window while the
         // committed generation on the device still references its old image,
         // so only a block the committed bitmap released as well is reusable.
-        if (staging_find(device, 0,
+        if (staging_find(device,
                          (u32)(block / ((u64)ADYTUMFS_BLOCK_SIZE * 8)))) {
             int committed = adytumfs_bit_committed(device, super, block);
             if (committed < 0) return -1;
@@ -436,25 +408,78 @@ int adytumfs_free_run(struct kernel_object *device,
     return 0;
 }
 
+int adytumfs_superblock_slot_root(struct kernel_object *device,
+                                  const struct adytumfs_superblock *super,
+                                  u8 slot, u8 root[ADYTUMFS_HASH_SIZE]) {
+    if (!device || !super || !root || slot > 1u) return 0;
+    static u8 block[ADYTUMFS_BLOCK_SIZE];
+    for (u32 index = 0; index < ADYTUMFS_HASH_SIZE; index++) root[index] = 0;
+    if (adytumfs_block_read(device, superblock_slot(super->total_blocks, slot),
+                            block))
+        return 0;
+    struct adytumfs_superblock held;
+    if (adytumfs_super_unpack(&held, block)) return 0;
+    if (adytumfs_super_valid(&held, super->total_blocks)) return 0;
+    for (u32 index = 0; index < ADYTUMFS_HASH_SIZE; index++)
+        root[index] = held.inode_root[index];
+    return 1;
+}
+
 int adytumfs_commit(struct kernel_object *device,
-                    struct adytumfs_superblock *super) {
-    if (!device || !super) return -1;
+                    struct adytumfs_superblock *super,
+                    struct adytumfs_cas *store) {
+    if (!device || !super || !store) return -1;
+    // Inodes written since the last commit are still images in the store.
+    // They have to reach the tree before the window is counted, both so the
+    // flip cannot name a tree they never reached and so the blocks landing
+    // them are part of the generation being written. A transaction that
+    // touched nothing but inodes would otherwise look empty and not commit.
+    if (adytumfs_inode_flush(device, super, store)) return -1;
     u8 inactive = super->active_slot ? 0 : 1;
+    // The root the overwritten slot names is a candidate for collection, but
+    // only if no superblock left on the device still names it. The two slots
+    // hold two generations, and a freshly formatted volume holds the same one
+    // in both, so the root the slot being written names can still be the one
+    // the other slot falls back to; dropping it there would break the copy a
+    // torn flip is supposed to recover to. The surviving slot is read from
+    // the device rather than taken from the in-memory superblock, which has
+    // already moved on to the root this commit is about to land.
+    //
+    // Collecting here, before the window is counted, puts the blocks it frees
+    // into this same commit: a crash before the flip leaves them staged and
+    // both generations on the device still resolve.
     int staged = 0;
     for (u32 entry = 0; entry < ADYTUMFS_STAGING_POOL; entry++)
         if (adytumfs_staging[entry].device == device) staged = 1;
     // A window that staged nothing has nothing to land: skipping the flip
     // keeps read-only mounts from bumping the generation on their way out.
+    // Collection has to wait for that verdict. Dropping the superseded root
+    // first would destroy a generation in a commit that then decides not to
+    // happen, and the device would keep naming blocks nothing accounts for.
     if (!staged) return 0;
+    u8 prior_root[ADYTUMFS_HASH_SIZE];
+    u8 kept_root[ADYTUMFS_HASH_SIZE];
+    adytumfs_superblock_slot_root(device, super, super->active_slot, kept_root);
+    // A prior root the index no longer maps was collected by an earlier
+    // attempt at this same generation: a commit that fails after the drop
+    // leaves it released, and the retry that follows finds nothing to let go
+    // of. Treating that as an error would stop the flip on a volume that is
+    // already consistent.
+    u32 prior_refs = 0;
+    if (adytumfs_superblock_slot_root(device, super, inactive, prior_root) &&
+        !adytumfs_item_root_empty(prior_root) &&
+        !crypto_equal(prior_root, super->inode_root, ADYTUMFS_HASH_SIZE) &&
+        !crypto_equal(prior_root, kept_root, ADYTUMFS_HASH_SIZE) &&
+        !adytumfs_cas_refs(device, super, store, prior_root, &prior_refs) &&
+        adytumfs_item_drop(device, super, store, prior_root))
+        return -1;
     // The staged blocks are the next generation's metadata set; the active
     // set on the device stays untouched so the current generation survives
     // every crash point below.
     for (u32 entry = 0; entry < ADYTUMFS_STAGING_POOL; entry++) {
         struct adytumfs_staged *slot = &adytumfs_staging[entry];
         if (slot->device != device) continue;
-        u64 block = slot->is_table
-                        ? table_slot_base(super, inactive) + slot->index
-                        : bitmap_slot_base(super, inactive) + slot->index;
+        u64 block = bitmap_slot_base(super, inactive) + slot->index;
         if (adytumfs_block_write(device, block, slot->image)) return -1;
     }
     // Land every dirty sector of this device before the flip exists on it.
@@ -485,6 +510,11 @@ int adytumfs_commit(struct kernel_object *device,
         return -1;
     }
     *super = next;
+    // The root this transaction started from has just become the one the
+    // overwritten slot no longer names, so the next transaction captures its
+    // own instead of protecting a generation that is gone.
+    for (u32 index = 0; index < ADYTUMFS_HASH_SIZE; index++)
+        store->txn_root[index] = 0;
     adytumfs_window_discard(device);
     return 0;
 }

@@ -4,6 +4,7 @@
 #include "adytumfs_format.h"
 #include "adytumfs_cas.h"
 #include "adytumfs_index.h"
+#include "adytumfs_item.h"
 #include "blake2b.h"
 
 // The mount audit is the last thing standing between a damaged volume and a
@@ -31,18 +32,56 @@ static int super_rewrite(struct kernel_object *dev,
     return adytumfs_block_write(dev, adytumfs_superblock_block(super), scratch);
 }
 
-// Rewrite one slot straight onto the device, past the window, so the audit
-// reads the forgery rather than a staged copy of it.
-static int inode_rewrite(struct kernel_object *dev,
-                         const struct adytumfs_superblock *super, u64 number,
-                         const struct adytumfs_inode *in, u8 *scratch) {
-    u32 which = adytumfs_table_block(super,
-                                     (u32)(number / ADYTUMFS_INODES_PER_BLOCK));
-    if (adytumfs_block_read(dev, which, scratch)) return -1;
-    adytumfs_inode_pack(
-        scratch + (number % ADYTUMFS_INODES_PER_BLOCK) * ADYTUMFS_INODE_SIZE,
-        in);
-    return adytumfs_block_write(dev, which, scratch);
+// Publish a copy of the leaf holding one inode with a different image behind
+// it, as the next generation. Content addressing means a bare byte flip is
+// caught by the node hash before the audit ever reads the item, so a lie that
+// has to reach the audit's own checks needs a hash that matches what it holds.
+// The allocation moves the bitmap and the free count together, so the ledger
+// still balances and the only thing left disagreeing is the inode itself.
+//
+// The same call repairs the volume afterwards, by publishing the true image
+// over the lie. Nothing rewinds a committed generation: a root captured before
+// the forgery names blocks that two commits later belong to nobody, and the
+// collector has already handed them back.
+static int inode_republish(struct kernel_object *dev,
+                       struct adytumfs_superblock *super,
+                       struct adytumfs_cas *store, u64 number,
+                       const struct adytumfs_inode *in, u8 *scratch) {
+    u64 node = 0;
+    if (adytumfs_cas_lookup(dev, super, store, super->inode_root, &node))
+        return -1;
+    if (adytumfs_block_read(dev, node, scratch)) return -1;
+    struct adytumfs_item_key key = {0};
+    key.objectid = number;
+    key.type = ADYTUMFS_ITEM_INODE;
+    int at = adytumfs_item_node_search(scratch, &key);
+    if (at < 0) return -1;
+    const u8 *item = 0;
+    struct adytumfs_item_key found = {0};
+    u32 size = 0;
+    if (adytumfs_item_leaf_get(scratch, (u32)at, &found, &item, &size))
+        return -1;
+    adytumfs_inode_pack(scratch + (u32)(item - scratch), in);
+    u8 hash[ADYTUMFS_HASH_SIZE];
+    if (adytumfs_item_node_hash(scratch, hash)) return -1;
+    // Publishing the true image over a lie lands on a hash the volume already
+    // holds, and a second block with the same bytes is exactly what content
+    // addressing exists to avoid. Reusing the mapping is what makes repairing
+    // forward possible at all.
+    u64 placed = 0;
+    if (adytumfs_cas_lookup(dev, super, store, hash, &placed)) {
+        if (adytumfs_alloc_run(dev, super, 1, &placed)) return -1;
+        if (adytumfs_block_write(dev, placed, scratch)) return -1;
+        if (adytumfs_index_insert(dev, &store->index, hash, placed)) return -1;
+    }
+    for (u32 byte = 0; byte < ADYTUMFS_HASH_SIZE; byte++)
+        super->inode_root[byte] = hash[byte];
+    // The audit reads the root the device names, and a mount only ever gets
+    // one that came off the device. Committing is what makes the new leaf a
+    // generation the volume really holds: left mid-transaction, the block sits
+    // in the staging bitmap alone and the committed generation the audit walks
+    // has never heard of it.
+    return adytumfs_commit(dev, super, store);
 }
 
 int test_adytumfs_verify64(void) {
@@ -72,13 +111,13 @@ int test_adytumfs_verify64(void) {
     u64 second = 0;
     struct adytumfs_inode file;
     valid = valid &&
-        adytumfs_inode_alloc(dev, &super, ADYTUMFS_MODE_REG | 0644u,
-                             &number) == 0 &&
-        adytumfs_inode_read(dev, &super, number, &file) == 0 &&
-        adytumfs_inode_alloc(dev, &super, ADYTUMFS_MODE_REG | 0644u,
-                             &second) == 0 &&
+        adytumfs_inode_alloc(dev, &super, &store,
+                             ADYTUMFS_MODE_REG | 0644u, &number) == 0 &&
+        adytumfs_inode_read(dev, &super, &store, number, &file) == 0 &&
+        adytumfs_inode_alloc(dev, &super, &store,
+                             ADYTUMFS_MODE_REG | 0644u, &second) == 0 &&
         adytumfs_inode_grow(dev, &super, &store, &file, number, 3) == 0 &&
-        adytumfs_commit(dev, &super) == 0 &&
+        adytumfs_commit(dev, &super, &store) == 0 &&
         // The commit flips the active slot, and unpack always guesses slot
         // zero, so the generation has to be picked the way the mount picks it
         // or the audit reads one generation's numbers against another's data.
@@ -154,23 +193,32 @@ int test_adytumfs_verify64(void) {
         adytumfs_verify(dev, &super) == 0;
 
     // The inode counter is audited the same way: a volume that claims a
-    // different number of free slots than the table holds is lying about one
+    // different number of live inodes than the tree holds is lying about one
     // of the two.
     struct adytumfs_superblock inodes_lie = super;
-    inodes_lie.free_inodes = super.free_inodes - 1;
+    inodes_lie.live_inodes = super.live_inodes - 1;
     valid = valid && super_rewrite(dev, &inodes_lie, block) == 0 &&
         adytumfs_super_read(dev, &probe) == 0 &&
         adytumfs_verify(dev, &probe) != 0 &&
         super_rewrite(dev, &super, block) == 0 &&
         adytumfs_verify(dev, &super) == 0;
 
-    // A mode that is neither directory, regular, nor symlink is a table lying
+    // The forgery scenarios below read the volume the way a mount does, so
+    // they need it at a transaction boundary. Mid-transaction the root the
+    // committed generation names is still on the device and still allocated,
+    // but nothing reaching from the in-memory root gets there, and the
+    // rebuild would report it as a leak the collection walk missed.
+    valid = valid && adytumfs_commit(dev, &super, &store) == 0;
+
+    // A mode that is neither directory, regular, nor symlink is a tree lying
     // about what it holds.
     struct adytumfs_inode odd = file;
     odd.mode = 0777u;
-    valid = valid && inode_rewrite(dev, &super, number, &odd, block) == 0 &&
-        adytumfs_verify(dev, &super) != 0 &&
-        inode_rewrite(dev, &super, number, &file, block) == 0 &&
+    valid = valid &&
+        inode_republish(dev, &super, &store, number, &odd, block) == 0 &&
+        adytumfs_verify(dev, &super) != 0;
+    valid = valid &&
+        inode_republish(dev, &super, &store, number, &file, block) == 0 &&
         adytumfs_verify(dev, &super) == 0;
 
     // The v2 case for an extent behind the zero length terminator has no
@@ -181,10 +229,13 @@ int test_adytumfs_verify64(void) {
     // that believes it is longer than the space it holds.
     struct adytumfs_inode short_count = file;
     short_count.blocks = 2;
+
     valid = valid &&
-        inode_rewrite(dev, &super, number, &short_count, block) == 0 &&
-        adytumfs_verify(dev, &super) != 0 &&
-        inode_rewrite(dev, &super, number, &file, block) == 0 &&
+        inode_republish(dev, &super, &store, number, &short_count,
+                        block) == 0 &&
+        adytumfs_verify(dev, &super) != 0;
+    valid = valid &&
+        inode_republish(dev, &super, &store, number, &file, block) == 0 &&
         adytumfs_verify(dev, &super) == 0;
 
 

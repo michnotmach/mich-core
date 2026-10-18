@@ -23,7 +23,7 @@ int test_adytumfs_file64(void) {
 
     u64 num = 0;
     valid = valid &&
-        adytumfs_inode_alloc(dev, &super, ADYTUMFS_MODE_REG | 0644u, &num) == 0;
+        adytumfs_inode_alloc(dev, &super, &store, ADYTUMFS_MODE_REG | 0644u, &num) == 0;
 
     // Write a 70000-byte file, past the old 64 KiB cap, in 512-byte chunks so no
     // huge buffer is needed. The byte at file position p is deterministic.
@@ -40,7 +40,7 @@ int test_adytumfs_file64(void) {
     }
 
     struct adytumfs_inode inode;
-    valid = valid && adytumfs_inode_read(dev, &super, num, &inode) == 0 &&
+    valid = valid && adytumfs_inode_read(dev, &super, &store, num, &inode) == 0 &&
         inode.size == total && inode.blocks >= 18;
 
     // Read it back in chunks and verify the pattern survived the extents.

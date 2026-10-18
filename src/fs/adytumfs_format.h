@@ -55,7 +55,6 @@ static inline void adytumfs_write_le64(u8 *p, u64 value) {
 // v1 bounds the inode table at sixteen blocks (256 inodes at sixteen per
 // block); the formatter caps at the same value, so a bigger table is a volume
 // this format never wrote.
-#define ADYTUMFS_INODE_TABLE_BLOCKS_MAX 16u
 // One u32 crc32c per data block lives in the checksum region, so a 4 KiB
 // region block covers 1024 data blocks.
 #define ADYTUMFS_CHECKSUMS_PER_BLOCK (ADYTUMFS_BLOCK_SIZE / 4u)
@@ -72,6 +71,10 @@ static inline void adytumfs_write_le64(u8 *p, u64 value) {
 // bit and must refuse to mount rather than be read with the wrong
 // span.
 #define ADYTUMFS_FEATURE_INCOMPAT_NO_CKSUM_REGION 0x4u
+// Inodes live in the item tree and there is no fixed table on the volume. The
+// two slots that held the table are reserved and must read as zero, so a
+// volume written before this has no path here and says so itself.
+#define ADYTUMFS_FEATURE_INCOMPAT_ITEM_INODES 0x8u
 
 // The superblock lives in block 0 (a backup copy in the last block). Its
 // checksum is the last field and covers every byte before it, so it never has
@@ -100,13 +103,19 @@ struct adytumfs_superblock {
     u64 total_blocks;
     u64 block_bitmap_start;
     u64 block_bitmap_blocks;
-    u64 inode_table_start;
-    u64 inode_table_blocks;
-    u64 inode_count;
+    // The next inode number to hand out, and the only allocation state the
+    // format carries. Numbers are never reused, so a stale handle cannot
+    // resolve into a different file and there is no free list to scan:
+    // allocating reads this and adds one, which is what keeps a 64K inode
+    // volume from turning creation into a scan of every inode before it.
+    u64 inode_next;
     u64 root_inode;
     u64 data_start;
     u64 free_blocks;
-    u64 free_inodes;
+    // How many inodes the tree holds. Recomputed by the audit from a walk and
+    // compared, so a superblock that disagrees with its own tree fails the
+    // mount rather than being believed.
+    u64 live_inodes;
     u64 generation;
     u64 feature_compat;
     u64 feature_incompat;
@@ -118,6 +127,10 @@ struct adytumfs_superblock {
     // it had.
     u64 index_start;
     u64 index_blocks;
+    // Root of the item tree holding every inode, keyed by inode number. All
+    // zero is a tree with nothing in it. The root lives here rather than in an
+    // inode of its own because reading it must not need an inode read first.
+    u8 inode_root[ADYTUMFS_HASH_SIZE];
     // Which superblock slot this copy came from: 0 is block 0, 1 is the tail
     // copy in the last block. Runtime state only, never serialised; the
     // reader defaults it to the primary slot and the mount picker overrides
@@ -184,12 +197,28 @@ int adytumfs_super_read(struct kernel_object *device,
 // Land the open window: copy the staged bitmap and inode table blocks into
 // the inactive metadata set, flush, then write the inactive superblock with
 // generation plus one and flush again. The superblock write is the flip, so
+// Land every inode the store is holding for this transaction. The commit
+// does this itself; it is exposed so a caller that reads the tree through a
+// second store can force the first one's writes to be visible to it.
+int adytumfs_inode_flush(struct kernel_object *device,
+                         struct adytumfs_superblock *super,
+                         struct adytumfs_cas *store);
+
 // a crash before it leaves the old generation intact and a crash during it
 // leaves a checksum-failed superblock the mount picker refuses. On failure
 // the staging and the in-memory superblock stay untouched, so the commit can
 // simply be retried. A window with nothing staged commits nothing.
+// The inode tree root one of the two superblock copies names, or all zeroes
+// when that copy holds nothing this format can read. Both copies are on the
+// device and either is the one a mount falls back to, so both trees are live
+// and anything reasoning about what the device references needs both.
+int adytumfs_superblock_slot_root(struct kernel_object *device,
+                                  const struct adytumfs_superblock *super,
+                                  u8 slot, u8 root[ADYTUMFS_HASH_SIZE]);
+
 int adytumfs_commit(struct kernel_object *device,
-                    struct adytumfs_superblock *super);
+                    struct adytumfs_superblock *super,
+                    struct adytumfs_cas *store);
 // Drop the staged metadata for a device without landing it, the in-memory
 // equivalent of a crash inside the window: the device keeps the last
 // committed generation. The mount path calls this defensively before it reads,
@@ -218,22 +247,11 @@ int adytumfs_block_zero(struct kernel_object *device, u64 block);
 // backup), the block bitmap, and an empty root directory.
 int adytumfs_make(struct kernel_object *device);
 
-// The device location of one bitmap or inode table block of the active
-// metadata set, so callers never hardcode the primary prefix against a
-// generation pair that may have flipped to the tail copy.
+// The device location of one bitmap block of the active metadata set, so
+// callers never hardcode the primary prefix against a generation pair that may
+// have flipped to the tail copy.
 u64 adytumfs_superblock_block(const struct adytumfs_superblock *super);
 u64 adytumfs_bitmap_block(const struct adytumfs_superblock *super, u32 index);
-u64 adytumfs_table_block(const struct adytumfs_superblock *super, u32 index);
-// Read one inode table block of the active metadata set, passing through the
-// open window's staging, or stage one into the window. The device copy of a
-// staged table block belongs to the committed generation until the commit
-// replaces the whole set.
-int adytumfs_table_read(struct kernel_object *device,
-                        const struct adytumfs_superblock *super,
-                        u32 index, u8 *buffer);
-int adytumfs_table_stage(struct kernel_object *device,
-                         const struct adytumfs_superblock *super,
-                         u32 index, const u8 *buffer);
 
 // Allocate a contiguous run of length data blocks (first-fit) and return its
 // start block, or free a previously allocated run. Data blocks live in
@@ -250,23 +268,28 @@ int adytumfs_free_run(struct kernel_object *device,
                       struct adytumfs_superblock *super,
                       u64 start, u64 length);
 
-// Read or write one inode by number from the inode table. Reads pass through
-// the open window's staging first; writes read-modify-write the 4 KiB table
-// block into the staging, so the committed table on the device is only ever
-// replaced by the whole committed generation at commit time.
+// Read or write one inode by number. An inode is an item in the tree keyed by
+// its number, so a write rewrites the path from the root and lands a new root
+// in the superblock, which is what the commit publishes. Both take a non-const
+// superblock because the root they resolve through and replace lives in it.
 int adytumfs_inode_read(struct kernel_object *device,
-                        const struct adytumfs_superblock *super,
-                        u64 inode_num, struct adytumfs_inode *out);
+                        struct adytumfs_superblock *super,
+                        struct adytumfs_cas *store, u64 inode_num,
+                        struct adytumfs_inode *out);
 int adytumfs_inode_write(struct kernel_object *device,
-                         const struct adytumfs_superblock *super,
-                         u64 inode_num, const struct adytumfs_inode *in);
-// Allocate the first free inode slot, initialised with mode and link count 1 and
-// a bumped generation, or free an inode. super->free_inodes is kept current.
+                         struct adytumfs_superblock *super,
+                         struct adytumfs_cas *store, u64 inode_num,
+                         const struct adytumfs_inode *in);
+// Allocate the next inode number, which is never reused, initialised with mode
+// and link count 1, or drop an inode from the tree entirely.
+// super->inode_next and super->live_inodes are kept current.
 int adytumfs_inode_alloc(struct kernel_object *device,
                          struct adytumfs_superblock *super,
-                         u16 mode, u64 *inode_num);
+                         struct adytumfs_cas *store, u16 mode,
+                         u64 *inode_num);
 int adytumfs_inode_free(struct kernel_object *device,
-                        struct adytumfs_superblock *super, u64 inode_num);
+                        struct adytumfs_superblock *super,
+                        struct adytumfs_cas *store, u64 inode_num);
 
 // Mount time audit of the allocation state: every used inode's extents must
 // stay inside the data region, no two extents may share a block, the bitmap

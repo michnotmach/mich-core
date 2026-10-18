@@ -53,13 +53,14 @@ int test_adytumfs_cas64(void) {
         adytumfs_block_read(dev, 0, block) == 0 &&
         adytumfs_super_unpack(&super, block) == 0;
 
-    // The index is the one mkfs reserved, not one the test carved out, and a
-    // fresh volume has to start with it empty.
+    // The index is the one mkfs reserved, not one the test carved out. It is
+    // not empty on a fresh volume any more: formatting builds the tree that
+    // holds the root inode, and that one leaf is the only mapping in it.
     struct adytumfs_index layout;
-    u64 fresh = 1;
+    u64 fresh = 0;
     adytumfs_index_init(&layout, super.index_start, super.index_blocks);
     valid = valid && super.index_blocks > 1 &&
-        adytumfs_index_live(dev, &layout, &fresh) == 0 && fresh == 0;
+        adytumfs_index_live(dev, &layout, &fresh) == 0 && fresh == 1;
     adytumfs_cas_open(&store, super.index_start, super.index_blocks);
 
     u8 key_a[ADYTUMFS_CAS_HASH_SIZE];
@@ -67,11 +68,16 @@ int test_adytumfs_cas64(void) {
     cas_key(1, key_a);
     cas_key(2, key_b);
 
+    // A key nobody placed resolves to nothing. The count is not zero on a
+    // fresh volume: the leaf holding the root inode is already mapped.
     u64 unknown = 0;
     valid = valid &&
         adytumfs_cas_lookup(dev, &super, &store, key_a, &unknown) != 0 &&
-        cas_live(dev, &super, &store) == 0;
+        cas_live(dev, &super, &store) == 1;
 
+    // The leaf holding the root inode is mapped from the moment the
+    // volume exists, so every count below starts from one rather than
+    // from an empty index.
     u64 free0 = super.free_blocks;
     u64 block_a = 0;
     u64 block_a_again = 0;
@@ -80,7 +86,7 @@ int test_adytumfs_cas64(void) {
     // The first acquire costs exactly one block.
     valid = valid &&
         adytumfs_cas_acquire(dev, &super, &store, key_a, &block_a) == 0 &&
-        super.free_blocks == free0 - 1 && cas_live(dev, &super, &store) == 1;
+        super.free_blocks == free0 - 1 && cas_live(dev, &super, &store) == 2;
 
     // The second acquire of the same content costs nothing and lands on the
     // same block. This is the assertion the whole design rests on: sharing is
@@ -88,13 +94,13 @@ int test_adytumfs_cas64(void) {
     valid = valid &&
         adytumfs_cas_acquire(dev, &super, &store, key_a, &block_a_again) == 0 &&
         block_a_again == block_a && super.free_blocks == free0 - 1 &&
-        cas_live(dev, &super, &store) == 1;
+        cas_live(dev, &super, &store) == 2;
 
     // Different content is a different block.
     valid = valid &&
         adytumfs_cas_acquire(dev, &super, &store, key_b, &block_b) == 0 &&
         block_b != block_a && super.free_blocks == free0 - 2 &&
-        cas_live(dev, &super, &store) == 2;
+        cas_live(dev, &super, &store) == 3;
 
     cas_image(1, block);
     valid = valid && adytumfs_block_write(dev, block_a, block) == 0;
@@ -118,17 +124,17 @@ int test_adytumfs_cas64(void) {
     // the block exactly once.
     valid = valid &&
         adytumfs_cas_release(dev, &super, &store, key_a) == 0 &&
-        super.free_blocks == free0 - 2 && cas_live(dev, &super, &store) == 2;
+        super.free_blocks == free0 - 2 && cas_live(dev, &super, &store) == 3;
     valid = valid &&
         adytumfs_cas_release(dev, &super, &store, key_a) == 0 &&
-        super.free_blocks == free0 - 1 && cas_live(dev, &super, &store) == 1;
+        super.free_blocks == free0 - 1 && cas_live(dev, &super, &store) == 2;
     valid = valid &&
         adytumfs_cas_lookup(dev, &super, &store, key_a, &found) != 0 &&
         adytumfs_cas_release(dev, &super, &store, key_a) != 0;
 
     valid = valid &&
         adytumfs_cas_release(dev, &super, &store, key_b) == 0 &&
-        super.free_blocks == free0 && cas_live(dev, &super, &store) == 0;
+        super.free_blocks == free0 && cas_live(dev, &super, &store) == 1;
 
     // More mappings than there are cache slots. Under the old table this loop
     // could not run at all: it stopped at the size of the array and refused
@@ -140,7 +146,7 @@ int test_adytumfs_cas64(void) {
         valid = valid &&
             adytumfs_cas_place(dev, &super, &store, key, &spare) == 0;
     }
-    valid = valid && cas_live(dev, &super, &store) == CAS_TEST_MANY;
+    valid = valid && cas_live(dev, &super, &store) == CAS_TEST_MANY + 1;
 
     // Every one of them still resolves, including the ones the cache had to
     // throw away to make room. A miss has to cost a read of the index and
@@ -156,7 +162,7 @@ int test_adytumfs_cas64(void) {
     // Dropping the cache entirely is the strongest form of the same claim:
     // nothing lives in memory that the index does not also hold.
     adytumfs_cas_open(&store, super.index_start, super.index_blocks);
-    valid = valid && cas_live(dev, &super, &store) == CAS_TEST_MANY;
+    valid = valid && cas_live(dev, &super, &store) == CAS_TEST_MANY + 1;
     for (u32 index = 0; index < CAS_TEST_MANY; index++) {
         u64 where = 0;
         u32 refs = 9u;
@@ -174,10 +180,10 @@ int test_adytumfs_cas64(void) {
         adytumfs_cas_retain(dev, &super, &store, key) == 0 &&
         adytumfs_cas_release(dev, &super, &store, key) == 0 &&
         adytumfs_cas_lookup(dev, &super, &store, key, &found) != 0 &&
-        cas_live(dev, &super, &store) == CAS_TEST_MANY - 1u;
+        cas_live(dev, &super, &store) == CAS_TEST_MANY;
     valid = valid &&
         adytumfs_cas_acquire(dev, &super, &store, key, &spare) == 0 &&
-        cas_live(dev, &super, &store) == CAS_TEST_MANY;
+        cas_live(dev, &super, &store) == CAS_TEST_MANY + 1;
     for (u32 index = 0; index < CAS_TEST_MANY; index++) {
         u64 where = 0;
         cas_key(index + 100u, key);

@@ -11,7 +11,7 @@ int adytumfs_file_read(struct kernel_object *device,
                        u64 offset, void *buffer, u64 length, u64 *out_read) {
     if (!out_read) return -1;
     struct adytumfs_inode inode;
-    if (adytumfs_inode_read(device, super, inode_num, &inode)) return -1;
+    if (adytumfs_inode_read(device, super, store, inode_num, &inode)) return -1;
     if ((inode.mode & ADYTUMFS_MODE_REG) == 0) return -1;
     if (offset >= inode.size) {
         *out_read = 0;
@@ -45,7 +45,7 @@ int adytumfs_file_write(struct kernel_object *device,
                         u64 *out_written) {
     if (!out_written) return -1;
     struct adytumfs_inode inode;
-    if (adytumfs_inode_read(device, super, inode_num, &inode)) return -1;
+    if (adytumfs_inode_read(device, super, store, inode_num, &inode)) return -1;
     if ((inode.mode & ADYTUMFS_MODE_REG) == 0) return -1;
     if (length == 0) {
         *out_written = 0;
@@ -91,7 +91,8 @@ int adytumfs_file_write(struct kernel_object *device,
     u64 now = rtc64_wall_clock();
     inode.mtime = now;
     inode.ctime = now;
-    if (adytumfs_inode_write(device, super, inode_num, &inode)) return -1;
+    if (adytumfs_inode_write(device, super, store, inode_num, &inode))
+        return -1;
     *out_written = done;
     return 0;
 }

@@ -1,4 +1,6 @@
 #include "adytumfs_format.h"
+#include "crypto.h"
+#include "adytumfs_item.h"
 #include "adytumfs_tree.h"
 #include "blake2b.h"
 #include "crc32c.h"
@@ -28,7 +30,8 @@ void adytumfs_inode_pack(u8 *slot, const struct adytumfs_inode *inode) {
 
 int adytumfs_inode_unpack(struct adytumfs_inode *inode, const u8 *slot) {
     u16 mode = adytumfs_read_le16(slot + 0);
-    // A free slot has no meaningful checksum, so only in-use inodes are checked.
+    // An all zero image carries no meaningful checksum, so only an image
+    // with a mode set is checked.
     if (mode && adytumfs_read_le32(slot + ADYTUMFS_INODE_CHECKSUM_OFFSET) !=
         crc32c(slot, ADYTUMFS_INODE_CHECKSUM_OFFSET))
         return -1;
@@ -51,87 +54,179 @@ int adytumfs_inode_unpack(struct adytumfs_inode *inode, const u8 *slot) {
     return 0;
 }
 
-// One staging block for the inode table read-modify-write; the single-CPU
-// filesystem owns it for the duration of one call, and the block cache keeps
-// repeats cheap.
-static u8 adytumfs_inode_scratch[ADYTUMFS_BLOCK_SIZE];
+static void root_copy(u8 *to, const u8 *from) {
+    for (u32 index = 0; index < ADYTUMFS_HASH_SIZE; index++)
+        to[index] = from[index];
+}
+
+// An inode is one item in the metadata tree, keyed by its own number. The key
+// is assembled in one place because four callers need the same fields, and a
+// spare left uninitialised would order the item away from its own lookups.
+static void inode_key(struct adytumfs_item_key *key, u64 inode_num) {
+    key->objectid = inode_num;
+    key->offset = 0;
+    key->type = ADYTUMFS_ITEM_INODE;
+    key->spare = 0;
+}
+
+// Where an inode is being held, or -1 when it is not.
+static int stage_find(struct adytumfs_cas *store, u64 inode_num) {
+    for (u32 index = 0; index < ADYTUMFS_INODE_STAGE; index++)
+        if (store->staged_num[index] == inode_num) return (int)index;
+    return -1;
+}
+
+// Land one held image in the tree. The root it supersedes is left standing
+// rather than dropped, for the reason the commit gives: the committed
+// superblock still names it, and dropping it early would leave that
+// superblock pointing at freed nodes.
+static int stage_land(struct kernel_object *device,
+                      struct adytumfs_superblock *super,
+                      struct adytumfs_cas *store, u32 index) {
+    struct adytumfs_item_key key;
+    inode_key(&key, store->staged_num[index]);
+    // Captured on the first landing rather than when the store is bound,
+    // because a store belongs to an index run and not to a generation, and
+    // this is the first moment the distinction decides anything.
+    if (adytumfs_item_root_empty(store->txn_root))
+        root_copy(store->txn_root, super->inode_root);
+    u8 previous[ADYTUMFS_HASH_SIZE];
+    root_copy(previous, super->inode_root);
+    u8 next[ADYTUMFS_HASH_SIZE];
+    if (adytumfs_item_insert(device, super, store, previous, &key,
+                             store->staged_image[index], ADYTUMFS_INODE_SIZE,
+                             next))
+        return -1;
+    root_copy(super->inode_root, next);
+    store->staged_num[index] = 0;
+    // Every root this transaction built before this one is named by nothing
+    // any more, and leaving it mapped is what made a rebuilt index report a
+    // leak on a volume that had merely been written to. The one the
+    // committed generation names stays: dropping it here would leave the
+    // superblock on the device pointing at freed nodes.
+    if (!crypto_equal(previous, store->txn_root, ADYTUMFS_HASH_SIZE))
+        return adytumfs_item_drop(device, super, store, previous);
+    return 0;
+}
+
+// Land everything held. The commit calls this before it counts the window,
+// both so the flip cannot name a tree these inodes never reached and so the
+// blocks they allocate are part of the generation being written.
+int adytumfs_inode_flush(struct kernel_object *device,
+                         struct adytumfs_superblock *super,
+                         struct adytumfs_cas *store) {
+    if (!device || !super || !store) return -1;
+    for (u32 index = 0; index < ADYTUMFS_INODE_STAGE; index++)
+        if (store->staged_num[index] &&
+            stage_land(device, super, store, index))
+            return -1;
+    return 0;
+}
 
 int adytumfs_inode_read(struct kernel_object *device,
-                        const struct adytumfs_superblock *super,
-                        u64 inode_num, struct adytumfs_inode *out) {
-    if (!super || !out || inode_num == 0 || inode_num >= super->inode_count)
+                        struct adytumfs_superblock *super,
+                        struct adytumfs_cas *store, u64 inode_num,
+                        struct adytumfs_inode *out) {
+    if (!device || !super || !store || !out || inode_num == 0) return -1;
+    // A held image is the truth for this transaction even though the tree
+    // still carries the one the committed generation named.
+    int held = stage_find(store, inode_num);
+    if (held >= 0)
+        return adytumfs_inode_unpack(out, store->staged_image[held]);
+    struct adytumfs_item_key key;
+    inode_key(&key, inode_num);
+    u8 slot[ADYTUMFS_INODE_SIZE];
+    u32 size = 0;
+    if (adytumfs_item_lookup(device, super, store, super->inode_root, &key,
+                             slot, ADYTUMFS_INODE_SIZE, &size))
         return -1;
-    u32 block = (u32)(inode_num / ADYTUMFS_INODES_PER_BLOCK);
-    u32 slot = (u32)(inode_num % ADYTUMFS_INODES_PER_BLOCK) * ADYTUMFS_INODE_SIZE;
-    if (adytumfs_table_read(device, super, block, adytumfs_inode_scratch))
-        return -1;
-    return adytumfs_inode_unpack(out, adytumfs_inode_scratch + slot);
+    if (size != ADYTUMFS_INODE_SIZE) return -1;
+    return adytumfs_inode_unpack(out, slot);
 }
 
 int adytumfs_inode_write(struct kernel_object *device,
-                         const struct adytumfs_superblock *super,
-                         u64 inode_num, const struct adytumfs_inode *in) {
-    if (!super || !in || inode_num == 0 || inode_num >= super->inode_count)
-        return -1;
-    u32 block = (u32)(inode_num / ADYTUMFS_INODES_PER_BLOCK);
-    u32 slot = (u32)(inode_num % ADYTUMFS_INODES_PER_BLOCK) * ADYTUMFS_INODE_SIZE;
-    // Read-modify-write: the other fifteen inodes in this block must survive,
-    // and the merged image lands in the window staging rather than on the
-    // device, so the committed table stays whole until the commit.
-    if (adytumfs_table_read(device, super, block, adytumfs_inode_scratch))
-        return -1;
-    adytumfs_inode_pack(adytumfs_inode_scratch + slot, in);
-    return adytumfs_table_stage(device, super, block, adytumfs_inode_scratch);
+                         struct adytumfs_superblock *super,
+                         struct adytumfs_cas *store, u64 inode_num,
+                         const struct adytumfs_inode *in) {
+    if (!device || !super || !store || !in || inode_num == 0) return -1;
+    int at = stage_find(store, inode_num);
+    if (at < 0) {
+        // A full stage is a memory budget running out, not a volume limit:
+        // the image held longest lands in the tree, costing the block this
+        // write would have cost before staging existed, and the new one
+        // takes the slot that frees.
+        at = (int)store->staged_next;
+        store->staged_next = (store->staged_next + 1u) % ADYTUMFS_INODE_STAGE;
+        if (store->staged_num[at] && stage_land(device, super, store, (u32)at))
+            return -1;
+    }
+    store->staged_num[at] = inode_num;
+    adytumfs_inode_pack(store->staged_image[at], in);
+    return 0;
 }
 
 int adytumfs_inode_alloc(struct kernel_object *device,
                          struct adytumfs_superblock *super,
-                         u16 mode, u64 *inode_num) {
-    if (!super || !inode_num || mode == 0) return -1;
-    for (u64 candidate = 1; candidate < super->inode_count; candidate++) {
-        struct adytumfs_inode inode;
-        if (adytumfs_inode_read(device, super, candidate, &inode)) return -1;
-        if (inode.mode) continue;
-        // Reusing a slot bumps its generation so a handle to the old inode that
-        // outlives it fails the generation check rather than aliasing the new one.
-        struct adytumfs_inode fresh = {0};
-        fresh.mode = mode;
-        // A directory is born holding the two names every POSIX directory
-        // has, its entry in the parent plus the implicit self reference;
-        // counting subdirectory parents arrives with hard links.
-        fresh.links = (mode & ADYTUMFS_MODE_DIR) ? 2u : 1u;
-        fresh.generation = inode.generation + 1;
-        u64 now = rtc64_wall_clock();
-        u32 now_nsec = rtc64_wall_clock_nsec();
-        fresh.atime = now;
-        fresh.mtime = now;
-        fresh.ctime = now;
-        fresh.atime_nsec = now_nsec;
-        fresh.mtime_nsec = now_nsec;
-        fresh.ctime_nsec = now_nsec;
-        if (adytumfs_inode_write(device, super, candidate, &fresh)) return -1;
-        super->free_inodes--;
-        *inode_num = candidate;
-        return 0;
-    }
-    return -1;
-}
-
-int adytumfs_inode_free(struct kernel_object *device,
-                        struct adytumfs_superblock *super, u64 inode_num) {
-    if (!super || inode_num == 0 || inode_num >= super->inode_count) return -1;
-    struct adytumfs_inode inode;
-    if (adytumfs_inode_read(device, super, inode_num, &inode)) return -1;
-    if (inode.mode == 0) return -1;
-    inode.mode = 0;
-    if (adytumfs_inode_write(device, super, inode_num, &inode)) return -1;
-    super->free_inodes++;
+                         struct adytumfs_cas *store, u16 mode,
+                         u64 *inode_num) {
+    if (!device || !super || !store || !inode_num || mode == 0) return -1;
+    struct adytumfs_inode fresh = {0};
+    fresh.mode = mode;
+    // A directory is born holding the two names every POSIX directory has, its
+    // entry in the parent plus the implicit self reference; counting
+    // subdirectory parents arrives with hard links.
+    fresh.links = (mode & ADYTUMFS_MODE_DIR) ? 2u : 1u;
+    u64 candidate = super->inode_next;
+    // The number is the generation. A mount slot is reused even though a
+    // number never is, so a tag that restarted at one for every fresh inode
+    // would let a handle outliving its file match the slot's next occupant.
+    fresh.generation = candidate;
+    u64 now = rtc64_wall_clock();
+    u32 now_nsec = rtc64_wall_clock_nsec();
+    fresh.atime = now;
+    fresh.mtime = now;
+    fresh.ctime = now;
+    fresh.atime_nsec = now_nsec;
+    fresh.mtime_nsec = now_nsec;
+    fresh.ctime_nsec = now_nsec;
+    if (adytumfs_inode_write(device, super, store, candidate, &fresh))
+        return -1;
+    super->inode_next = candidate + 1u;
+    super->live_inodes++;
+    *inode_num = candidate;
     return 0;
 }
 
-static void root_copy(u8 *to, const u8 *from) {
-    for (u32 index = 0; index < ADYTUMFS_HASH_SIZE; index++)
-        to[index] = from[index];
+int adytumfs_inode_free(struct kernel_object *device,
+                        struct adytumfs_superblock *super,
+                        struct adytumfs_cas *store, u64 inode_num) {
+    if (!device || !super || !store || inode_num == 0) return -1;
+    // A held image is dropped either way: it is the truth for this
+    // transaction, and keeping it would resurrect the inode on the next read.
+    int held = stage_find(store, inode_num);
+    if (held >= 0) store->staged_num[held] = 0;
+    struct adytumfs_item_key key;
+    inode_key(&key, inode_num);
+    // An inode allocated in this transaction has no item yet, so there is
+    // nothing to take out. One that landed in an earlier commit does, and
+    // leaving it behind keeps an inode whose extent tree the caller has
+    // already released, so the next audit walks a root nothing maps.
+    u8 image[ADYTUMFS_INODE_SIZE];
+    u32 size = 0;
+    int present = !adytumfs_item_lookup(device, super, store, super->inode_root,
+                                        &key, image, ADYTUMFS_INODE_SIZE, &size);
+    // Neither a held image nor an item means the number names nothing, and
+    // freeing it again would take a second inode out of the live count.
+    if (held < 0 && !present) return -1;
+    if (present) {
+        u8 next[ADYTUMFS_HASH_SIZE];
+        if (adytumfs_item_remove(device, super, store, super->inode_root, &key,
+                                 next))
+            return -1;
+        root_copy(super->inode_root, next);
+    }
+    super->live_inodes--;
+    return 0;
 }
 
 // Commit a new extent root into the inode and let go of the one it named
@@ -143,14 +238,20 @@ static int root_commit(struct kernel_object *device,
                        struct adytumfs_superblock *super,
                        struct adytumfs_cas *store, struct adytumfs_inode *inode,
                        u64 inode_num, const u8 *previous, u64 blocks) {
-    if (adytumfs_inode_write(device, super, inode_num, inode)) {
+    u8 built[ADYTUMFS_HASH_SIZE];
+    root_copy(built, inode->extent_root);
+    int moved = !crypto_equal(previous, built, ADYTUMFS_HASH_SIZE);
+    if (adytumfs_inode_write(device, super, store, inode_num, inode)) {
         // The on-disk inode still names the previous root, so the in-memory
         // copy goes back to it and the root just built is the garbage.
         root_copy(inode->extent_root, previous);
         inode->blocks = blocks;
-        return adytumfs_tree_drop(device, super, store, inode->extent_root) ?
-            -1 : -1;
+        if (moved) adytumfs_tree_drop(device, super, store, built);
+        return -1;
     }
+    // A rewrite that stores identical bytes lands the same node hash, so the
+    // root does not move and the previous root is still the live one.
+    if (!moved) return 0;
     return adytumfs_tree_drop(device, super, store, previous);
 }
 
@@ -250,7 +351,8 @@ int adytumfs_inode_grow(struct kernel_object *device,
     root_copy(previous, inode->extent_root);
     root_copy(inode->extent_root, next);
     inode->blocks = new_blocks;
-    return root_commit(device, super, store, inode, inode_num, previous, blocks);
+    return root_commit(device, super, store, inode, inode_num, previous,
+                       blocks);
 }
 
 int adytumfs_inode_truncate(struct kernel_object *device,
@@ -269,7 +371,8 @@ int adytumfs_inode_truncate(struct kernel_object *device,
     root_copy(previous, inode->extent_root);
     root_copy(inode->extent_root, next);
     inode->blocks = new_blocks;
-    return root_commit(device, super, store, inode, inode_num, previous, blocks);
+    return root_commit(device, super, store, inode, inode_num, previous,
+                       blocks);
 }
 
 int adytumfs_inode_remap(struct kernel_object *device,
@@ -295,5 +398,6 @@ int adytumfs_inode_remap(struct kernel_object *device,
     u8 previous[ADYTUMFS_HASH_SIZE];
     root_copy(previous, inode->extent_root);
     root_copy(inode->extent_root, next);
-    return root_commit(device, super, store, inode, inode_num, previous, blocks);
+    return root_commit(device, super, store, inode, inode_num, previous,
+                       blocks);
 }

@@ -111,8 +111,8 @@ static u32 slot_name_len(const struct adytumfs_slot *slot) {
 static int slot_inode_read(struct adytumfs_mount *m, u32 slot,
                            struct adytumfs_inode *out) {
     if (!m || slot >= ADYTUMFS_INODE_MAX || !m->slots[slot].inode) return -1;
-    return adytumfs_inode_read(m->device, &m->super, m->slots[slot].inode,
-                               out);
+    return adytumfs_inode_read(m->device, &m->super, &m->store,
+                               m->slots[slot].inode, out);
 }
 
 // The format stores the VFS node type in the POSIX type bits of the mode.
@@ -133,8 +133,8 @@ static u32 slot_type(const struct adytumfs_inode *inode) {
 // children, so the table cannot express a cycle.
 static int walk_tree(struct adytumfs_mount *m, adytumfs_alias_sink sink) {
     struct adytumfs_inode root;
-    if (adytumfs_inode_read(m->device, &m->super, m->super.root_inode, &root))
-        return -1;
+    if (adytumfs_inode_read(m->device, &m->super, &m->store,
+                            m->super.root_inode, &root)) return -1;
     // The mount root is the directory every walk starts from; anything else
     // would have file data parsed as directory records.
     if ((root.mode & ADYTUMFS_MODE_DIR) == 0) return -1;
@@ -165,8 +165,8 @@ static int walk_tree(struct adytumfs_mount *m, adytumfs_alias_sink sink) {
             if (step == 1) break;
             if (step < 0) return -1;
             struct adytumfs_inode child;
-            if (adytumfs_inode_read(m->device, &m->super, target, &child) ||
-                child.mode == 0)
+            if (adytumfs_inode_read(m->device, &m->super, &m->store,
+                                    target, &child) || child.mode == 0)
                 return -1;
             u32 bits = child.mode & (ADYTUMFS_MODE_DIR | ADYTUMFS_MODE_REG |
                                      ADYTUMFS_MODE_LNK);
@@ -367,8 +367,8 @@ int adytumfs_pages_dirty(u32 mount, u32 inode, u64 generation, u32 page,
     cache_mark(slot->dirty, page);
     if (size > in.size) {
         in.size = size;
-        if (adytumfs_inode_write(m->device, &m->super, m->slots[inode].inode,
-                                 &in))
+        if (adytumfs_inode_write(m->device, &m->super, &m->store,
+                                 m->slots[inode].inode, &in))
             return -1;
     }
     return 0;
@@ -418,7 +418,7 @@ int adytumfs_pages_sync(u32 mount, u32 inode, u64 generation) {
     }
     // Sync is the agreed commit boundary: the redirected pages and the
     // staged metadata land together or not at all.
-    return adytumfs_commit(m->device, &m->super);
+    return adytumfs_commit(m->device, &m->super, &m->store);
 }
 
 void adytumfs_pages_detach(u32 mount, u32 inode, u64 generation) {
@@ -498,7 +498,7 @@ void adytumfs_detach(u32 mount) {
         }
         // Unmount is the other commit boundary; pages_sync already committed
         // per file, so this lands windows that only touched raw metadata.
-        adytumfs_commit(m->device, &m->super);
+        adytumfs_commit(m->device, &m->super, &m->store);
         object_release(m->device);
     }
     m->device = 0;
@@ -571,8 +571,8 @@ int adytumfs_touch(u32 mount, u32 inode, u64 generation, u32 flags) {
         changed = 1;
     }
     if (!changed) return 0;
-    return adytumfs_inode_write(m->device, &m->super, m->slots[inode].inode,
-                                &in);
+    return adytumfs_inode_write(m->device, &m->super, &m->store,
+                                m->slots[inode].inode, &in);
 }
 
 int adytumfs_inode_update(u32 mount, u32 inode, u64 generation, u32 flags,
@@ -602,8 +602,8 @@ int adytumfs_inode_update(u32 mount, u32 inode, u64 generation, u32 flags,
     if (!changed) return 0;
     in.ctime = rtc64_wall_clock();
     in.ctime_nsec = rtc64_wall_clock_nsec();
-    return adytumfs_inode_write(m->device, &m->super, m->slots[inode].inode,
-                                &in);
+    return adytumfs_inode_write(m->device, &m->super, &m->store,
+                                m->slots[inode].inode, &in);
 }
 
 int adytumfs_set_times(u32 mount, u32 inode, u64 generation, u32 flags,
@@ -633,8 +633,8 @@ int adytumfs_set_times(u32 mount, u32 inode, u64 generation, u32 flags,
     if (!changed) return 0;
     in.ctime = rtc64_wall_clock();
     in.ctime_nsec = rtc64_wall_clock_nsec();
-    return adytumfs_inode_write(m->device, &m->super, m->slots[inode].inode,
-                                &in);
+    return adytumfs_inode_write(m->device, &m->super, &m->store,
+                                m->slots[inode].inode, &in);
 }
 
 int adytumfs_inode_meta(u32 mount, u32 inode, u64 generation, u16 *links,
@@ -717,7 +717,9 @@ int adytumfs_inode_create(u32 mount, const char *name, u32 parent, u32 type,
     // slot table must carry the same value the caller will be told to present
     // on every later backend call.
     struct adytumfs_inode fresh;
-    if (adytumfs_inode_read(m->device, &m->super, target, &fresh)) return -1;
+    if (adytumfs_inode_read(m->device, &m->super, &m->store,
+                            target, &fresh))
+        return -1;
     m->slots[slot].inode = target;
     m->slots[slot].generation = fresh.generation;
     m->slots[slot].parent = parent;
@@ -764,8 +766,8 @@ int adytumfs_inode_link(u32 mount, u32 inode, u64 generation, u32 parent,
     in.links++;
     in.ctime = rtc64_wall_clock();
     in.ctime_nsec = rtc64_wall_clock_nsec();
-    if (adytumfs_inode_write(m->device, &m->super, m->slots[inode].inode,
-                             &in))
+    if (adytumfs_inode_write(m->device, &m->super, &m->store,
+                             m->slots[inode].inode, &in))
         return -1;
     if (adytumfs_dir_add(m->device, &m->super, &m->store, m->slots[parent].inode, name,
                          name_len, m->slots[inode].inode,
@@ -773,8 +775,8 @@ int adytumfs_inode_link(u32 mount, u32 inode, u64 generation, u32 parent,
         // The name could not land, so the count goes back down; a failed
         // rollback write just leaves the stale-high drift above.
         in.links--;
-        adytumfs_inode_write(m->device, &m->super, m->slots[inode].inode,
-                             &in);
+        adytumfs_inode_write(m->device, &m->super, &m->store,
+                             m->slots[inode].inode, &in);
         return -1;
     }
     adytumfs_touch(mount, parent, m->slots[parent].generation,
@@ -792,10 +794,11 @@ static int inode_reclaim(u32 mount, struct adytumfs_mount *m, u32 inode) {
     adytumfs_pages_detach(mount, inode, m->slots[inode].generation);
     if (adytumfs_inode_truncate(m->device, &m->super, &m->store, &in, m->slots[inode].inode, 0)) return -1;
     in.size = 0;
-    if (adytumfs_inode_write(m->device, &m->super, m->slots[inode].inode,
-                             &in))
+    if (adytumfs_inode_write(m->device, &m->super, &m->store,
+                             m->slots[inode].inode, &in))
         return -1;
-    if (adytumfs_inode_free(m->device, &m->super, m->slots[inode].inode))
+    if (adytumfs_inode_free(m->device, &m->super, &m->store,
+                            m->slots[inode].inode))
         return -1;
     m->slots[inode].inode = 0;
     m->slots[inode].parent = 0;
@@ -851,7 +854,7 @@ int adytumfs_unlink(u32 mount, u32 inode, u64 generation, u32 parent,
         in.links--;
         in.ctime = rtc64_wall_clock();
         in.ctime_nsec = rtc64_wall_clock_nsec();
-        return adytumfs_inode_write(m->device, &m->super,
+        return adytumfs_inode_write(m->device, &m->super, &m->store,
                                     m->slots[inode].inode, &in);
     }
     if (last_close) {
@@ -861,7 +864,7 @@ int adytumfs_unlink(u32 mount, u32 inode, u64 generation, u32 parent,
         in.links = 0;
         in.ctime = rtc64_wall_clock();
         in.ctime_nsec = rtc64_wall_clock_nsec();
-        return adytumfs_inode_write(m->device, &m->super,
+        return adytumfs_inode_write(m->device, &m->super, &m->store,
                                     m->slots[inode].inode, &in);
     }
     return inode_reclaim(mount, m, inode);
@@ -911,8 +914,8 @@ int adytumfs_rename(u32 mount, u32 inode, u64 generation, u32 old_parent,
     // name the metadata cannot vouch for.
     in.ctime = rtc64_wall_clock();
     in.ctime_nsec = rtc64_wall_clock_nsec();
-    if (adytumfs_inode_write(m->device, &m->super, m->slots[inode].inode,
-                             &in))
+    if (adytumfs_inode_write(m->device, &m->super, &m->store,
+                             m->slots[inode].inode, &in))
         return -1;
     // The old name leaves before the new one lands: a crash between the
     // two leaves an orphan holding its data, never one inode under two
@@ -951,9 +954,7 @@ int adytumfs_rename(u32 mount, u32 inode, u64 generation, u32 old_parent,
                 m->slots[inode].name[byte] = new_name[byte];
         }
     }
-    // One commit lands the move, its times, and any target removal the
-    // caller staged before this call: the whole rename is a single flip.
-    return adytumfs_commit(m->device, &m->super);
+    return 0;
 }
 
 // Write the target into a freshly created symlink inode's file body. The
@@ -991,10 +992,10 @@ int adytumfs_symlink_write(u32 mount, u32 inode, u64 generation,
     in.mtime_nsec = now_nsec;
     in.ctime_nsec = now_nsec;
     in.size = length;
-    if (adytumfs_inode_write(m->device, &m->super, m->slots[inode].inode,
-                             &in))
+    if (adytumfs_inode_write(m->device, &m->super, &m->store,
+                             m->slots[inode].inode, &in))
         return -1;
-    return adytumfs_commit(m->device, &m->super);
+    return 0;
 }
 
 // Read a symlink's target out of its data block for the mount scan: the
@@ -1102,9 +1103,12 @@ int adytumfs_truncate(u32 mount, u32 inode, u64 generation, u32 size,
     in.mtime_nsec = now_nsec;
     in.ctime_nsec = now_nsec;
     in.size = size;
-    if (adytumfs_inode_write(m->device, &m->super, m->slots[inode].inode,
-                             &in) ||
-        adytumfs_commit(m->device, &m->super))
+    // Truncate keeps its commit: the read path resolves a page through the
+    // extent tree the committed inode names, so a staged truncation leaves
+    // the tree and the blocks on the device disagreeing.
+    if (adytumfs_inode_write(m->device, &m->super, &m->store,
+                             m->slots[inode].inode, &in) ||
+        adytumfs_commit(m->device, &m->super, &m->store))
         return -1;
     *new_size = size;
     return 0;

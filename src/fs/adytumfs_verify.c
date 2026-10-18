@@ -1,7 +1,9 @@
 #include "types.h"
 #include "adytumfs_format.h"
+#include "crypto.h"
 #include "adytumfs_index.h"
 #include "adytumfs_cas.h"
+#include "adytumfs_item.h"
 #include "adytumfs_tree.h"
 #include "crypto.h"
 
@@ -126,6 +128,46 @@ static int verify_tree_refs(struct kernel_object *device,
     return 0;
 }
 
+// The item tree holds its references the way an extent tree does, and the drop
+// path fails closed on a node at zero rather than freeing one something still
+// names. A rebuild leaves every mapping unheld, so without this walk the first
+// commit after a repaired mount would refuse to release the root it supersedes.
+static int verify_item_refs(struct kernel_object *device,
+                            struct adytumfs_superblock *super,
+                            struct adytumfs_cas *store, const u8 *root) {
+    static u8 stack[VERIFY_STACK_MAX][ADYTUMFS_HASH_SIZE];
+    static u8 node[ADYTUMFS_BLOCK_SIZE];
+    u8 hash[ADYTUMFS_HASH_SIZE];
+    u32 top = 0;
+    for (u32 byte = 0; byte < ADYTUMFS_HASH_SIZE; byte++)
+        stack[top][byte] = root[byte];
+    top = 1u;
+    while (top) {
+        top--;
+        for (u32 byte = 0; byte < ADYTUMFS_HASH_SIZE; byte++)
+            hash[byte] = stack[top][byte];
+        if (adytumfs_cas_retain(device, super, store, hash)) return -1;
+        // Reading through the store checks the block against the hash its
+        // parent promised, so a node that does not match is never walked.
+        if (adytumfs_cas_read(device, super, store, hash, node)) return -1;
+        u32 level = adytumfs_read_le32(node + 8);
+        if (level >= ADYTUMFS_ITEM_DEPTH_MAX) return -1;
+        if (adytumfs_item_node_check(node, level)) return -1;
+        if (!level) continue;
+        u32 count = 0;
+        if (adytumfs_item_node_count(node, &count)) return -1;
+        for (u32 index = 0; index < count; index++) {
+            u8 child[ADYTUMFS_ITEM_CHILD_SIZE];
+            if (adytumfs_item_branch_get(node, index, 0, child)) return -1;
+            if (top >= VERIFY_STACK_MAX) return -1;
+            for (u32 byte = 0; byte < ADYTUMFS_ITEM_CHILD_SIZE; byte++)
+                stack[top][byte] = child[byte];
+            top++;
+        }
+    }
+    return 0;
+}
+
 static int verify_bit(struct kernel_object *device,
                       const struct adytumfs_superblock *super, u64 block) {
     u64 window = block / ((u64)ADYTUMFS_BLOCK_SIZE * 8u);
@@ -183,6 +225,64 @@ static int verify_index(struct kernel_object *device,
     return live == allocated ? 0 : -1;
 }
 
+// Every item the tree holds is an inode today, so the shape check sits in one
+// place rather than being repeated per visitor.
+static int scan_inode_item(const struct adytumfs_item_key *key,
+                           const u8 *data, u32 size,
+                           struct adytumfs_inode *out) {
+    if (key->type != ADYTUMFS_ITEM_INODE || key->objectid == 0 ||
+        key->offset != 0 || size != ADYTUMFS_INODE_SIZE)
+        return -1;
+    return adytumfs_inode_unpack(out, data);
+}
+
+struct verify_scan {
+    struct kernel_object *device;
+    struct adytumfs_superblock *super;
+    struct adytumfs_cas *store;
+    u64 live;
+};
+
+static int scan_retain(const struct adytumfs_item_key *key, const u8 *data,
+                       u32 size, void *context) {
+    struct verify_scan *scan = context;
+    struct adytumfs_inode in;
+    if (scan_inode_item(key, data, size, &in)) return -1;
+    if (adytumfs_tree_root_empty(in.extent_root)) return 0;
+    if (adytumfs_cas_retain(scan->device, scan->super, scan->store,
+                            in.extent_root))
+        return -1;
+    return verify_tree_refs(scan->device, scan->super, scan->store,
+                            in.extent_root);
+}
+
+static int scan_audit(const struct adytumfs_item_key *key, const u8 *data,
+                      u32 size, void *context) {
+    struct verify_scan *scan = context;
+    struct adytumfs_inode in;
+    if (scan_inode_item(key, data, size, &in)) return -1;
+    u32 bits = in.mode & (ADYTUMFS_MODE_DIR | ADYTUMFS_MODE_REG |
+                          ADYTUMFS_MODE_LNK);
+    if (bits != ADYTUMFS_MODE_DIR && bits != ADYTUMFS_MODE_REG &&
+        bits != ADYTUMFS_MODE_LNK)
+        return -1;
+    // An inode names the root of its extent tree. All zero is the empty tree,
+    // which only a file with no blocks may hold, and anything else has to
+    // resolve and cover exactly the blocks the inode claims.
+    int empty = adytumfs_tree_root_empty(in.extent_root);
+    if (empty ? in.blocks != 0 : in.blocks == 0) return -1;
+    u64 mapped = 0;
+    if (!empty && verify_tree_bytes(scan->device, scan->super, scan->store,
+                                    in.extent_root, &mapped))
+        return -1;
+    if (mapped != in.blocks * ADYTUMFS_BLOCK_SIZE) return -1;
+    // Size is deliberately not audited: the write path persists a grown size
+    // before the matching block count lands, and reads clamp to the mapped
+    // blocks anyway.
+    scan->live++;
+    return 0;
+}
+
 // Rebuild the index from the generation the superblock actually points at.
 //
 // The index is written through, outside the two generation slots: a mapping is
@@ -227,14 +327,37 @@ static int rebuild_index(struct kernel_object *device,
     // Every mapping now sits at zero references. The trees put the real count
     // back: a node holds a reference on everything it names, and the inode
     // holds the one on the root of its own tree.
-    for (u64 inode = 1; inode < super->inode_count; inode++) {
-        struct adytumfs_inode in;
-        if (adytumfs_inode_read(device, super, inode, &in)) return -1;
-        if (!in.mode) continue;
-        if (adytumfs_tree_root_empty(in.extent_root)) continue;
-        if (adytumfs_cas_retain(device, super, store, in.extent_root))
+    // Both superblock copies are walked, not just the one being audited. The
+    // device holds two generations and either is the one a mount falls back
+    // to, so the older one's nodes are allocated and referenced for a reason.
+    // Retaining only the audited generation would report them as blocks the
+    // collection walk missed, which rejects the fallback for being the
+    // fallback. The inode count the audit compares against belongs to the
+    // audited generation alone, and the pass that follows takes it.
+    u8 roots[2][ADYTUMFS_HASH_SIZE];
+    u32 found = 0;
+    for (u8 slot = 0; slot < 2u; slot++) {
+        u8 root[ADYTUMFS_HASH_SIZE];
+        if (!adytumfs_superblock_slot_root(device, super, slot, root) ||
+            adytumfs_item_root_empty(root))
+            continue;
+        u32 seen = 0;
+        for (u32 index = 0; index < found; index++)
+            if (crypto_equal(roots[index], root, ADYTUMFS_HASH_SIZE)) seen = 1;
+        // A freshly formatted volume names the same root from both copies,
+        // and walking it twice would take a second reference on every node
+        // it reaches.
+        if (seen) continue;
+        for (u32 byte = 0; byte < ADYTUMFS_HASH_SIZE; byte++)
+            roots[found][byte] = root[byte];
+        found++;
+    }
+    struct verify_scan scan = {device, super, store, 0};
+    for (u32 index = 0; index < found; index++) {
+        if (verify_item_refs(device, super, store, roots[index])) return -1;
+        if (adytumfs_item_walk(device, super, store, roots[index], scan_retain,
+                               &scan))
             return -1;
-        if (verify_tree_refs(device, super, store, in.extent_root)) return -1;
     }
     return 0;
 }
@@ -246,41 +369,18 @@ static int verify_volume(struct kernel_object *device,
                          struct adytumfs_cas *store) {
     if (!device || !super || !store) return -1;
     verify_bitmap_window = ~(u64)0;
-    u64 free_inodes = 0;
     // The index region is reserved metadata that happens to sit inside the
     // data span. It is allocated at format time and no inode owns it, so it
     // stays out of both sides of the allocation ledger.
     u64 index_end = super->index_start + super->index_blocks;
 
-    // An unreachable inode still owns its blocks, and a used slot with a
-    // broken body means the table itself is lying, so every used slot is
-    // audited, not only the tree the mount will walk.
-    for (u64 inode = 1; inode < super->inode_count; inode++) {
-        struct adytumfs_inode in;
-        if (adytumfs_inode_read(device, super, inode, &in)) return -1;
-        if (!in.mode) {
-            free_inodes++;
-            continue;
-        }
-        u32 bits = in.mode & (ADYTUMFS_MODE_DIR | ADYTUMFS_MODE_REG |
-                              ADYTUMFS_MODE_LNK);
-        if (bits != ADYTUMFS_MODE_DIR && bits != ADYTUMFS_MODE_REG &&
-            bits != ADYTUMFS_MODE_LNK)
-            return -1;
-        // An inode names the root of its extent tree. All zero is the empty
-        // tree, which only a file with no blocks may hold, and anything else
-        // has to resolve and cover exactly the blocks the inode claims.
-        int empty = adytumfs_tree_root_empty(in.extent_root);
-        if (empty ? in.blocks != 0 : in.blocks == 0) return -1;
-        u64 mapped = 0;
-        if (!empty && verify_tree_bytes(device, super, store, in.extent_root,
-                                        &mapped))
-            return -1;
-        if (mapped != in.blocks * ADYTUMFS_BLOCK_SIZE) return -1;
-        // Size is deliberately not audited: the write path persists a grown
-        // size before the matching block count lands, and reads clamp to the
-        // mapped blocks anyway.
-    }
+    // Every inode the tree holds is audited, not only the ones a mount walks:
+    // an inode nothing references still owns blocks, and the ledger below only
+    // balances when all of them are counted.
+    struct verify_scan scan = {device, super, store, 0};
+    if (adytumfs_item_walk(device, super, store, super->inode_root, scan_audit,
+                           &scan))
+        return -1;
 
     // The metadata prefix, the reserved index region, and the tail from the
     // checksum region on must stay allocated, and every allocated data block
@@ -299,7 +399,7 @@ static int verify_volume(struct kernel_object *device,
     }
     u64 live = 0;
     if (verify_index(device, super, index_end, allocated, &live)) return -1;
-    if (super->free_inodes != free_inodes) return -1;
+    if (super->live_inodes != scan.live) return -1;
     // The allocatable span ends at the checksum region, not at the backup
     // superblock, and the reserved index is not allocatable either, so the
     // free count is taken against the span the allocator can actually reach.

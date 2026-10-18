@@ -2,6 +2,7 @@
 #include "object.h"
 #include "block.h"
 #include "adytumfs_format.h"
+#include "adytumfs_cas.h"
 
 int test_adytumfs_volume64(void) {
     u32 objects = object_active_count();
@@ -29,30 +30,40 @@ int test_adytumfs_volume64(void) {
         backup.data_start == super.data_start;
 
     // The bitmap marks block 0, the backup block, and the reserved index
-    // region used, and leaves the first block past the index free.
+    // region used. Formatting also builds the tree that holds the root inode,
+    // and first fit gives that leaf the first block past the index, so the
+    // block after it is the first one nothing has taken.
     u64 last = super.total_blocks - 1;
-    u64 first_free = super.index_start + super.index_blocks;
+    u64 root_leaf = super.index_start + super.index_blocks;
+    u64 first_free = root_leaf + 1;
     valid = valid &&
         adytumfs_block_read(dev, super.block_bitmap_start, block) == 0 &&
         (block[0] & 1u) &&
         (block[super.data_start / 8] & (u8)(1u << (super.data_start % 8))) &&
         (block[last / 8] & (u8)(1u << (last % 8))) &&
+        (block[root_leaf / 8] & (u8)(1u << (root_leaf % 8))) &&
         (block[first_free / 8] & (u8)(1u << (first_free % 8))) == 0;
 
     // The reserved region is recorded, sits inside the data area, and is
-    // excluded from the free count, so nothing can hand it out twice.
+    // excluded from the free count, so nothing can hand it out twice. The one
+    // block the root tree took is the only other thing the span has lost.
     valid = valid && super.index_blocks >= 2 &&
         super.index_start == super.data_start &&
         super.index_start + super.index_blocks <= super.data_end &&
-        super.free_blocks + super.index_blocks ==
+        super.free_blocks + super.index_blocks + 1 ==
             super.data_end - super.data_start;
 
-    // The root inode is a directory that owns no data yet.
+    // The root inode is a directory that owns no data yet. It is an item in
+    // the metadata tree now, so reaching it goes through the root the
+    // superblock names rather than a fixed offset in a table. The index cache
+    // is 20 KiB, too large for a modest stack, and the test is single
+    // threaded.
+    static struct adytumfs_cas store;
+    adytumfs_cas_open(&store, super.index_start, super.index_blocks);
     struct adytumfs_inode root;
     valid = valid &&
-        adytumfs_block_read(dev, super.inode_table_start, block) == 0 &&
-        adytumfs_inode_unpack(&root,
-            block + ADYTUMFS_ROOT_INODE * ADYTUMFS_INODE_SIZE) == 0 &&
+        adytumfs_inode_read(dev, &super, &store, ADYTUMFS_ROOT_INODE,
+                            &root) == 0 &&
         (root.mode & ADYTUMFS_MODE_DIR) && root.size == 0;
 
     adytumfs_window_discard(dev);

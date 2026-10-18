@@ -5,30 +5,30 @@ int test_adytumfs_super64(void) {
     // A 4 KiB block is too big for a modest stack, and this test is single
     // threaded, so the scratch block is static.
     static u8 block[ADYTUMFS_BLOCK_SIZE];
-    // The tail grows backwards from block 1023: shadow superblock, shadow
-    // bitmap (1), shadow table (4), so the checksum region starts at 1017 and
-    // covers the 1011 data blocks [6, 1017).
+    // The tail grows backwards from block 1023: shadow superblock, then shadow
+    // bitmap (1), so the data region is [2, 1022). There is no inode table in
+    // the layout: inodes are items in a tree that grows inside the data region.
     struct adytumfs_superblock super = {
         .format_version = ADYTUMFS_FORMAT_VERSION,
         .block_size = ADYTUMFS_BLOCK_SIZE,
         .total_blocks = 1024,
         .block_bitmap_start = 1,
         .block_bitmap_blocks = 1,
-        .inode_table_start = 2,
-        .inode_table_blocks = 4,
-        .inode_count = 64,
+        .inode_next = 2,
         .root_inode = ADYTUMFS_ROOT_INODE,
-        .data_start = 6,
-        .free_blocks = 1011,
-        .free_inodes = 63,
+        .data_start = 2,
+        .free_blocks = 999,
+        .live_inodes = 1,
         .generation = 1,
         .feature_compat = 0,
         .feature_incompat = ADYTUMFS_FEATURE_INCOMPAT_V3 |
-                            ADYTUMFS_FEATURE_INCOMPAT_NO_CKSUM_REGION,
+                            ADYTUMFS_FEATURE_INCOMPAT_NO_CKSUM_REGION |
+                            ADYTUMFS_FEATURE_INCOMPAT_ITEM_INODES,
         .feature_ro_compat = 0,
-        .data_end = 1017,
-        .index_start = 6,
+        .data_end = 1022,
+        .index_start = 2,
         .index_blocks = 21,
+        .inode_root = {0xa5, 0x5a, 0x11, 0xee},
     };
 
     adytumfs_super_pack(block, &super);
@@ -45,18 +45,20 @@ int test_adytumfs_super64(void) {
         decoded.total_blocks == super.total_blocks &&
         decoded.block_bitmap_start == super.block_bitmap_start &&
         decoded.block_bitmap_blocks == super.block_bitmap_blocks &&
-        decoded.inode_table_start == super.inode_table_start &&
-        decoded.inode_table_blocks == super.inode_table_blocks &&
-        decoded.inode_count == super.inode_count &&
+        decoded.inode_next == super.inode_next &&
         decoded.root_inode == super.root_inode &&
         decoded.data_start == super.data_start &&
         decoded.free_blocks == super.free_blocks &&
-        decoded.free_inodes == super.free_inodes &&
+        decoded.live_inodes == super.live_inodes &&
         decoded.generation == super.generation &&
         decoded.feature_incompat == super.feature_incompat &&
         decoded.data_end == super.data_end &&
         decoded.index_start == super.index_start &&
         decoded.index_blocks == super.index_blocks;
+    // The tree root is the one field with no numeric bound to catch a field
+    // that silently stopped being written, so it is compared byte for byte.
+    for (u32 byte = 0; byte < ADYTUMFS_HASH_SIZE; byte++)
+        valid = valid && decoded.inode_root[byte] == super.inode_root[byte];
 
     // The checksum must catch a single flipped byte, and a broken signature
     // must be rejected before anything else.
@@ -66,17 +68,24 @@ int test_adytumfs_super64(void) {
     block[0] = 'X';
     valid = valid && adytumfs_super_unpack(&decoded, block) != 0;
 
-    // Bounds validation rejects an out-of-range root inode, a table that is
-    // not where the fixed order demands, a checksum region that does not fit
-    // its data span, and an unknown incompatible feature bit.
+    // Bounds validation rejects a root the volume never handed out, an
+    // allocator that has issued no numbers at all, a live count that is zero
+    // or larger than everything ever allocated, a data span that runs into the
+    // tail or collapses to nothing, and an unknown incompatible feature bit.
     struct adytumfs_superblock bad = super;
-    bad.root_inode = super.inode_count;
+    bad.root_inode = super.inode_next;
     valid = valid && adytumfs_super_valid(&bad, 1024) != 0;
     bad = super;
-    bad.inode_table_start = 3;
+    bad.inode_next = 1;
     valid = valid && adytumfs_super_valid(&bad, 1024) != 0;
     bad = super;
-    bad.data_end = 1020;
+    bad.live_inodes = 0;
+    valid = valid && adytumfs_super_valid(&bad, 1024) != 0;
+    bad = super;
+    bad.live_inodes = super.inode_next;
+    valid = valid && adytumfs_super_valid(&bad, 1024) != 0;
+    bad = super;
+    bad.data_end = 1023;
     valid = valid && adytumfs_super_valid(&bad, 1024) != 0;
     bad = super;
     bad.data_end = super.data_start;
@@ -84,7 +93,7 @@ int test_adytumfs_super64(void) {
     bad = super;
     bad.feature_incompat = ADYTUMFS_FEATURE_INCOMPAT_V3 |
                            ADYTUMFS_FEATURE_INCOMPAT_NO_CKSUM_REGION |
-                           0x8u;
+                           ADYTUMFS_FEATURE_INCOMPAT_ITEM_INODES | 0x10u;
     valid = valid && adytumfs_super_valid(&bad, 1024) != 0;
 
     // The clean break: the v2 mask is not a smaller v3, it is a volume this
@@ -94,13 +103,14 @@ int test_adytumfs_super64(void) {
     valid = valid && adytumfs_super_valid(&bad, 1024) != 0;
 
     // The index region is part of the layout, so a header with no entries, one
-    // that starts above the data region, and one that runs into the checksum
-    // region are all volumes the formatter never wrote.
+    // that starts below the data region, one that starts so high the region
+    // cannot fit, and one that runs past the data end are all volumes the
+    // formatter never wrote.
     bad = super;
     bad.index_blocks = 1;
     valid = valid && adytumfs_super_valid(&bad, 1024) != 0;
     bad = super;
-    bad.index_start = super.inode_table_start;
+    bad.index_start = super.data_start - 1;
     valid = valid && adytumfs_super_valid(&bad, 1024) != 0;
     bad = super;
     bad.index_start = super.data_end - 1;
