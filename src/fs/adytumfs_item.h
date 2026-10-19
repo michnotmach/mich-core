@@ -24,6 +24,7 @@
 #define ADYTUMFS_ITEM_DEPTH_MAX 12u
 
 #define ADYTUMFS_ITEM_INODE 1u
+#define ADYTUMFS_ITEM_DIR 2u
 
 // One B+tree holds every metadata item in the volume, replacing the fixed
 // inode table. The key is composite so that different kinds of item share a

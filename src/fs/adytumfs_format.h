@@ -388,6 +388,45 @@ int adytumfs_dir_iter(struct kernel_object *device,
                       u64 *cursor, char *name, u32 *name_len, u64 *inode_out,
                       u8 *type_out);
 
+// Directory entries as items in the item tree, keyed by the directory and the
+// hash of the name. The key is fixed width, so one item holds every entry
+// whose name hashes alike, and resolving a name is a search for the bucket
+// followed by a comparison inside it.
+int adytumfs_dir_name_hash(const char *name, u32 name_len, u64 *hash);
+
+// Pack or read one entry of a bucket. The name follows the header and is not
+// terminated, so the caller supplies the buffer and the length it holds.
+int adytumfs_dirent_pack(u8 *out, u32 out_size, u64 inode, u8 type,
+                         const char *name, u32 name_len);
+int adytumfs_dirent_read(const u8 *data, u32 size, u32 at, u64 *inode,
+                         u8 *type, u32 *name_len);
+// Offset of a name inside a bucket, or -1 when the bucket does not hold it.
+int adytumfs_dirent_find(const u8 *data, u32 size, const char *name,
+                         u32 name_len, u32 *at);
+
+// Add, resolve, or remove one name, copy on write. A name already in its
+// bucket is refused rather than replaced, because whether a second name
+// overwrites or fails belongs to the layer above. The type comes back with the
+// target so a walk knows whether to descend without searching twice.
+int adytumfs_dir_item_add(struct kernel_object *device,
+                          struct adytumfs_superblock *super,
+                          struct adytumfs_cas *store,
+                          const u8 root[ADYTUMFS_HASH_SIZE], u64 dir,
+                          const char *name, u32 name_len, u64 target, u8 type,
+                          u8 new_root[ADYTUMFS_HASH_SIZE]);
+int adytumfs_dir_item_find(struct kernel_object *device,
+                           struct adytumfs_superblock *super,
+                           struct adytumfs_cas *store,
+                           const u8 root[ADYTUMFS_HASH_SIZE], u64 dir,
+                           const char *name, u32 name_len, u64 *target,
+                           u8 *type);
+int adytumfs_dir_item_remove(struct kernel_object *device,
+                             struct adytumfs_superblock *super,
+                             struct adytumfs_cas *store,
+                             const u8 root[ADYTUMFS_HASH_SIZE], u64 dir,
+                             const char *name, u32 name_len,
+                             u8 new_root[ADYTUMFS_HASH_SIZE]);
+
 // Read or write a byte range of a regular file through its extents. A write past
 // the current end grows the file (allocating blocks); size is updated. Returns 0
 // with the transferred count, or -1 on error.
