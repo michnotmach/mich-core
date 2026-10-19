@@ -948,3 +948,162 @@ int test_adytumfs_item_remove64(void) {
         block_active_count() == devices;
     return valid ? 0 : -1;
 }
+
+struct range_seen {
+    u32 count;
+    u64 first;
+    u64 last;
+    u32 out_of_order;
+    u32 payload_bad;
+};
+
+#define RANGE_PAYLOAD 32u
+#define RANGE_ITEMS 300u
+
+static int range_visit(const struct adytumfs_item_key *key, const u8 *data,
+                       u32 size, void *context) {
+    struct range_seen *seen = context;
+    if (seen->count && key->objectid <= seen->last) seen->out_of_order++;
+    if (!seen->count) seen->first = key->objectid;
+    seen->last = key->objectid;
+    seen->count++;
+    // The payload is rebuilt for the item being visited, so a range that
+    // returned the right keys but read the wrong blocks would still fail.
+    static u8 want[RANGE_PAYLOAD];
+    payload_at((u32)(key->objectid - 1u), want, sizeof want);
+    if (size != sizeof want) {
+        seen->payload_bad++;
+        return 0;
+    }
+    for (u32 byte = 0; byte < size; byte++)
+        if (data[byte] != want[byte]) {
+            seen->payload_bad++;
+            break;
+        }
+    return 0;
+}
+
+// Items are deliberately small. A leaf holds as many as its data budget
+// allows, so at 32 bytes several dozen share one and a range boundary falls
+// inside a leaf rather than between two of them. Large items would put one
+// per leaf, and then only the branch bounds would ever be exercised while the
+// leaf bounds went untested.
+// A range is the same walk as the whole tree with the branches that cannot
+// hold it left alone, so both the descent and the leaf bounds have to be
+// right. Bounds are inclusive, either may be absent, and a range holding
+// nothing comes back empty rather than picking up the neighbour the descent
+// landed on.
+int test_adytumfs_item_range64(void) {
+    static struct adytumfs_cas store;
+    static u8 scratch[ADYTUMFS_BLOCK_SIZE];
+    static u8 root[ADYTUMFS_ITEM_CHILD_SIZE];
+    static u8 node[ADYTUMFS_BLOCK_SIZE];
+    static u8 payload[RANGE_PAYLOAD];
+    struct adytumfs_superblock super;
+    u32 objects = object_active_count();
+    u32 devices = block_active_count();
+    // 4096 sectors is the most a block device takes, so this is the largest
+    // volume a test can ask for and the item count has to fit inside it.
+    struct kernel_object *dev = block_create(4096, 0);
+    int valid = dev && adytumfs_make(dev) == 0 &&
+        adytumfs_block_read(dev, 0, scratch) == 0 &&
+        adytumfs_super_unpack(&super, scratch) == 0;
+    adytumfs_cas_open(&store, super.index_start, super.index_blocks);
+    crypto_zero(root, ADYTUMFS_ITEM_CHILD_SIZE);
+
+    for (u32 index = 0; index < RANGE_ITEMS; index++) {
+        struct adytumfs_item_key key =
+            item_key(index + 1u, ADYTUMFS_ITEM_INODE, 0);
+        payload_at(index, payload, sizeof(payload));
+        u8 next[ADYTUMFS_ITEM_CHILD_SIZE];
+        if (adytumfs_item_insert(dev, &super, &store, root, &key, payload,
+                                 sizeof(payload), next)) {
+            valid = 0;
+            break;
+        }
+        if (!adytumfs_item_root_empty(root))
+            if (adytumfs_item_drop(dev, &super, &store, root)) {
+                valid = 0;
+                break;
+            }
+        for (u32 byte = 0; byte < ADYTUMFS_ITEM_CHILD_SIZE; byte++)
+            root[byte] = next[byte];
+    }
+
+    // The tree has to have a branch over the leaves, or the range walk never
+    // prunes anything and the test proves nothing about the bounds it exists
+    // for.
+    valid = valid &&
+        adytumfs_cas_read(dev, &super, &store, root, node) == 0 &&
+        adytumfs_read_le32(node + 8) >= 1u;
+
+    // No bounds at all is the walk that already existed, and it has to see
+    // every item in order: the range walk replaced it rather than sitting
+    // beside it.
+    struct range_seen all = {0};
+    valid = valid &&
+        adytumfs_item_walk_range(dev, &super, &store, root, 0, 0, range_visit,
+                                 &all) == 0 &&
+        all.count == RANGE_ITEMS && all.first == 1u &&
+        all.last == RANGE_ITEMS && !all.out_of_order && !all.payload_bad;
+
+    // A narrow pair of bounds that falls inside one leaf, which is the case
+    // only the leaf bounds can answer.
+    struct range_seen mid = {0};
+    struct adytumfs_item_key low = item_key(30u, ADYTUMFS_ITEM_INODE, 0);
+    struct adytumfs_item_key high = item_key(40u, ADYTUMFS_ITEM_INODE, 0);
+    valid = valid &&
+        adytumfs_item_walk_range(dev, &super, &store, root, &low, &high,
+                                 range_visit, &mid) == 0 &&
+        mid.count == 11u && mid.first == 30u && mid.last == 40u &&
+        !mid.out_of_order && !mid.payload_bad;
+
+    // A wide pair that starts in one leaf and ends in another, so the walk has
+    // to leave a leaf, skip the branches beside the range, and stop at the far
+    // end rather than running to the last item in the tree.
+    struct range_seen wide = {0};
+    struct adytumfs_item_key wide_low = item_key(60u, ADYTUMFS_ITEM_INODE, 0);
+    struct adytumfs_item_key wide_high = item_key(200u, ADYTUMFS_ITEM_INODE, 0);
+    valid = valid &&
+        adytumfs_item_walk_range(dev, &super, &store, root, &wide_low,
+                                 &wide_high, range_visit, &wide) == 0 &&
+        wide.count == 141u && wide.first == 60u && wide.last == 200u &&
+        !wide.out_of_order && !wide.payload_bad;
+
+    // One bound at a time, which is what a listing resumed from a cursor asks
+    // for.
+    struct range_seen tail = {0};
+    struct range_seen head = {0};
+    struct adytumfs_item_key tail_low = item_key(250u, ADYTUMFS_ITEM_INODE, 0);
+    valid = valid &&
+        adytumfs_item_walk_range(dev, &super, &store, root, &tail_low, 0,
+                                 range_visit, &tail) == 0 &&
+        tail.count == 51u && tail.first == 250u && tail.last == RANGE_ITEMS &&
+        adytumfs_item_walk_range(dev, &super, &store, root, 0, &high,
+                                 range_visit, &head) == 0 &&
+        head.count == 40u && head.first == 1u && head.last == 40u;
+
+    // A range that holds nothing has to come back empty rather than settling
+    // for the item the descent landed on.
+    struct range_seen none = {0};
+    struct range_seen single = {0};
+    struct adytumfs_item_key past_low = item_key(400u, ADYTUMFS_ITEM_INODE, 0);
+    struct adytumfs_item_key past_high = item_key(500u, ADYTUMFS_ITEM_INODE, 0);
+    struct adytumfs_item_key zero_low = item_key(0, ADYTUMFS_ITEM_INODE, 0);
+    struct adytumfs_item_key one_high = item_key(1u, ADYTUMFS_ITEM_INODE, 0);
+    valid = valid &&
+        adytumfs_item_walk_range(dev, &super, &store, root, &past_low,
+                                 &past_high, range_visit, &none) == 0 &&
+        none.count == 0 &&
+        adytumfs_item_walk_range(dev, &super, &store, root, &zero_low,
+                                 &one_high, range_visit, &single) == 0 &&
+        single.count == 1u && single.first == 1u;
+
+    if (!adytumfs_item_root_empty(root))
+        valid = valid && adytumfs_item_drop(dev, &super, &store, root) == 0;
+    adytumfs_window_discard(dev);
+    if (dev) object_release(dev);
+    valid = valid && object_active_count() == objects &&
+        block_active_count() == devices;
+    return valid ? 0 : -1;
+}

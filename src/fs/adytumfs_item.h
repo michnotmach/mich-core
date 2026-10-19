@@ -163,4 +163,20 @@ int adytumfs_item_walk(struct kernel_object *device,
                                     const u8 *data, u32 size, void *context),
                        void *context);
 
+// The same walk restricted to an inclusive key range, either end of which may
+// be absent. Items sharing an objectid sit together in key order, so a
+// directory listing reads its own entries and none of the tree beside them,
+// which is the difference between a listing that costs its own length and one
+// that costs the whole filesystem.
+int adytumfs_item_walk_range(struct kernel_object *device,
+                             struct adytumfs_superblock *super,
+                             struct adytumfs_cas *store,
+                             const u8 root[ADYTUMFS_ITEM_CHILD_SIZE],
+                             const struct adytumfs_item_key *from,
+                             const struct adytumfs_item_key *to,
+                             int (*visit)(const struct adytumfs_item_key *key,
+                                          const u8 *data, u32 size,
+                                          void *context),
+                             void *context);
+
 #endif

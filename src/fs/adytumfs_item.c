@@ -287,18 +287,33 @@ static int walk_push(const u8 child[ADYTUMFS_ITEM_CHILD_SIZE]) {
     return 0;
 }
 
-int adytumfs_item_walk(struct kernel_object *device,
-                       struct adytumfs_superblock *super,
-                       struct adytumfs_cas *store,
-                       const u8 root[ADYTUMFS_ITEM_CHILD_SIZE],
-                       int (*visit)(const struct adytumfs_item_key *key,
-                                    const u8 *data, u32 size, void *context),
-                       void *context) {
+// Set when a leaf passes the far end of a range, which ends the walk without
+// borrowing a return value a visitor might legitimately produce.
+static u32 walk_done;
+
+// One traversal serves the whole tree and a key range, because a range is the
+// same walk with the branches that cannot hold it left unpushed and the leaves
+// stopping at the far end. Two traversals would be two places to get the key
+// order wrong, and the order is what an audit compares a rebuild against.
+//
+// Both bounds are inclusive and either may be absent. A directory listing is
+// the case this exists for: its entries share an objectid, so the range is the
+// whole listing and the rest of the tree is never read.
+static int walk_range(struct kernel_object *device,
+                      struct adytumfs_superblock *super,
+                      struct adytumfs_cas *store,
+                      const u8 root[ADYTUMFS_ITEM_CHILD_SIZE],
+                      const struct adytumfs_item_key *from,
+                      const struct adytumfs_item_key *to,
+                      int (*visit)(const struct adytumfs_item_key *key,
+                                   const u8 *data, u32 size, void *context),
+                      void *context) {
     if (!device || !super || !store || !root || !visit) return -1;
     walk_top = 0;
+    walk_done = 0;
     if (adytumfs_item_root_empty(root)) return 0;
     if (walk_push(root)) return -1;
-    while (walk_top) {
+    while (walk_top && !walk_done) {
         walk_top--;
         u8 child[ADYTUMFS_ITEM_CHILD_SIZE];
         for (u32 byte = 0; byte < ADYTUMFS_ITEM_CHILD_SIZE; byte++)
@@ -318,6 +333,13 @@ int adytumfs_item_walk(struct kernel_object *device,
                 if (adytumfs_item_leaf_get(walk_node, index, &key, &data,
                                            &length))
                     return -1;
+                // Keys ascend within a leaf, so the first one past the far end
+                // ends the walk rather than being skipped over.
+                if (to && key_compare(&key, to) > 0) {
+                    walk_done = 1;
+                    break;
+                }
+                if (from && key_compare(&key, from) < 0) continue;
                 int result = visit(&key, data, length, context);
                 if (result) return result;
             }
@@ -327,12 +349,51 @@ int adytumfs_item_walk(struct kernel_object *device,
         // order, which is what an audit comparing against a sorted rebuild
         // needs.
         for (u32 index = count; index-- > 0;) {
+            struct adytumfs_item_key bound;
             u8 next[ADYTUMFS_ITEM_CHILD_SIZE];
-            if (adytumfs_item_branch_get(walk_node, index, 0, next)) return -1;
+            if (adytumfs_item_branch_get(walk_node, index, &bound, next))
+                return -1;
+            // A branch key is the largest key in its child's subtree, so a
+            // child ending below the range holds nothing in it, and walking
+            // down from here only meets more of the same.
+            if (from && key_compare(&bound, from) < 0) break;
+            // The child before this one carries the smallest key this child
+            // can hold, and a subtree starting above the range is out too.
+            if (to && index) {
+                struct adytumfs_item_key lower;
+                u8 skip[ADYTUMFS_ITEM_CHILD_SIZE];
+                if (adytumfs_item_branch_get(walk_node, index - 1, &lower,
+                                             skip))
+                    return -1;
+                if (key_compare(&lower, to) > 0) continue;
+            }
             if (walk_push(next)) return -1;
         }
     }
     return 0;
+}
+
+int adytumfs_item_walk(struct kernel_object *device,
+                       struct adytumfs_superblock *super,
+                       struct adytumfs_cas *store,
+                       const u8 root[ADYTUMFS_ITEM_CHILD_SIZE],
+                       int (*visit)(const struct adytumfs_item_key *key,
+                                    const u8 *data, u32 size, void *context),
+                       void *context) {
+    return walk_range(device, super, store, root, 0, 0, visit, context);
+}
+
+int adytumfs_item_walk_range(struct kernel_object *device,
+                             struct adytumfs_superblock *super,
+                             struct adytumfs_cas *store,
+                             const u8 root[ADYTUMFS_ITEM_CHILD_SIZE],
+                             const struct adytumfs_item_key *from,
+                             const struct adytumfs_item_key *to,
+                             int (*visit)(const struct adytumfs_item_key *key,
+                                          const u8 *data, u32 size,
+                                          void *context),
+                             void *context) {
+    return walk_range(device, super, store, root, from, to, visit, context);
 }
 
 static void hash_copy(u8 *to, const u8 *from) {

@@ -64,6 +64,7 @@ int test_adytumfs_item_insert64(void);
 int test_adytumfs_item_depth64(void);
 int test_adytumfs_item_drop64(void);
 int test_adytumfs_item_remove64(void);
+int test_adytumfs_item_range64(void);
 int test_adytumfs_index64(void);
 int test_adytumfs_verify64(void);
 int test_adytumfs_inode64(void);
