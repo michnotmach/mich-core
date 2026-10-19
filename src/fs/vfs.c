@@ -909,6 +909,13 @@ struct kernel_object *vfs_symlink(struct kernel_object *directory,
                                node->fs_generation, target)) {
         node->linked = 0;
         adytumfs_inode_remove(node->mount, node->fs_id);
+        // Creating the node took two references on the same object, one for
+        // the node table and one for the handle about to be returned. A failed
+        // link returns no handle, so both have to go. Dropping only the handle
+        // left the table holding a node that is no longer linked, and mount
+        // teardown skips unlinked nodes, so the node outlived every later
+        // unmount and the volume it belonged to.
+        object_release(node->self);
         object_release(object);
         return 0;
     }
