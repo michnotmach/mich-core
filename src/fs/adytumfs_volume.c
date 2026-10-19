@@ -109,7 +109,8 @@ int adytumfs_make(struct kernel_object *device) {
         .feature_compat = 0,
         .feature_incompat = ADYTUMFS_FEATURE_INCOMPAT_V3 |
                             ADYTUMFS_FEATURE_INCOMPAT_NO_CKSUM_REGION |
-                            ADYTUMFS_FEATURE_INCOMPAT_ITEM_INODES,
+                            ADYTUMFS_FEATURE_INCOMPAT_ITEM_INODES |
+                            ADYTUMFS_FEATURE_INCOMPAT_DIR_ITEMS,
         .feature_ro_compat = 0,
         .data_end = tail_base,
         .index_start = index_start,

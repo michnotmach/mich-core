@@ -23,7 +23,8 @@ int test_adytumfs_super64(void) {
         .feature_compat = 0,
         .feature_incompat = ADYTUMFS_FEATURE_INCOMPAT_V3 |
                             ADYTUMFS_FEATURE_INCOMPAT_NO_CKSUM_REGION |
-                            ADYTUMFS_FEATURE_INCOMPAT_ITEM_INODES,
+                            ADYTUMFS_FEATURE_INCOMPAT_ITEM_INODES |
+                            ADYTUMFS_FEATURE_INCOMPAT_DIR_ITEMS,
         .feature_ro_compat = 0,
         .data_end = 1022,
         .index_start = 2,
@@ -91,9 +92,13 @@ int test_adytumfs_super64(void) {
     bad.data_end = super.data_start;
     valid = valid && adytumfs_super_valid(&bad, 1024) != 0;
     bad = super;
+    // A bit no build defines, which is the one case that has to be refused
+    // rather than ignored: an extra bit means a newer build wrote something
+    // this one cannot interpret.
     bad.feature_incompat = ADYTUMFS_FEATURE_INCOMPAT_V3 |
                            ADYTUMFS_FEATURE_INCOMPAT_NO_CKSUM_REGION |
-                           ADYTUMFS_FEATURE_INCOMPAT_ITEM_INODES | 0x10u;
+                           ADYTUMFS_FEATURE_INCOMPAT_ITEM_INODES |
+                           ADYTUMFS_FEATURE_INCOMPAT_DIR_ITEMS | 0x20u;
     valid = valid && adytumfs_super_valid(&bad, 1024) != 0;
 
     // The clean break: the v2 mask is not a smaller v3, it is a volume this

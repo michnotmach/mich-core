@@ -83,7 +83,8 @@ int adytumfs_super_valid(const struct adytumfs_superblock *super,
     if (super->feature_incompat !=
         (ADYTUMFS_FEATURE_INCOMPAT_V3 |
          ADYTUMFS_FEATURE_INCOMPAT_NO_CKSUM_REGION |
-         ADYTUMFS_FEATURE_INCOMPAT_ITEM_INODES))
+         ADYTUMFS_FEATURE_INCOMPAT_ITEM_INODES |
+         ADYTUMFS_FEATURE_INCOMPAT_DIR_ITEMS))
         return -1;
     if (super->block_size != ADYTUMFS_BLOCK_SIZE) return -1;
     if (super->total_blocks > device_blocks) return -1;

@@ -11,6 +11,8 @@
 #include "vfs.h"
 #include "resource.h"
 
+void serial64_write(const char *text);
+
 // One staging block for raw device probes and on-disk edits; the test battery
 // is single-CPU, so reuse across probes is safe.
 static u8 adytumfs_probe_block[ADYTUMFS_BLOCK_SIZE];
@@ -44,6 +46,60 @@ static int probe_read_block(struct kernel_object *dev, u64 block, u8 *buffer) {
 // single static store serves all of them and no scenario has to say so.
 static struct adytumfs_cas adytumfs_test_store;
 
+// Directory entries are items in the item tree, and copy on write writes a
+// node per edit that nothing reclaims until a commit, so the volumes in this
+// battery have to carry the metadata churn rather than fit the smallest layout
+// the packed directory records needed. Measured, not guessed: the overrun case
+// creates 127 files through a sync per file and needs every block a device
+// takes, while 320 sectors ran out around a hundred. One constant, because a
+// size asserted against the superblock has to be the size the device was
+// created with.
+#define ADYTUMFS_TEST_SECTORS 2304u
+
+// The overrun case is the exception: it fills a directory past the mount slot
+// bound, which is the one place the battery needs every block a device takes.
+// Giving the whole battery that size pushed the suite past the smoke timeout.
+#define ADYTUMFS_OVERRUN_SECTORS 4096u
+
+
+// Find the mount slot holding a name.
+//
+// Slot numbers follow the order the mount walk met the names in, and a
+// directory now lists in hash order rather than insertion order, so a test
+// that wants a particular file has to look for it instead of assuming where it
+// landed. What is worth asserting is the metadata and the parent link, not the
+// numbering the walk happened to produce.
+static int probe_find_slot(u32 mount_id, const char *want, u32 *slot,
+                           u32 *used, u32 *type, u32 *size, u32 *parent,
+                           u32 *mode) {
+    char probe_name[VFS_NAME_MAX + 1];
+    for (u32 index = 1; index < 64u; index++) {
+        if (adytumfs_inode_get(mount_id, index, used, type, size, parent, mode,
+                               probe_name, 0))
+            continue;
+        if (*used && probe_name_equals(probe_name, want)) {
+            *slot = index;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+// A hard-linked inode is stored under whichever of its names the mount walk
+// met first, and a directory now lists in hash order, so which name that is
+// follows from the hashes rather than from the order the links were made in.
+// Both names resolve to the same node through the VFS, which is the property
+// that matters; the stored one is not.
+static int probe_find_slot_any(u32 mount_id, const char *first,
+                               const char *second, u32 *slot, u32 *used,
+                               u32 *type, u32 *size, u32 *parent, u32 *mode) {
+    if (!probe_find_slot(mount_id, first, slot, used, type, size, parent, mode))
+        return 0;
+    return probe_find_slot(mount_id, second, slot, used, type, size, parent,
+                           mode);
+}
+
+
 static int policy_super(struct kernel_object *dev,
                         struct adytumfs_superblock *super) {
     if (adytumfs_super_read(dev, super)) return -1;
@@ -52,42 +108,72 @@ static int policy_super(struct kernel_object *dev,
     return 0;
 }
 
-// Locate a root directory record by name and leave its data block in the
-// staging buffer, so a scenario can edit one field of one record in place.
-static int policy_find_record(struct kernel_object *dev,
-                              struct adytumfs_superblock *super,
-                              const char *name, u32 name_len, u64 *block,
-                              u32 *offset) {
-    struct adytumfs_inode dir;
-    if (adytumfs_inode_read(dev, super, &adytumfs_test_store,
-                            super->root_inode, &dir)) return -1;
-    u64 physical = 0;
-    if (adytumfs_inode_map(dev, super, &adytumfs_test_store, &dir, 0,
-                           &physical))
-        return -1;
-    if (adytumfs_block_read(dev, physical, adytumfs_probe_block)) return -1;
-    u32 cursor = 0;
-    while (cursor + ADYTUMFS_DIR_HEADER <= ADYTUMFS_BLOCK_SIZE) {
-        u64 entry_inode = adytumfs_read_le64(adytumfs_probe_block + cursor);
-        u16 rec_len = adytumfs_read_le16(adytumfs_probe_block + cursor + 8);
-        u8 stored_len = adytumfs_probe_block[cursor + 10];
-        if (rec_len < ADYTUMFS_DIR_HEADER ||
-            cursor + rec_len > ADYTUMFS_BLOCK_SIZE)
+// Publish a forged copy of one directory entry as the next generation.
+//
+// Content addressing means a bare byte flip is caught by the node hash before
+// anything reads the entry, so a lie that has to reach a mount check needs a
+// hash matching what it holds, and republishing through the tree is what
+// produces one. The bucket is read first so the forgery replaces one entry and
+// leaves any other name sharing the hash untouched, which is also what a real
+// corruption would look like: one entry wrong, the rest of the volume sound.
+static int policy_forge_dirent(struct kernel_object *dev,
+                               struct adytumfs_superblock *super, u64 dir,
+                               const char *name, u32 name_len, u64 target,
+                               u8 type) {
+    static u8 bucket[8 * (ADYTUMFS_DIRENT_HEADER + ADYTUMFS_NAME_MAX)];
+    u64 hash = 0;
+    if (adytumfs_dir_name_hash(name, name_len, &hash)) return -1;
+    struct adytumfs_item_key key = {0};
+    key.objectid = dir;
+    key.type = ADYTUMFS_ITEM_DIR;
+    key.offset = hash;
+    u32 used = 0;
+    if (!adytumfs_item_lookup(dev, super, &adytumfs_test_store,
+                              super->inode_root, &key, bucket,
+                              (u32)sizeof bucket, &used)) {
+        u32 at = 0;
+        if (adytumfs_dirent_find(bucket, used, name, name_len, &at)) return -1;
+        u64 inode = 0;
+        u8 old_type = 0;
+        u32 length = 0;
+        if (adytumfs_dirent_read(bucket, used, at, &inode, &old_type, &length))
             return -1;
-        if (entry_inode && stored_len == name_len) {
-            u32 index = 0;
-            while (index < name_len &&
-                   adytumfs_probe_block[cursor + 12 + index] == (u8)name[index])
-                index++;
-            if (index == name_len) {
-                *block = physical;
-                *offset = cursor;
-                return 0;
-            }
-        }
-        cursor += rec_len;
+        u32 entry = ADYTUMFS_DIRENT_HEADER + length;
+        for (u32 index = at + entry; index < used; index++)
+            bucket[index - entry] = bucket[index];
+        used -= entry;
     }
-    return -1;
+    if (adytumfs_dirent_pack(bucket + used, (u32)sizeof bucket - used, target,
+                             type, name, name_len))
+        return -1;
+    used += ADYTUMFS_DIRENT_HEADER + name_len;
+    u8 next[ADYTUMFS_HASH_SIZE];
+    if (adytumfs_item_insert(dev, super, &adytumfs_test_store,
+                             super->inode_root, &key, bucket, used, next))
+        return -1;
+    for (u32 byte = 0; byte < ADYTUMFS_HASH_SIZE; byte++)
+        super->inode_root[byte] = next[byte];
+    return 0;
+}
+
+// Land a superblock whose root was moved outside the commit protocol.
+//
+// The commit skips itself when no inode is staged, and a forged directory
+// entry stages none, so the generation has to be written the way the commit
+// would have written it: into the slot that is not the active one, with a
+// higher generation, and with the cache dropped so the mount that follows
+// reads the device rather than a stale copy of it.
+static int policy_land_super(struct kernel_object *dev,
+                             struct adytumfs_superblock *super) {
+    super->active_slot = super->active_slot ? 0 : 1;
+    super->generation++;
+    adytumfs_super_pack(adytumfs_probe_block, super);
+    if (adytumfs_block_write(dev, adytumfs_superblock_block(super),
+                             adytumfs_probe_block))
+        return -1;
+    if (block_cache_flush(dev)) return -1;
+    block_cache_drop_device((u32)dev->value);
+    return 0;
 }
 
 // Land a staging-block edit on the device and drop the cached copies, so the
@@ -134,7 +220,7 @@ int test_adytumfs64(void) {
     struct kernel_object *root = vfs_root();
     struct kernel_object *mnt = root ?
         vfs_create(root, "disk", VFS_NODE_DIRECTORY) : 0;
-    struct kernel_object *dev = block_create(320, 0);
+    struct kernel_object *dev = block_create(ADYTUMFS_TEST_SECTORS, 0);
     u8 payload[16];
     u8 received[16];
     for (u32 i = 0; i < 16; i++) {
@@ -282,20 +368,26 @@ int test_adytumfs64(void) {
             break;
         }
     u32 used = 0, type = 0, size = 0, parent = 0, mode = 0;
-    char name[VFS_NAME_MAX + 1];
+    // The parent of "nested" is asserted against the slot "folder" actually
+    // occupies rather than against a number, because which slot a name lands
+    // in is an artefact of the walk order and not a property of the volume.
+    u32 hello_slot = 0;
+    u32 folder_slot = 0;
+    u32 nested_slot = 0;
+    u32 nested_parent = 0;
     valid = valid && mount_id &&
-        !adytumfs_inode_get(mount_id, 1, &used, &type, &size, &parent, &mode,
-                           name, 0) &&
+        !probe_find_slot_any(mount_id, "hello", "hello-alias", &hello_slot,
+                             &used, &type, &size, &parent, &mode) &&
         used == 1 && type == VFS_NODE_REGULAR && size == 4 && parent == 0 &&
-        mode == 0604 && probe_name_equals(name, "hello") &&
-        !adytumfs_inode_get(mount_id, 2, &used, &type, &size, &parent, &mode,
-                           name, 0) &&
+        mode == 0604 &&
+        !probe_find_slot(mount_id, "folder", &folder_slot, &used, &type, &size,
+                         &parent, &mode) &&
         used == 1 && type == VFS_NODE_DIRECTORY && parent == 0 &&
-        mode == 0711 && probe_name_equals(name, "folder") &&
-        !adytumfs_inode_get(mount_id, 3, &used, &type, &size, &parent, &mode,
-                           name, 0) &&
-        used == 1 && type == VFS_NODE_REGULAR && parent == 2 &&
-        mode == 0620 && probe_name_equals(name, "nested");
+        mode == 0711 &&
+        !probe_find_slot(mount_id, "nested", &nested_slot, &used, &type, &size,
+                         &nested_parent, &mode) &&
+        used == 1 && type == VFS_NODE_REGULAR && mode == 0620 &&
+        nested_parent == folder_slot;
     if (reopened) {
         object_release(reopened);
         reopened = 0;
@@ -529,7 +621,7 @@ int test_adytumfs_pages64(void) {
     struct kernel_object *root = vfs_root();
     struct kernel_object *mnt = root ?
         vfs_create(root, "pages", VFS_NODE_DIRECTORY) : 0;
-    struct kernel_object *dev = block_create(320, 0);
+    struct kernel_object *dev = block_create(ADYTUMFS_TEST_SECTORS, 0);
     int valid = root && mnt && dev && !adytumfs_format(dev) &&
         !vfs_mount_adytumfs(mnt, dev);
     struct kernel_object *disk = valid ? vfs_lookup(root, "pages") : 0;
@@ -563,7 +655,8 @@ int test_adytumfs_pages64(void) {
         !probe_read_block(dev, 0, adytumfs_probe_block) &&
         !adytumfs_super_unpack(&probe, adytumfs_probe_block) &&
         probe.format_version == ADYTUMFS_FORMAT_VERSION &&
-        probe.total_blocks == 320u / ADYTUMFS_SECTORS_PER_BLOCK &&
+        probe.total_blocks ==
+            ADYTUMFS_TEST_SECTORS / ADYTUMFS_SECTORS_PER_BLOCK &&
         probe.root_inode == ADYTUMFS_ROOT_INODE &&
         probe.generation == 1;
     adytumfs_cas_open(&adytumfs_test_store, probe.index_start,
@@ -675,7 +768,7 @@ int test_adytumfs_policy64(void) {
     // A dirent naming an inode the table no longer backs must fail the mount
     // rather than surface a file with another inode's content.
     {
-        struct kernel_object *dev = block_create(320, 0);
+        struct kernel_object *dev = block_create(ADYTUMFS_TEST_SECTORS, 0);
         struct kernel_object *point = root ?
             vfs_create(root, "policy", VFS_NODE_DIRECTORY) : 0;
         int ok = dev && point && !adytumfs_format(dev) &&
@@ -713,7 +806,7 @@ int test_adytumfs_policy64(void) {
     // A dirent whose type disagrees with the target inode means the tree
     // cannot be trusted, so the mount must fail.
     {
-        struct kernel_object *dev = block_create(320, 0);
+        struct kernel_object *dev = block_create(ADYTUMFS_TEST_SECTORS, 0);
         struct kernel_object *point = root ?
             vfs_create(root, "policy", VFS_NODE_DIRECTORY) : 0;
         int ok = dev && point && !adytumfs_format(dev) &&
@@ -726,12 +819,14 @@ int test_adytumfs_policy64(void) {
         if (disk) object_release(disk);
         ok = ok && !vfs_unmount(point);
         struct adytumfs_superblock super;
-        u64 block = 0;
-        u32 at = 0;
+        u64 hello = 0;
         ok = ok && !policy_super(dev, &super) &&
-            !policy_find_record(dev, &super, "hello", 5, &block, &at);
-        if (ok) adytumfs_probe_block[at + 11] = ADYTUMFS_DTYPE_DIR;
-        ok = ok && !policy_commit(dev, block) &&
+            !adytumfs_dir_lookup(dev, &super, &adytumfs_test_store,
+                                 super.root_inode, "hello", 5, &hello) &&
+            hello &&
+            !policy_forge_dirent(dev, &super, super.root_inode, "hello", 5,
+                                 hello, ADYTUMFS_DTYPE_DIR) &&
+            !policy_land_super(dev, &super) &&
             vfs_mount_adytumfs(point, dev) < 0;
         valid = valid && ok;
         if (point) object_release(point);
@@ -743,7 +838,7 @@ int test_adytumfs_policy64(void) {
     // inode's second name is a hard link now, but a directory can never
     // carry one, so the mount must fail.
     {
-        struct kernel_object *dev = block_create(320, 0);
+        struct kernel_object *dev = block_create(ADYTUMFS_TEST_SECTORS, 0);
         struct kernel_object *point = root ?
             vfs_create(root, "policy", VFS_NODE_DIRECTORY) : 0;
         int ok = dev && point && !adytumfs_format(dev) &&
@@ -760,16 +855,14 @@ int test_adytumfs_policy64(void) {
         ok = ok && !vfs_unmount(point);
         struct adytumfs_superblock super;
         u64 alias = 0;
-        u64 block = 0;
-        u32 at = 0;
         ok = ok && !policy_super(dev, &super) &&
             !adytumfs_dir_lookup(dev, &super, &adytumfs_test_store,
                                  super.root_inode, "a", 1,
                                  &alias) &&
             alias &&
-            !policy_find_record(dev, &super, "b", 1, &block, &at);
-        if (ok) adytumfs_write_le64(adytumfs_probe_block + at, alias);
-        ok = ok && !policy_commit(dev, block) &&
+            !policy_forge_dirent(dev, &super, super.root_inode, "b", 1, alias,
+                                 ADYTUMFS_DTYPE_DIR) &&
+            !policy_land_super(dev, &super) &&
             vfs_mount_adytumfs(point, dev) < 0;
         valid = valid && ok;
         if (point) object_release(point);
@@ -780,7 +873,7 @@ int test_adytumfs_policy64(void) {
     // An inode no dirent names is invisible, not fatal: the mount succeeds,
     // the orphan stays unreached, and the table still admits new files.
     {
-        struct kernel_object *dev = block_create(320, 0);
+        struct kernel_object *dev = block_create(ADYTUMFS_TEST_SECTORS, 0);
         struct kernel_object *point = root ?
             vfs_create(root, "policy", VFS_NODE_DIRECTORY) : 0;
         int ok = dev && point && !adytumfs_format(dev) &&
@@ -827,7 +920,7 @@ int test_adytumfs_policy64(void) {
     // nine table blocks and so outnumbers the bound, and the last reachable
     // inode is placed by the format layer itself.
     {
-        struct kernel_object *dev = block_create(2304, 0);
+        struct kernel_object *dev = block_create(ADYTUMFS_OVERRUN_SECTORS, 0);
         struct kernel_object *point = root ?
             vfs_create(root, "policy", VFS_NODE_DIRECTORY) : 0;
         int ok = dev && point && !adytumfs_format(dev) &&
@@ -843,7 +936,18 @@ int test_adytumfs_policy64(void) {
             struct kernel_object *node = disk ?
                 vfs_create(disk, label, VFS_NODE_REGULAR) : 0;
             ok = node != 0;
-            if (node) object_release(node);
+            if (node) {
+                // Creating a file stages two copy-on-write edits, an inode and
+                // a directory entry, and nothing reclaims the generations they
+                // supersede until a commit. Only a sync boundary commits, so a
+                // volume this size has to be synced through the loop: without
+                // it the allocations run out around a hundred files and the
+                // overrun this block exists to prove never becomes reachable.
+                struct kernel_object *file = vfs_open(node);
+                ok = file && !vfs_fsync(file);
+                if (file) object_release(file);
+                object_release(node);
+            }
         }
         ok = ok && disk;
         if (disk) object_release(disk);
@@ -873,7 +977,7 @@ int test_adytumfs_policy64(void) {
     // refuses the seventeenth. The names go in through the format layer
     // directly because the VFS link path enforces the same bound upstream.
     {
-        struct kernel_object *dev = block_create(320, 0);
+        struct kernel_object *dev = block_create(ADYTUMFS_TEST_SECTORS, 0);
         struct kernel_object *point = root ?
             vfs_create(root, "policy", VFS_NODE_DIRECTORY) : 0;
         int ok = dev && point && !adytumfs_format(dev) &&
@@ -953,7 +1057,7 @@ int test_adytumfs_reuse64(void) {
     // can be reused by the next create. Every later backend call through the
     // stale handle must fail closed instead of reaching the new owner.
     {
-        struct kernel_object *dev = block_create(320, 0);
+        struct kernel_object *dev = block_create(ADYTUMFS_TEST_SECTORS, 0);
         struct kernel_object *point = root ?
             vfs_create(root, "reuse", VFS_NODE_DIRECTORY) : 0;
         int ok = dev && point && !adytumfs_format(dev);
@@ -1126,7 +1230,7 @@ static int integrity_stage(struct kernel_object *root,
                            struct kernel_object **point_out,
                            struct adytumfs_superblock *super,
                            u64 *data_inode, u64 *other_inode) {
-    struct kernel_object *dev = block_create(320, 0);
+    struct kernel_object *dev = block_create(ADYTUMFS_TEST_SECTORS, 0);
     struct kernel_object *point = root ?
         vfs_create(root, "integrity", VFS_NODE_DIRECTORY) : 0;
     int ok = dev && point && !adytumfs_format(dev) &&
@@ -1569,20 +1673,21 @@ int test_adytumfs_checksum64(void) {
     }
     valid = valid && point && !vfs_unmount(point);
 
-    // A flipped dirent byte must fail the mount itself: the walk reads
-    // directory blocks through the verified path too.
-    valid = valid && !adytumfs_inode_read(dev, &super, &adytumfs_test_store,
-                                          super.root_inode, &in) &&
-        !adytumfs_inode_map(dev, &super, &adytumfs_test_store, &in, 0,
-                            &physical) &&
-        !adytumfs_block_read(dev, physical, adytumfs_probe_block);
-    if (valid) adytumfs_probe_block[20] ^= 0x80u;
-    valid = valid && !adytumfs_block_write(dev, physical,
-                                           adytumfs_probe_block) &&
+    // A flipped byte in the node holding the directory's entries must fail the
+    // mount itself: the walk resolves every node through the verified path, and
+    // a directory is an item in the tree now rather than a block of packed
+    // entries, so the byte that used to sit in a dirent sits in a leaf. The
+    // offset is past the node header and the first slot's key, which puts it in
+    // the entry's own bytes where a real corruption would land.
+    u64 leaf = 0;
+    valid = valid && !adytumfs_cas_lookup(dev, &super, &adytumfs_test_store,
+                                          super.inode_root, &leaf) &&
+        !adytumfs_block_read(dev, leaf, adytumfs_probe_block);
+    if (valid) adytumfs_probe_block[56] ^= 0x80u;
+    valid = valid && !adytumfs_block_write(dev, leaf, adytumfs_probe_block) &&
         !integrity_commit(dev, &super) && vfs_mount_adytumfs(point, dev) < 0;
-    if (valid) adytumfs_probe_block[20] ^= 0x80u;
-    valid = valid && !adytumfs_block_write(dev, physical,
-                                           adytumfs_probe_block) &&
+    if (valid) adytumfs_probe_block[56] ^= 0x80u;
+    valid = valid && !adytumfs_block_write(dev, leaf, adytumfs_probe_block) &&
         !integrity_commit(dev, &super);
 
     integrity_cleanup(root, point, dev);
@@ -1775,24 +1880,26 @@ int test_adytumfs_cow64(void) {
     }
     valid = valid && point && !vfs_unmount(point);
 
-    // A dirent edit redirects the directory block: the old block keeps the
-    // original records while the new one carries the tombstone. The sync and
-    // unmount above committed, so the raw super copy has to follow the flip
-    // before this window stages against it.
-    u64 record_block = 0;
-    u32 record_at = 0;
-    u8 record_keep[32];
+    // The removal is copy on write, so the generation the device still names
+    // keeps resolving the name until the commit that supersedes it. Reading
+    // the superblock back off the device rather than reusing the one the
+    // removal updated is what makes that a statement about the device and not
+    // about the copy in memory, which is the property a crash between the two
+    // depends on.
     valid = valid && !adytumfs_super_read(dev, &super) &&
-        !policy_find_record(dev, &super, "data", 4, &record_block,
-                            &record_at);
-    for (u32 index = 0; valid && index < sizeof(record_keep); index++)
-        record_keep[index] = adytumfs_probe_block[index];
-    valid = valid && !adytumfs_dir_remove(dev, &super, &adytumfs_test_store,
-                                          super.root_inode,
-                                          "data", 4) &&
-        !probe_read_block(dev, record_block, adytumfs_probe_block);
-    for (u32 index = 0; valid && index < sizeof(record_keep); index++)
-        if (adytumfs_probe_block[index] != record_keep[index]) valid = 0;
+        !adytumfs_dir_remove(dev, &super, &adytumfs_test_store,
+                             super.root_inode, "data", 4);
+    // The removal is copy on write, so the generation the device still names
+    // keeps resolving the name until a commit supersedes it. Reading the
+    // superblock back off the device rather than reusing the one the removal
+    // updated is what makes that a statement about the device and not about
+    // the copy in memory, which is what a crash between the two relies on.
+    struct adytumfs_superblock on_device;
+    u64 survivor = 0;
+    valid = valid && !adytumfs_super_read(dev, &on_device) &&
+        !adytumfs_dir_lookup(dev, &on_device, &adytumfs_test_store,
+                             on_device.root_inode, "data", 4, &survivor) &&
+        survivor == data_inode;
     valid = valid &&
         adytumfs_dir_lookup(dev, &super, &adytumfs_test_store, super.root_inode,
                             "data", 4,

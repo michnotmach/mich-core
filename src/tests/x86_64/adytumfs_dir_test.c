@@ -8,7 +8,11 @@
 int test_adytumfs_dir64(void) {
     u32 objects = object_active_count();
     u32 devices = block_active_count();
-    struct kernel_object *dev = block_create(512, 0);   // 64 filesystem blocks
+    // Directory entries are tree nodes now, and copy on write writes a
+    // node per edit that nothing reclaims until a commit, so the volume
+    // has to be the largest a device takes rather than the smallest one
+    // the packed layout could fit in.
+    struct kernel_object *dev = block_create(4096, 0);
 
     // A 4 KiB block is too big for a modest stack, and the test is single
     // threaded, so the scratch block is static.
@@ -48,7 +52,10 @@ int test_adytumfs_dir64(void) {
         adytumfs_dir_add(dev, &super, &store, root, "beta", 4, 60, ADYTUMFS_DTYPE_REG) == 0 &&
         adytumfs_dir_lookup(dev, &super, &store, root, "beta", 4, &got) == 0 && got == 60;
 
-    // A fresh directory grows into a second block once entries overflow one.
+    // Entries live in the tree, so a directory that holds forty of them still
+    // owns no data blocks at all. That is the whole point of the change: what
+    // used to grow the directory by a block per overflow now costs it nothing,
+    // and the entries are reached by hash instead of by scanning blocks.
     u64 dirnum = 0;
     valid = valid &&
         adytumfs_inode_alloc(dev, &super, &store, ADYTUMFS_MODE_DIR | 0755u, &dirnum) == 0;
@@ -63,7 +70,7 @@ int test_adytumfs_dir64(void) {
     struct adytumfs_inode grown;
     longname[0] = (u8)('a' + 20);
     valid = valid && adytumfs_inode_read(dev, &super, &store, dirnum, &grown) == 0 &&
-        grown.blocks >= 2 &&
+        grown.blocks == 0 && grown.size == 0 &&
         adytumfs_dir_lookup(dev, &super, &store, dirnum, (const char *)longname,
                             sizeof(longname), &got) == 0 && got == 1020;
 
@@ -93,7 +100,7 @@ int test_adytumfs_diritem64(void) {
     // A bucket is a list that describes itself, so the walk has to stop where
     // the bytes say and not where a count says. Two entries, the second found
     // by name rather than by position.
-    static u8 pair[2 * (ADYTUMFS_DIR_HEADER + 3u)];
+    static u8 pair[2 * (ADYTUMFS_DIRENT_HEADER + 3u)];
     u32 at = 0;
     u64 inode = 0;
     u8 kind = 0;
@@ -101,11 +108,11 @@ int test_adytumfs_diritem64(void) {
     valid = valid &&
         adytumfs_dirent_pack(pair, (u32)sizeof pair, 21, ADYTUMFS_DTYPE_REG,
                              "one", 3) == 0 &&
-        adytumfs_dirent_pack(pair + ADYTUMFS_DIR_HEADER + 3u,
-                             (u32)sizeof pair - ADYTUMFS_DIR_HEADER - 3u, 22,
+        adytumfs_dirent_pack(pair + ADYTUMFS_DIRENT_HEADER + 3u,
+                             (u32)sizeof pair - ADYTUMFS_DIRENT_HEADER - 3u, 22,
                              ADYTUMFS_DTYPE_DIR, "two", 3) == 0 &&
         adytumfs_dirent_find(pair, (u32)sizeof pair, "two", 3, &at) == 0 &&
-        at == ADYTUMFS_DIR_HEADER + 3u &&
+        at == ADYTUMFS_DIRENT_HEADER + 3u &&
         adytumfs_dirent_read(pair, (u32)sizeof pair, at, &inode, &kind,
                              &length) == 0 &&
         inode == 22 && kind == ADYTUMFS_DTYPE_DIR && length == 3u &&
@@ -179,7 +186,7 @@ int test_adytumfs_diritem64(void) {
     // Finding "alpha" has to fail on the name rather than answer from the key,
     // and adding it has to join the bucket rather than overwrite the name
     // already there.
-    static u8 forged[2 * (ADYTUMFS_DIR_HEADER + 5u)];
+    static u8 forged[2 * (ADYTUMFS_DIRENT_HEADER + 5u)];
     u64 hash = 0;
     struct adytumfs_item_key key = {0};
     valid = valid &&
@@ -195,7 +202,7 @@ int test_adytumfs_diritem64(void) {
         adytumfs_dirent_pack(forged, (u32)sizeof forged, 77,
                              ADYTUMFS_DTYPE_REG, "other", 5) == 0 &&
         adytumfs_item_insert(dev, &super, &store, root, &key, forged,
-                             ADYTUMFS_DIR_HEADER + 5u, next) == 0;
+                             ADYTUMFS_DIRENT_HEADER + 5u, next) == 0;
     for (u32 index = 0; index < ADYTUMFS_HASH_SIZE; index++)
         root[index] = next[index];
     valid = valid &&

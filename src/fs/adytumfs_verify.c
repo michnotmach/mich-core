@@ -225,8 +225,9 @@ static int verify_index(struct kernel_object *device,
     return live == allocated ? 0 : -1;
 }
 
-// Every item the tree holds is an inode today, so the shape check sits in one
-// place rather than being repeated per visitor.
+// The tree holds inodes and the directory entries of directories. The inode
+// shape check sits in one place rather than being repeated per visitor, and the
+// dispatch on type is what lets both kinds be audited by the same walk.
 static int scan_inode_item(const struct adytumfs_item_key *key,
                            const u8 *data, u32 size,
                            struct adytumfs_inode *out) {
@@ -245,6 +246,10 @@ struct verify_scan {
     // superblock is only meaningful against this, because the check on the
     // superblock itself can only bound it by the live count.
     u64 highest;
+    // The inode the last inode item named. Items are ordered by objectid and
+    // then by type, and an inode item sorts before the directory entries of
+    // the same number, so a bucket can only belong to this one.
+    u64 last_inode;
 };
 
 // Both visitors need the number, so the shape check and the bound it makes
@@ -254,12 +259,42 @@ static int scan_number(struct verify_scan *scan, u64 number) {
     return 0;
 }
 
+// A directory bucket is a list, so the audit walks it the way a lookup does.
+// Every entry has to parse and name an inode, and the bucket has to belong to
+// the inode the key says it does, because a name that resolves to nothing is
+// one the mount hands back and then fails to open.
+static int scan_dir_item(struct verify_scan *scan,
+                         const struct adytumfs_item_key *key, const u8 *data,
+                         u32 size) {
+    if (!key->objectid || key->objectid != scan->last_inode) return -1;
+    u32 offset = 0;
+    u32 entries = 0;
+    while (offset + ADYTUMFS_DIRENT_HEADER <= size) {
+        u64 target = 0;
+        u8 type = 0;
+        u32 length = 0;
+        if (adytumfs_dirent_read(data, size, offset, &target, &type, &length))
+            return -1;
+        if (!target) return -1;
+        offset += ADYTUMFS_DIRENT_HEADER + length;
+        entries++;
+    }
+    // Ending anywhere but the item's own end leaves bytes no entry accounts
+    // for, and an empty bucket is one the tree never stores.
+    if (offset != size || !entries) return -1;
+    return 0;
+}
+
 static int scan_retain(const struct adytumfs_item_key *key, const u8 *data,
                        u32 size, void *context) {
     struct verify_scan *scan = context;
+    // A directory entry owns no blocks, so there is nothing for a rebuild to
+    // take a reference on and nothing for it to leak.
+    if (key->type == ADYTUMFS_ITEM_DIR) return 0;
     struct adytumfs_inode in;
     if (scan_inode_item(key, data, size, &in)) return -1;
     scan_number(scan, key->objectid);
+    scan->last_inode = key->objectid;
     if (adytumfs_tree_root_empty(in.extent_root)) return 0;
     if (adytumfs_cas_retain(scan->device, scan->super, scan->store,
                             in.extent_root))
@@ -271,9 +306,12 @@ static int scan_retain(const struct adytumfs_item_key *key, const u8 *data,
 static int scan_audit(const struct adytumfs_item_key *key, const u8 *data,
                       u32 size, void *context) {
     struct verify_scan *scan = context;
+    if (key->type == ADYTUMFS_ITEM_DIR)
+        return scan_dir_item(scan, key, data, size);
     struct adytumfs_inode in;
     if (scan_inode_item(key, data, size, &in)) return -1;
     scan_number(scan, key->objectid);
+    scan->last_inode = key->objectid;
     u32 bits = in.mode & (ADYTUMFS_MODE_DIR | ADYTUMFS_MODE_REG |
                           ADYTUMFS_MODE_LNK);
     if (bits != ADYTUMFS_MODE_DIR && bits != ADYTUMFS_MODE_REG &&
@@ -365,8 +403,26 @@ static int rebuild_index(struct kernel_object *device,
             roots[found][byte] = root[byte];
         found++;
     }
-    struct verify_scan scan = {device, super, store, 0, 0};
+    // The copy the mount reads has to resolve: every later access goes through
+    // it, so a root nothing maps means the rebuild cannot restore the volume.
+    // The other copy is a fallback, and the commit that retires a generation
+    // hands its blocks back before the flip that overwrites the slot naming
+    // it, so a fallback whose nodes the index no longer maps is the collection
+    // walk having done its job rather than a volume worth refusing. Skipping
+    // it costs nothing: those blocks are already back with the allocator, so
+    // there is no mapping for the ledger to balance against.
+    u8 active[ADYTUMFS_HASH_SIZE];
+    if (!adytumfs_superblock_slot_root(device, super, super->active_slot,
+                                       active))
+        return -1;
+    struct verify_scan scan = {device, super, store, 0, 0, 0};
     for (u32 index = 0; index < found; index++) {
+        u32 refs = 0;
+        int resolves = !adytumfs_cas_refs(device, super, store, roots[index],
+                                          &refs);
+        if (!resolves &&
+            !crypto_equal(roots[index], active, ADYTUMFS_HASH_SIZE))
+            continue;
         if (verify_item_refs(device, super, store, roots[index])) return -1;
         if (adytumfs_item_walk(device, super, store, roots[index], scan_retain,
                                &scan))
@@ -390,7 +446,7 @@ static int verify_volume(struct kernel_object *device,
     // Every inode the tree holds is audited, not only the ones a mount walks:
     // an inode nothing references still owns blocks, and the ledger below only
     // balances when all of them are counted.
-    struct verify_scan scan = {device, super, store, 0, 0};
+    struct verify_scan scan = {device, super, store, 0, 0, 0};
     if (adytumfs_item_walk(device, super, store, super->inode_root, scan_audit,
                            &scan))
         return -1;

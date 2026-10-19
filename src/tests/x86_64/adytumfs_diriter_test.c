@@ -7,7 +7,11 @@
 int test_adytumfs_diriter64(void) {
     u32 objects = object_active_count();
     u32 devices = block_active_count();
-    struct kernel_object *dev = block_create(512, 0);   // 64 filesystem blocks
+    // Directory entries are tree nodes now, and copy on write writes a
+    // node per edit that nothing reclaims until a commit, so the volume
+    // has to be the largest a device takes rather than the smallest one
+    // the packed layout could fit in.
+    struct kernel_object *dev = block_create(4096, 0);
 
     // A 4 KiB block is too big for a modest stack, and the test is single
     // threaded, so the scratch block is static.

@@ -75,6 +75,11 @@ static inline void adytumfs_write_le64(u8 *p, u64 value) {
 // two slots that held the table are reserved and must read as zero, so a
 // volume written before this has no path here and says so itself.
 #define ADYTUMFS_FEATURE_INCOMPAT_ITEM_INODES 0x8u
+// Directory entries are items in the item tree rather than records packed into
+// the directory's own data blocks. A volume without this bit has directories
+// this build cannot list, and one with it has directories an older build would
+// read as an empty file, so the bit is incompat in both directions.
+#define ADYTUMFS_FEATURE_INCOMPAT_DIR_ITEMS 0x10u
 
 // The superblock lives in block 0 (a backup copy in the last block). Its
 // checksum is the last field and covers every byte before it, so it never has
@@ -358,10 +363,12 @@ int adytumfs_inode_truncate(struct kernel_object *device,
                             struct adytumfs_inode *inode, u64 inode_num,
                             u64 new_blocks);
 
-// Directory entries live in the directory's data blocks: an 8-byte target inode,
-// a 2-byte record length, a 1-byte name length, a 1-byte type, then the name.
-// inode 0 marks a free record. Records never cross a 4 KiB block boundary.
-#define ADYTUMFS_DIR_HEADER 12u
+// One entry of a directory bucket: an 8-byte target inode, a 2-byte name
+// length, a 1-byte type, a 1-byte spare, then the name. The length prefixes
+// the name, so a bucket is a list that describes itself and carries no count
+// that could disagree with it. Entries live in the item tree, not in the
+// directory's data blocks, and a directory owns none.
+#define ADYTUMFS_DIRENT_HEADER 12u
 #define ADYTUMFS_DTYPE_REG 1u
 #define ADYTUMFS_DTYPE_DIR 2u
 #define ADYTUMFS_DTYPE_LNK 3u

@@ -1,12 +1,9 @@
 #include "adytumfs_format.h"
+#include "crypto.h"
 #include "adytumfs_item.h"
 #include "adytumfs_tree.h"
 #include "blake2b.h"
 #include "rtc64.h"
-
-// One staging block for directory data; the single-CPU filesystem reads,
-// modifies, and writes it in place.
-static u8 adytumfs_dir_scratch[ADYTUMFS_BLOCK_SIZE];
 
 // Inserting or removing an entry is a metadata change to the directory
 // itself, so every path that lands an edit stamps the parent's mtime and
@@ -38,10 +35,14 @@ static int adytumfs_name_equal(const u8 *stored, const char *name, u32 length) {
 // longest name a directory accepts stay well inside that budget, and the cap
 // turns a corruption that would otherwise fail deep in the packer into a
 // refusal here.
-#define ADYTUMFS_DIRENT_HEADER 12u
 #define ADYTUMFS_DIRENT_MAX (ADYTUMFS_DIRENT_HEADER + ADYTUMFS_NAME_MAX)
 #define ADYTUMFS_DIR_BUCKET_MAX 8u
 #define ADYTUMFS_DIR_BUCKET_SIZE (ADYTUMFS_DIR_BUCKET_MAX * ADYTUMFS_DIRENT_MAX)
+
+#define ADYTUMFS_DIR_HASH_BITS 61u
+#define ADYTUMFS_DIR_HASH_MASK ((((u64)1) << ADYTUMFS_DIR_HASH_BITS) - 1u)
+#define ADYTUMFS_DIR_CURSOR_SHIFT 3u
+#define ADYTUMFS_DIR_CURSOR_MASK 7u
 
 // The hash a name is keyed under. BLAKE2b with a 64 bit output rather than a
 // truncation of the 512 bit digest, because the output length is part of the
@@ -51,7 +52,11 @@ int adytumfs_dir_name_hash(const char *name, u32 name_len, u64 *hash) {
     if (!name || !hash || !name_len || name_len > ADYTUMFS_NAME_MAX) return -1;
     u8 digest[8];
     if (blake2b(digest, 8, name, name_len)) return -1;
-    *hash = adytumfs_read_le64(digest);
+    // Masked to the width the listing cursor reserves, so every hash a
+    // directory can hold is inside the range a listing walks. An unmasked hash
+    // would put the top of the space past the far bound and those names would
+    // resolve by lookup while never appearing in a listing.
+    *hash = adytumfs_read_le64(digest) & ADYTUMFS_DIR_HASH_MASK;
     return 0;
 }
 
@@ -218,70 +223,81 @@ int adytumfs_dir_item_remove(struct kernel_object *device,
     return adytumfs_item_remove(device, super, store, root, &key, new_root);
 }
 
-// Place a new record in a block that already holds a free record big enough,
-// splitting the free space when the leftover can hold another record.
-static int adytumfs_dir_place(u8 *block, const char *name, u32 name_len,
-                              u64 target, u8 type, u32 needed) {
-    u32 offset = 0;
-    while (offset + ADYTUMFS_DIR_HEADER <= ADYTUMFS_BLOCK_SIZE) {
-        u64 entry_inode = adytumfs_read_le64(block + offset);
-        u16 rec_len = adytumfs_read_le16(block + offset + 8);
-        if (rec_len < ADYTUMFS_DIR_HEADER ||
-            offset + rec_len > ADYTUMFS_BLOCK_SIZE)
-            return -1;
-        if (entry_inode == 0 && rec_len >= needed) {
-            u16 record = rec_len;
-            if (rec_len - needed >= ADYTUMFS_DIR_HEADER + 4u) {
-                record = (u16)needed;
-                u32 rest = offset + needed;
-                adytumfs_write_le64(block + rest, 0);
-                adytumfs_write_le16(block + rest + 8, (u16)(rec_len - needed));
-                block[rest + 10] = 0;
-                block[rest + 11] = 0;
-            }
-            adytumfs_write_le64(block + offset, target);
-            adytumfs_write_le16(block + offset + 8, record);
-            block[offset + 10] = (u8)name_len;
-            block[offset + 11] = type;
-            for (u32 index = 0; index < name_len; index++)
-                block[offset + 12 + index] = (u8)name[index];
-            return 0;
-        }
-        offset += rec_len;
-    }
-    return -1;
+// A directory owns no data blocks: its entries are items in the item tree
+// keyed by its own number, so its extent tree stays empty and its size stays
+// zero. The audit already accepts an inode that claims no blocks.
+//
+// The name hash is 61 bits rather than 64 so a listing cursor can carry the
+// hash and the position inside its bucket in one word, which is the width the
+// VFS hands back and forth. Three bits off a 64 bit hash leaves a birthday
+// bound orders of magnitude past the number of names one directory can hold,
+// and the alternative is a cursor too wide for the interface above it.
+static void dir_bound(struct adytumfs_item_key *key, u64 dir, u64 offset) {
+    key->objectid = dir;
+    key->type = ADYTUMFS_ITEM_DIR;
+    key->offset = offset;
+    key->spare = 0;
+}
+
+static void super_root_take(struct adytumfs_superblock *super,
+                            const u8 root[ADYTUMFS_HASH_SIZE]) {
+    for (u32 byte = 0; byte < ADYTUMFS_HASH_SIZE; byte++)
+        super->inode_root[byte] = root[byte];
+}
+
+// Adopt a generation the tree just built and let go of the one it replaced.
+//
+// The root the committed generation names has to keep resolving until the
+// commit flips the superblock, so it is held; the transaction root, captured
+// here on the first adoption of the window, is what tells the two apart. Every
+// root built after it is named by nothing the moment the next one lands, and
+// holding on is what made a rebuilt index report a leak on a volume that had
+// only ever been written to. The inode landing does the same, and a directory
+// edit that skipped it left one unreachable leaf behind per entry.
+static int dir_root_adopt(struct kernel_object *device,
+                          struct adytumfs_superblock *super,
+                          struct adytumfs_cas *store,
+                          const u8 root[ADYTUMFS_HASH_SIZE]) {
+    u8 previous[ADYTUMFS_HASH_SIZE];
+    for (u32 byte = 0; byte < ADYTUMFS_HASH_SIZE; byte++)
+        previous[byte] = super->inode_root[byte];
+    // Captured in its own pass: testing for an empty root while filling it
+    // would see the first byte land and stop, leaving a root that matches
+    // nothing and dropping the generation the device still names.
+    if (adytumfs_item_root_empty(store->txn_root))
+        for (u32 byte = 0; byte < ADYTUMFS_HASH_SIZE; byte++)
+            store->txn_root[byte] = previous[byte];
+    super_root_take(super, root);
+    if (crypto_equal(previous, store->txn_root, ADYTUMFS_HASH_SIZE)) return 0;
+    return adytumfs_item_drop(device, super, store, previous);
+}
+
+// Stamping the parent is what is left of the write the packed layout needed,
+// and there is no longer a block to remap, so it is one inode write.
+static int dir_touch_write(struct kernel_object *device,
+                           struct adytumfs_superblock *super,
+                           struct adytumfs_cas *store,
+                           struct adytumfs_inode *dir, u64 dir_inode) {
+    adytumfs_dir_touch(dir);
+    return adytumfs_inode_write(device, super, store, dir_inode, dir);
 }
 
 int adytumfs_dir_lookup(struct kernel_object *device,
                         struct adytumfs_superblock *super,
                         struct adytumfs_cas *store, u64 dir_inode,
                         const char *name, u32 name_len, u64 *out_inode) {
+    if (!device || !super || !store || !name) return -1;
     if (name_len == 0 || name_len > ADYTUMFS_NAME_MAX) return -1;
     struct adytumfs_inode dir;
     if (adytumfs_inode_read(device, super, store, dir_inode, &dir)) return -1;
     if ((dir.mode & ADYTUMFS_MODE_DIR) == 0) return -1;
-    for (u64 logical = 0; logical < dir.blocks; logical++) {
-        if (adytumfs_inode_fetch(device, super, store, &dir, logical,
-                                 adytumfs_dir_scratch))
-            return -1;
-        u32 offset = 0;
-        while (offset + ADYTUMFS_DIR_HEADER <= ADYTUMFS_BLOCK_SIZE) {
-            u64 entry_inode = adytumfs_read_le64(adytumfs_dir_scratch + offset);
-            u16 rec_len = adytumfs_read_le16(adytumfs_dir_scratch + offset + 8);
-            u8 entry_name_len = adytumfs_dir_scratch[offset + 10];
-            if (rec_len < ADYTUMFS_DIR_HEADER ||
-                offset + rec_len > ADYTUMFS_BLOCK_SIZE)
-                break;
-            if (entry_inode != 0 && entry_name_len == name_len &&
-                adytumfs_name_equal(adytumfs_dir_scratch + offset + 12, name,
-                                    name_len)) {
-                if (out_inode) *out_inode = entry_inode;
-                return 0;
-            }
-            offset += rec_len;
-        }
-    }
-    return -1;
+    u64 target = 0;
+    u8 type = 0;
+    if (adytumfs_dir_item_find(device, super, store, super->inode_root,
+                               dir_inode, name, name_len, &target, &type))
+        return -1;
+    if (out_inode) *out_inode = target;
+    return 0;
 }
 
 int adytumfs_dir_add(struct kernel_object *device,
@@ -289,81 +305,91 @@ int adytumfs_dir_add(struct kernel_object *device,
                      struct adytumfs_cas *store, u64 dir_inode,
                      const char *name, u32 name_len, u64 target_inode,
                      u8 type) {
+    if (!device || !super || !store || !name) return -1;
     if (name_len == 0 || name_len > ADYTUMFS_NAME_MAX || target_inode == 0)
-        return -1;
-    u64 present;
-    if (adytumfs_dir_lookup(device, super, store, dir_inode, name, name_len,
-                            &present) == 0)
         return -1;
     struct adytumfs_inode dir;
     if (adytumfs_inode_read(device, super, store, dir_inode, &dir)) return -1;
     if ((dir.mode & ADYTUMFS_MODE_DIR) == 0) return -1;
-
-    u32 needed = ADYTUMFS_DIR_HEADER + ((name_len + 3u) & ~3u);
-    for (u64 logical = 0; logical < dir.blocks; logical++) {
-        if (adytumfs_inode_fetch(device, super, store, &dir, logical,
-                                 adytumfs_dir_scratch))
-            return -1;
-        if (adytumfs_dir_place(adytumfs_dir_scratch, name, name_len,
-                               target_inode, type, needed) == 0) {
-            adytumfs_dir_touch(&dir);
-            return adytumfs_inode_remap(device, super, store, &dir, dir_inode,
-                                        logical, adytumfs_dir_scratch);
-        }
-    }
-
-    // No room in any existing block, so grow by one and seed it with a single
-    // free record spanning the whole block.
-    if (adytumfs_inode_grow(device, super, store, &dir, dir_inode, dir.blocks + 1)) return -1;
-    for (u32 index = 0; index < ADYTUMFS_BLOCK_SIZE; index++)
-        adytumfs_dir_scratch[index] = 0;
-    adytumfs_write_le16(adytumfs_dir_scratch + 8, (u16)ADYTUMFS_BLOCK_SIZE);
-    if (adytumfs_dir_place(adytumfs_dir_scratch, name, name_len, target_inode,
-                           type, needed))
+    u8 root[ADYTUMFS_HASH_SIZE];
+    // The entry reaches the tree before the parent's timestamp, so a crash
+    // between the two leaves a name that resolves and a parent whose mtime is
+    // stale. The other order would leave a timestamp claiming an edit that a
+    // reader cannot see.
+    if (adytumfs_dir_item_add(device, super, store, super->inode_root,
+                              dir_inode, name, name_len, target_inode, type,
+                              root))
         return -1;
-    // Through a remap and not into the mapping: the block the grow just added
-    // is the one image of zeroes every hole on the volume shares.
-    if (adytumfs_inode_remap(device, super, store, &dir, dir_inode,
-                             dir.blocks - 1, adytumfs_dir_scratch))
-        return -1;
-    dir.size = dir.blocks * ADYTUMFS_BLOCK_SIZE;
-    adytumfs_dir_touch(&dir);
-    return adytumfs_inode_write(device, super, store, dir_inode, &dir);
+    if (dir_root_adopt(device, super, store, root)) return -1;
+    return dir_touch_write(device, super, store, &dir, dir_inode);
 }
 
 int adytumfs_dir_remove(struct kernel_object *device,
                         struct adytumfs_superblock *super,
                         struct adytumfs_cas *store, u64 dir_inode,
                         const char *name, u32 name_len) {
+    if (!device || !super || !store || !name) return -1;
     if (name_len == 0 || name_len > ADYTUMFS_NAME_MAX) return -1;
     struct adytumfs_inode dir;
     if (adytumfs_inode_read(device, super, store, dir_inode, &dir)) return -1;
     if ((dir.mode & ADYTUMFS_MODE_DIR) == 0) return -1;
-    for (u64 logical = 0; logical < dir.blocks; logical++) {
-        if (adytumfs_inode_fetch(device, super, store, &dir, logical,
-                                 adytumfs_dir_scratch))
+    u8 root[ADYTUMFS_HASH_SIZE];
+    if (adytumfs_dir_item_remove(device, super, store, super->inode_root,
+                                 dir_inode, name, name_len, root))
+        return -1;
+    if (dir_root_adopt(device, super, store, root)) return -1;
+    return dir_touch_write(device, super, store, &dir, dir_inode);
+}
+
+struct dir_iter_state {
+    u64 dir;
+    u64 resume_hash;
+    u32 resume_skip;
+    u32 returned;
+    char *name;
+    u32 *name_len;
+    u64 *inode_out;
+    u8 *type_out;
+    u64 *cursor;
+};
+
+// One bucket at a time. Entries already handed back on an earlier call sit at
+// the front of the bucket the cursor names, so they are counted past rather
+// than compared, and the walk stops on the first entry after them. Returning a
+// non zero value is what ends the walk, so this returns one once it has an
+// entry and the caller reads that as a listing rather than as a failure.
+static int dir_iter_visit(const struct adytumfs_item_key *key, const u8 *data,
+                          u32 size, void *context) {
+    struct dir_iter_state *it = context;
+    if (key->objectid != it->dir || key->type != ADYTUMFS_ITEM_DIR) return 0;
+    u32 offset = 0;
+    u32 index = 0;
+    while (offset + ADYTUMFS_DIRENT_HEADER <= size) {
+        u64 inode = 0;
+        u8 type = 0;
+        u32 length = 0;
+        if (adytumfs_dirent_read(data, size, offset, &inode, &type, &length))
             return -1;
-        u32 offset = 0;
-        while (offset + ADYTUMFS_DIR_HEADER <= ADYTUMFS_BLOCK_SIZE) {
-            u64 entry_inode = adytumfs_read_le64(adytumfs_dir_scratch + offset);
-            u16 rec_len = adytumfs_read_le16(adytumfs_dir_scratch + offset + 8);
-            u8 entry_name_len = adytumfs_dir_scratch[offset + 10];
-            if (rec_len < ADYTUMFS_DIR_HEADER ||
-                offset + rec_len > ADYTUMFS_BLOCK_SIZE)
-                break;
-            if (entry_inode != 0 && entry_name_len == name_len &&
-                adytumfs_name_equal(adytumfs_dir_scratch + offset + 12, name,
-                                    name_len)) {
-                // Tombstone: a zero inode makes the record free for reuse.
-                adytumfs_write_le64(adytumfs_dir_scratch + offset, 0);
-                adytumfs_dir_touch(&dir);
-                return adytumfs_inode_remap(device, super, store, &dir, dir_inode,
-                                            logical, adytumfs_dir_scratch);
-            }
-            offset += rec_len;
+        if (key->offset == it->resume_hash && index < it->resume_skip) {
+            offset += ADYTUMFS_DIRENT_HEADER + length;
+            index++;
+            continue;
         }
+        for (u32 byte = 0; byte < length; byte++)
+            it->name[byte] = (char)data[offset + ADYTUMFS_DIRENT_HEADER + byte];
+        // The VFS reads the name as a C string, and a name at the bound fills
+        // the last byte of a bare ADYTUMFS_NAME_MAX buffer, so the terminator
+        // lands here and callers size their buffers one past the bound.
+        it->name[length] = 0;
+        *it->name_len = length;
+        *it->inode_out = inode;
+        *it->type_out = type;
+        *it->cursor = (key->offset << ADYTUMFS_DIR_CURSOR_SHIFT) |
+                      (u64)(index + 1u);
+        it->returned = 1;
+        return 1;
     }
-    return -1;
+    return 0;
 }
 
 int adytumfs_dir_iter(struct kernel_object *device,
@@ -371,40 +397,30 @@ int adytumfs_dir_iter(struct kernel_object *device,
                       struct adytumfs_cas *store, u64 dir_inode,
                       u64 *cursor, char *name, u32 *name_len, u64 *inode_out,
                       u8 *type_out) {
+    if (!device || !super || !store) return -1;
     if (!cursor || !name || !name_len || !inode_out || !type_out) return -1;
     struct adytumfs_inode dir;
     if (adytumfs_inode_read(device, super, store, dir_inode, &dir)) return -1;
     if ((dir.mode & ADYTUMFS_MODE_DIR) == 0) return -1;
-    u64 total = dir.blocks * ADYTUMFS_BLOCK_SIZE;
-    while (*cursor + ADYTUMFS_DIR_HEADER <= total) {
-        u64 position = *cursor;
-        u64 logical = position / ADYTUMFS_BLOCK_SIZE;
-        u32 within = (u32)(position % ADYTUMFS_BLOCK_SIZE);
-        if (adytumfs_inode_fetch(device, super, store, &dir, logical,
-                                 adytumfs_dir_scratch))
-            return -1;
-        u64 entry_inode = adytumfs_read_le64(adytumfs_dir_scratch + within);
-        u16 rec_len = adytumfs_read_le16(adytumfs_dir_scratch + within + 8);
-        u8 entry_name_len = adytumfs_dir_scratch[within + 10];
-        u8 entry_type = adytumfs_dir_scratch[within + 11];
-        if (rec_len < ADYTUMFS_DIR_HEADER ||
-            within + rec_len > ADYTUMFS_BLOCK_SIZE)
-            return -1;
-        *cursor = position + rec_len;
-        if (entry_inode != 0) {
-            if (ADYTUMFS_DIR_HEADER + entry_name_len > rec_len) return -1;
-            for (u32 index = 0; index < entry_name_len; index++)
-                name[index] = (char)adytumfs_dir_scratch[within + 12 + index];
-            // The VFS and the probes read the name as a C string, and a
-            // name at the bound fills the last byte of a bare
-            // ADYTUMFS_NAME_MAX buffer, so the terminator lands here and
-            // the callers size their buffers one byte past the bound.
-            name[entry_name_len] = 0;
-            *name_len = entry_name_len;
-            *inode_out = entry_inode;
-            *type_out = entry_type;
-            return 0;
-        }
-    }
-    return 1;
+    struct dir_iter_state it = {0};
+    it.dir = dir_inode;
+    it.resume_hash = *cursor >> ADYTUMFS_DIR_CURSOR_SHIFT;
+    it.resume_skip = (u32)(*cursor & ADYTUMFS_DIR_CURSOR_MASK);
+    it.name = name;
+    it.name_len = name_len;
+    it.inode_out = inode_out;
+    it.type_out = type_out;
+    it.cursor = cursor;
+    // Both bounds carry the directory and the entry type, and the key order is
+    // objectid then type then offset, so the range is exactly this directory's
+    // entries and nothing else in the tree is read.
+    struct adytumfs_item_key from;
+    struct adytumfs_item_key to;
+    dir_bound(&from, dir_inode, *cursor ? it.resume_hash : 0);
+    dir_bound(&to, dir_inode, ADYTUMFS_DIR_HASH_MASK);
+    int result = adytumfs_item_walk_range(device, super, store,
+                                          super->inode_root, &from, &to,
+                                          dir_iter_visit, &it);
+    if (result < 0) return -1;
+    return it.returned ? 0 : 1;
 }
