@@ -12,10 +12,9 @@ struct vfs_node_state {
     const u8 *external_data;
     struct kernel_object *pages;
     char name[VFS_NAME_MAX + 1];
-    // The target a symlink name resolves through; empty for every other
-    // node. The disk copy is the truth for adytumfs, this is the runtime
-    // mirror the mount scan and readlink read from.
-    char target[VFS_PATH_MAX];
+    // Index plus one into the target table, or zero for every node that is
+    // not a symlink.
+    u32 target_slot;
     u32 parent;
     u32 type;
     u32 generation;
@@ -57,6 +56,41 @@ struct vfs_mount_state {
 };
 
 static struct vfs_node_state nodes[VFS_NODE_MAX];
+
+// Symlink targets, apart from the node table.
+//
+// A target is bounded by the path bound, so holding one inside every node
+// spent 4 KiB of the node's 4.4 KiB on a field only symlinks read, and that is
+// what kept the node table at a few hundred entries. Targets are far rarer
+// than nodes, so they live here and a node carries an index. The bound is on
+// symlink nodes alive at once, not on the volumes: a node that goes away
+// hands its slot back.
+#define VFS_TARGET_MAX 64u
+static char targets[VFS_TARGET_MAX][VFS_PATH_MAX];
+static u32 target_held[VFS_TARGET_MAX];
+
+static u32 target_alloc(void) {
+    for (u32 index = 0; index < VFS_TARGET_MAX; index++) {
+        if (target_held[index]) continue;
+        target_held[index] = 1;
+        for (u32 byte = 0; byte < VFS_PATH_MAX; byte++)
+            targets[index][byte] = 0;
+        return index + 1u;
+    }
+    return 0;
+}
+
+static void target_drop(u32 slot) {
+    if (!slot || slot > VFS_TARGET_MAX) return;
+    target_held[slot - 1u] = 0;
+    for (u32 byte = 0; byte < VFS_PATH_MAX; byte++)
+        targets[slot - 1u][byte] = 0;
+}
+
+static char *target_text(u32 slot) {
+    if (!slot || slot > VFS_TARGET_MAX) return 0;
+    return targets[slot - 1u];
+}
 static struct vfs_file_state files[VFS_FILE_MAX];
 static struct vfs_mount_state mounts[VFS_MOUNT_MAX];
 
@@ -216,6 +250,8 @@ static void node_destroy(struct kernel_object *object) {
     }
     node->self = 0;
     node->external_data = 0;
+    target_drop(node->target_slot);
+    node->target_slot = 0;
     // Names die with their node: an alias cannot outlive the inode it
     // points at, and every teardown path that releases the node lands
     // here, unmount included.
@@ -329,10 +365,16 @@ void vfs_init(void) {
     vfs_klock.lock.served = 0;
     root_object = 0;
     root_mount = 0;
+    for (u32 index = 0; index < VFS_TARGET_MAX; index++) {
+        target_held[index] = 0;
+        for (u32 byte = 0; byte < VFS_PATH_MAX; byte++)
+            targets[index][byte] = 0;
+    }
     for (u32 index = 0; index < VFS_NODE_MAX; index++) {
         nodes[index].self = 0;
         nodes[index].external_data = 0;
         nodes[index].pages = 0;
+        nodes[index].target_slot = 0;
         nodes[index].parent = VFS_NODE_MAX;
         nodes[index].type = 0;
         nodes[index].generation = 1;
@@ -661,9 +703,14 @@ int vfs_mount_adytumfs(struct kernel_object *directory,
         node->active = 1;
         // A symlink node mirrors the target the volume carries in its
         // file body, the way the alias table mirrors extra names.
+        if (types[inode] == VFS_NODE_SYMLINK)
+            node->target_slot = target_alloc();
+        // The slot is taken before the read so the undo below, which releases
+        // every node it created, hands it back through node_destroy.
         if (types[inode] == VFS_NODE_SYMLINK &&
-            adytumfs_symlink_target(mount_index, inode,
-                                    generations[inode], node->target)) {
+            (!node->target_slot ||
+             adytumfs_symlink_target(mount_index, inode, generations[inode],
+                                     target_text(node->target_slot)))) {
             node->active = 0;
             for (u32 undo = 0; undo < created; undo++)
                 object_release(nodes[slots[undo]].self);
@@ -803,8 +850,7 @@ struct kernel_object *vfs_create_mode(struct kernel_object *directory,
         for (u32 byte = 0; byte <= VFS_NAME_MAX; byte++)
             node->name[byte] = 0;
         for (u32 byte = 0; name[byte]; byte++) node->name[byte] = name[byte];
-        for (u32 byte = 0; byte < VFS_PATH_MAX; byte++)
-            node->target[byte] = 0;
+        node->target_slot = 0;
         if (parent->filesystem == VFS_FILESYSTEM_ADYTUMFS &&
             adytumfs_inode_create(parent->mount, name, parent->fs_id, type,
                                  mode, &node->fs_id, &node->fs_generation)) {
@@ -919,9 +965,14 @@ struct kernel_object *vfs_symlink(struct kernel_object *directory,
         object_release(object);
         return 0;
     }
-    for (u32 byte = 0; byte < length; byte++)
-        node->target[byte] = target[byte];
-    node->target[length] = 0;
+    node->target_slot = target_alloc();
+    if (!node->target_slot) {
+        object_release(object);
+        return 0;
+    }
+    char *stored = target_text(node->target_slot);
+    for (u32 byte = 0; byte < length; byte++) stored[byte] = target[byte];
+    stored[length] = 0;
     node->size = length;
     return object;
 }
@@ -932,13 +983,14 @@ int vfs_readlink(struct kernel_object *node_object, char *buffer, u32 size,
     if (!node || node->type != VFS_NODE_SYMLINK || !buffer || !size ||
         !length)
         return -1;
+    const char *stored = target_text(node->target_slot);
+    if (!stored) return -1;
     u32 count = 0;
-    while (node->target[count] && count < VFS_PATH_MAX) count++;
+    while (stored[count] && count < VFS_PATH_MAX) count++;
     // The caller owns a buffer of the path bound; a shorter one is a
     // contract violation rather than the truncation POSIX readlink does.
     if (count + 1u > size) return -1;
-    for (u32 byte = 0; byte < count; byte++)
-        buffer[byte] = node->target[byte];
+    for (u32 byte = 0; byte < count; byte++) buffer[byte] = stored[byte];
     buffer[count] = 0;
     *length = count;
     return 0;

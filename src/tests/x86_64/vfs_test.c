@@ -4,6 +4,7 @@
 #include "vfs.h"
 #include "firmware.h"
 
+
 int test_vfs64(void) {
     u32 objects = object_active_count();
     u32 nodes = vfs_node_active_count();
@@ -238,6 +239,49 @@ int test_vfs64(void) {
     if (link_resolved) object_release(link_resolved);
     if (link_found) object_release(link_found);
     if (guide) object_release(guide);
+    // Targets live in a table of their own, so a node that goes away has to
+    // hand its slot back or the table runs dry while the node table is still
+    // nearly empty. The round count is past that bound, and the link created
+    // afterwards is what proves a slot came back rather than the loop merely
+    // fitting inside it.
+    int slots_reclaimed = root != 0;
+    for (u32 round = 0; slots_reclaimed && round < 160; round++) {
+        char name[12];
+        char reversed[8];
+        u32 digits = 0;
+        u32 copy = round;
+        name[0] = 'l';
+        if (!copy) reversed[digits++] = '0';
+        while (copy) {
+            reversed[digits++] = (char)('0' + (copy % 10u));
+            copy /= 10u;
+        }
+        for (u32 index = 0; index < digits; index++)
+            name[1 + index] = reversed[digits - 1u - index];
+        name[1 + digits] = 0;
+        struct kernel_object *link = vfs_symlink(root, name, guide_target);
+        if (!link) {
+            slots_reclaimed = 0;
+            break;
+        }
+        object_release(link);
+        if (vfs_unlink(root, name)) {
+            slots_reclaimed = 0;
+        }
+    }
+    struct kernel_object *after = root ?
+        vfs_symlink(root, "after", guide_target) : 0;
+    u32 after_length = 0;
+    int rc_after = after ?
+        vfs_readlink(after, link_target, sizeof(link_target), &after_length) :
+        -1;
+    valid = valid && slots_reclaimed && after && !rc_after &&
+        after_length == sizeof(guide_target) - 1;
+    if (after) object_release(after);
+    // Unlinked as well, so the accounting at the end of the test sees the
+    // table where it started: a linked node is supposed to outlive the handle
+    // that created it.
+    if (root) vfs_unlink(root, "after");
     struct kernel_object *usr = root ?
         vfs_create_path(root, "/usr", VFS_NODE_DIRECTORY) : 0;
     struct kernel_object *lib = root ?
