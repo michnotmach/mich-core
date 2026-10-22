@@ -28,7 +28,10 @@ struct vfs_node_state {
     u32 gid;
     u32 special;
     u32 linked;
-    u32 fs_id;
+    // Set by a lookup that found this node, cleared by the eviction hand:
+    // the second chance that keeps a working set alive under a clock sweep.
+    u32 referenced;
+    u64 fs_id;
     u64 fs_generation;
     u64 atime;
     u64 mtime;
@@ -200,6 +203,37 @@ static int mount_has_open_file_locked(u32 mount_index, u32 generation) {
 static int node_has_open_file_locked(struct kernel_object *node) {
     for (u32 index = 0; index < VFS_FILE_MAX; index++)
         if (files[index].active && files[index].node == node) return 1;
+    return 0;
+}
+
+static u32 node_clock = 1;
+
+// Hand out a node slot, evicting under a clock when the table is full. A
+// node is evictable when it is a linked adytumfs file whose only remaining
+// reference is the table's own: releasing that reference destroys it, and
+// the next lookup that meets its name rebuilds it from the volume. Anything
+// else is either pinned by an open handle, a mount root, or a filesystem
+// with no backing store to rebuild from, and the hand passes it over.
+static u32 node_alloc(void) {
+    for (u32 index = 1; index < VFS_NODE_MAX; index++)
+        if (!nodes[index].active) return index;
+    for (u32 sweep = 0; sweep < 2; sweep++) {
+        for (u32 step = 0; step < VFS_NODE_MAX; step++) {
+            node_clock = node_clock >= VFS_NODE_MAX - 1 ? 1 : node_clock + 1;
+            struct vfs_node_state *node = &nodes[node_clock];
+            if (!node->active || !node->linked || !node->self ||
+                node->filesystem != VFS_FILESYSTEM_ADYTUMFS ||
+                node->self->references > 1)
+                continue;
+            if (node->referenced) {
+                node->referenced = 0;
+                continue;
+            }
+            u32 index = node_clock;
+            object_release(node->self);
+            if (!nodes[index].active) return index;
+        }
+    }
     return 0;
 }
 
@@ -568,38 +602,151 @@ int vfs_mount_bootfs(struct kernel_object *directory,
     return 0;
 }
 
-// Second names the adytumfs walk reports, held in slot space until the
-// nodes exist and the pairs can materialize as VFS aliases. Mounts run one
-// at a time from the kernel side, so a single buffer serves them all.
-struct vfs_alias_scan {
-    u32 parent;
-    u32 slot;
-    char name[VFS_NAME_MAX + 1];
-};
-static struct vfs_alias_scan alias_scan[VFS_ALIAS_MAX];
-static u32 alias_scan_count;
-
-// The walk calls back with every second name for a regular inode; the
-// scan records the pair and the mount materializes the alias once the
-// nodes exist. A volume carrying more hard links than the alias bound
-// fails the mount rather than half-lists its names.
-static int vfs_alias_sink(u32 parent, u32 slot, const char *name,
-                          u32 name_len) {
-    if (alias_scan_count >= VFS_ALIAS_MAX || !name || !name_len ||
-        name_len > VFS_NAME_MAX)
-        return -1;
-    struct vfs_alias_scan *scan = &alias_scan[alias_scan_count++];
-    scan->parent = parent;
-    scan->slot = slot;
-    for (u32 byte = 0; byte <= VFS_NAME_MAX; byte++)
-        scan->name[byte] = 0;
-    for (u32 byte = 0; byte < name_len; byte++)
-        scan->name[byte] = name[byte];
-    return 0;
+// Bring one directory entry into the node table. The volume is the record of
+// what exists, so a lookup that misses the cache asks the backend for the
+// name and builds a node from the inode it names. A second name for an inode
+// already cached becomes the existing node again, which is what keeps a hard
+// link one file rather than two.
+static struct kernel_object *vfs_materialise(struct vfs_node_state *parent,
+                                             const char *name) {
+    u32 name_len = 0;
+    while (name[name_len] && name_len < VFS_NAME_MAX) name_len++;
+    if (!name_len) return 0;
+    u64 entry = 0;
+    u32 type = 0;
+    if (adytumfs_dir_find(parent->mount, parent->fs_id, parent->fs_generation,
+                          name, name_len, &entry, &type))
+        return 0;
+    u32 parent_index = node_index(parent);
+    for (u32 index = 0; index < VFS_NODE_MAX; index++) {
+        struct vfs_node_state *node = &nodes[index];
+        if (!node->active || !node->linked ||
+            node->filesystem != VFS_FILESYSTEM_ADYTUMFS ||
+            node->mount != parent->mount || node->fs_id != entry)
+            continue;
+        // A directory carries exactly one name and one parent here, so a
+        // second name for a cached directory is a volume that disagrees
+        // with itself; resolving it would give the subtree two homes.
+        if (node->type == VFS_NODE_DIRECTORY &&
+            (node->parent != parent_index ||
+             !names_equal(node->name, name)))
+            return 0;
+        node->referenced = 1;
+        // A second name for an inode that is already cached is a hard link:
+        // record the name as an alias over the existing node rather than
+        // building a second node for one file.
+        // The name is either the node's own or one already recorded over
+        // it; anything else needs an alias slot of its own.
+        u32 recorded = node->parent == parent_index &&
+            names_equal(node->name, name);
+        for (u32 scan = 0; scan < VFS_ALIAS_MAX && !recorded; scan++) {
+            struct vfs_alias_state *alias = &aliases[scan];
+            if (alias->active && alias->node == index &&
+                alias->parent == parent_index &&
+                names_equal(alias->name, name))
+                recorded = 1;
+        }
+        if (!recorded) {
+            u32 placed = 0;
+            for (u32 scan = 0; scan < VFS_ALIAS_MAX && !placed; scan++) {
+                struct vfs_alias_state *alias = &aliases[scan];
+                if (alias->active) continue;
+                alias->node = index;
+                alias->parent = parent_index;
+                for (u32 byte = 0; byte <= VFS_NAME_MAX; byte++)
+                    alias->name[byte] = 0;
+                for (u32 byte = 0; byte < name_len; byte++)
+                    alias->name[byte] = name[byte];
+                alias->active = 1;
+                placed = 1;
+            }
+            // A name this VFS cannot record would be unlinked under the
+            // primary name's identity, so it resolves to nothing instead.
+            if (!placed) return 0;
+        }
+        if (object_retain(node->self)) return 0;
+        return node->self;
+    }
+    u32 used = 0;
+    u32 size = 0;
+    u32 mode = 0;
+    u64 generation = 0;
+    // The dirent carries a type hint for listings; the inode is the record,
+    // so the node takes its kind from there and a stale hint cannot make a
+    // regular file walkable as a directory.
+    if (adytumfs_inode_get(parent->mount, entry, &used, &type, &size, &mode,
+                           &generation) || !used)
+        return 0;
+    u32 index = node_alloc();
+    if (!index) return 0;
+    struct vfs_node_state *node = &nodes[index];
+    node->external_data = 0;
+    node->pages = 0;
+    node->parent = parent_index;
+    node->type = type;
+    node->size = size;
+    node->filesystem = VFS_FILESYSTEM_ADYTUMFS;
+    node->mount = parent->mount;
+    node->mount_generation = parent->mount_generation;
+    node->readonly = 0;
+    node->mode = mode ? mode :
+        (type == VFS_NODE_DIRECTORY ? VFS_MODE_DIRECTORY_DEFAULT :
+         VFS_MODE_REGULAR_DEFAULT);
+    node->uid = 0;
+    node->gid = 0;
+    node->atime = 0;
+    node->mtime = 0;
+    node->ctime = 0;
+    node->atime_nsec = 0;
+    node->mtime_nsec = 0;
+    node->ctime_nsec = 0;
+    node->special = VFS_SPECIAL_NONE;
+    node->linked = 1;
+    node->referenced = 1;
+    node->fs_id = entry;
+    node->fs_generation = generation;
+    node->target_slot = 0;
+    node->active = 1;
+    for (u32 byte = 0; byte <= VFS_NAME_MAX; byte++) node->name[byte] = 0;
+    for (u32 byte = 0; byte < name_len; byte++) node->name[byte] = name[byte];
+    if (type == VFS_NODE_SYMLINK) {
+        node->target_slot = target_alloc();
+        if (!node->target_slot ||
+            adytumfs_symlink_target(parent->mount, entry, generation,
+                                    target_text(node->target_slot))) {
+            node->linked = 0;
+            node->active = 0;
+            target_drop(node->target_slot);
+            node->target_slot = 0;
+            return 0;
+        }
+    }
+    u32 object_type = type == VFS_NODE_DIRECTORY ?
+        KOBJECT_DIRECTORY : KOBJECT_VNODE;
+    struct kernel_object *object =
+        object_create(object_type, index + 1, node_destroy);
+    if (!object) {
+        node->linked = 0;
+        node->active = 0;
+        target_drop(node->target_slot);
+        node->target_slot = 0;
+        return 0;
+    }
+    node->self = object;
+    if (object_retain(object)) {
+        node->linked = 0;
+        object_release(object);
+        return 0;
+    }
+    return object;
 }
 
+// Mounting a volume reads its superblock and puts one node down for the
+// root. Nothing walks the namespace: how many files a volume holds is not
+// the kernel's business, and every file below the root is met by name when
+// a path asks for it.
 int vfs_mount_adytumfs(struct kernel_object *directory,
-                      struct kernel_object *device) {
+                       struct kernel_object *device) {
     struct vfs_node_state *point = node_for(directory);
     if (!point || point->type != VFS_NODE_DIRECTORY || !point->linked ||
         !directory || !device || child_count(node_index(point)) ||
@@ -611,193 +758,90 @@ int vfs_mount_adytumfs(struct kernel_object *directory,
             mount_index = index;
             break;
         }
-    if (mount_index == VFS_MOUNT_MAX)
-        return -1;
-    alias_scan_count = 0;
-    if (adytumfs_attach(mount_index, device, vfs_alias_sink))
-        return -1;
-    u32 inode_count = adytumfs_inode_count(mount_index);
-    u32 used[ADYTUMFS_INODE_MAX];
-    u32 types[ADYTUMFS_INODE_MAX];
-    u32 sizes[ADYTUMFS_INODE_MAX];
-    u32 parents[ADYTUMFS_INODE_MAX];
-    u32 modes[ADYTUMFS_INODE_MAX];
-    static char names[ADYTUMFS_INODE_MAX][VFS_NAME_MAX + 1];
-    u64 generations[ADYTUMFS_INODE_MAX];
-    u32 inode_item[ADYTUMFS_INODE_MAX];
-    u32 count = 0;
-    for (u32 inode = 0; inode < inode_count; inode++) {
-        inode_item[inode] = VFS_NODE_MAX;
-        if (adytumfs_inode_get(mount_index, inode, &used[inode], &types[inode],
-                              &sizes[inode], &parents[inode], &modes[inode],
-                              names[inode], &generations[inode])) {
-            adytumfs_detach(mount_index);
-            return -1;
-        }
-        if (!used[inode]) continue;
-        if ((inode && (types[inode] != VFS_NODE_REGULAR &&
-                       types[inode] != VFS_NODE_DIRECTORY &&
-                       types[inode] != VFS_NODE_SYMLINK)) ||
-            (modes[inode] & ~VFS_MODE_MASK) ||
-            (inode && (!names[inode][0] ||
-                       names[inode][VFS_NAME_MAX] ||
-                       !valid_name(names[inode]))) ||
-            (inode && parents[inode] >= inode_count)) {
-            adytumfs_detach(mount_index);
-            return -1;
-        }
-        inode_item[inode] = count++;
-    }
-    if (!used[0] || types[0] != VFS_NODE_DIRECTORY || parents[0] || !count) {
+    if (mount_index == VFS_MOUNT_MAX) return -1;
+    if (adytumfs_attach(mount_index, device)) return -1;
+    u64 root_inode = 0;
+    u64 root_generation = 0;
+    if (adytumfs_root_inode(mount_index, &root_inode, &root_generation)) {
         adytumfs_detach(mount_index);
         return -1;
     }
-    for (u32 inode = 1; inode < inode_count; inode++) {
-        if (!used[inode]) continue;
-        u32 parent = parents[inode];
-        if (!used[parent] || types[parent] != VFS_NODE_DIRECTORY) {
-            adytumfs_detach(mount_index);
-            return -1;
-        }
-        u32 ancestor = inode;
-        for (u32 depth = 0; depth < inode_count; depth++) {
-            if (!ancestor) break;
-            ancestor = parents[ancestor];
-            if (ancestor >= inode_count || !used[ancestor]) {
-                adytumfs_detach(mount_index);
-                return -1;
-            }
-            if (depth + 1 == inode_count) {
-                adytumfs_detach(mount_index);
-                return -1;
-            }
-        }
-    }
-    u32 slots[ADYTUMFS_INODE_MAX];
-    u32 found = 0;
-    for (u32 index = 1; index < VFS_NODE_MAX && found < count; index++)
-        if (!nodes[index].active) slots[found++] = index;
-    if (found != count) {
+    u32 used = 0;
+    u32 type = 0;
+    u32 size = 0;
+    u32 mode = 0;
+    if (adytumfs_inode_get(mount_index, root_inode, &used, &type, &size,
+                           &mode, &root_generation) || !used ||
+        type != VFS_NODE_DIRECTORY) {
         adytumfs_detach(mount_index);
         return -1;
     }
-    u32 created = 0;
-    for (u32 inode = 0; inode < inode_count; inode++) {
-        if (!used[inode]) continue;
-        u32 item = inode_item[inode];
-        struct vfs_node_state *node = &nodes[slots[item]];
-        node->external_data = 0;
-        node->parent = inode ? slots[inode_item[parents[inode]]] : VFS_NODE_MAX;
-        node->type = types[inode];
-        node->size = sizes[inode];
-        node->filesystem = VFS_FILESYSTEM_ADYTUMFS;
-        node->mount = mount_index;
-        node->mount_generation = mounts[mount_index].generation;
-        node->readonly = 0;
-        node->mode = modes[inode] ? modes[inode] :
-            (node->type == VFS_NODE_DIRECTORY ? VFS_MODE_DIRECTORY_DEFAULT :
-             VFS_MODE_REGULAR_DEFAULT);
-        node->linked = 1;
-        node->fs_id = inode;
-        node->fs_generation = generations[inode];
-        node->active = 1;
-        // A symlink node mirrors the target the volume carries in its
-        // file body, the way the alias table mirrors extra names.
-        if (types[inode] == VFS_NODE_SYMLINK)
-            node->target_slot = target_alloc();
-        // The slot is taken before the read so the undo below, which releases
-        // every node it created, hands it back through node_destroy.
-        if (types[inode] == VFS_NODE_SYMLINK &&
-            (!node->target_slot ||
-             adytumfs_symlink_target(mount_index, inode, generations[inode],
-                                     target_text(node->target_slot)))) {
-            node->active = 0;
-            for (u32 undo = 0; undo < created; undo++)
-                object_release(nodes[slots[undo]].self);
-            adytumfs_detach(mount_index);
-            return -1;
-        }
-        const char *name = inode ? names[inode] : point->name;
-        for (u32 byte = 0; byte <= VFS_NAME_MAX; byte++)
-            node->name[byte] = 0;
-        for (u32 byte = 0; name[byte]; byte++) node->name[byte] = name[byte];
-        u32 object_type = node->type == VFS_NODE_DIRECTORY ?
-            KOBJECT_DIRECTORY : KOBJECT_VNODE;
-        node->self = object_create(object_type, slots[item] + 1, node_destroy);
-        if (!node->self) {
-            node->active = 0;
-            for (u32 undo = 0; undo < created; undo++)
-                object_release(nodes[slots[undo]].self);
-            adytumfs_detach(mount_index);
-            return -1;
-        }
-        created++;
-    }
-    // Validate and count before filling: every scanned pair must map to a
-    // live regular node under a live directory, and the alias table must
-    // have room for the whole set, so the fill itself cannot fail halfway
-    // and leave a partial mount to undo.
-    for (u32 scan = 0; scan < alias_scan_count; scan++) {
-        u32 node_slot = alias_scan[scan].slot;
-        u32 parent_slot = alias_scan[scan].parent;
-        if (node_slot >= inode_count || parent_slot >= inode_count ||
-            !used[node_slot] || !used[parent_slot] ||
-            types[node_slot] != VFS_NODE_REGULAR ||
-            types[parent_slot] != VFS_NODE_DIRECTORY) {
-            for (u32 undo = 0; undo < created; undo++)
-                object_release(nodes[slots[undo]].self);
-            adytumfs_detach(mount_index);
-            return -1;
-        }
-    }
-    u32 free_aliases = 0;
-    for (u32 index = 0; index < VFS_ALIAS_MAX; index++)
-        if (!aliases[index].active) free_aliases++;
-    if (free_aliases < alias_scan_count) {
-        for (u32 undo = 0; undo < created; undo++)
-            object_release(nodes[slots[undo]].self);
+    u32 index = node_alloc();
+    if (!index) {
         adytumfs_detach(mount_index);
         return -1;
     }
-    for (u32 scan = 0; scan < alias_scan_count; scan++) {
-        u32 alias_slot = VFS_ALIAS_MAX;
-        for (u32 index = 0; index < VFS_ALIAS_MAX; index++)
-            if (!aliases[index].active) {
-                alias_slot = index;
-                break;
-            }
-        aliases[alias_slot].node =
-            slots[inode_item[alias_scan[scan].slot]];
-        aliases[alias_slot].parent =
-            slots[inode_item[alias_scan[scan].parent]];
-        for (u32 byte = 0; byte <= VFS_NAME_MAX; byte++)
-            aliases[alias_slot].name[byte] = alias_scan[scan].name[byte];
-        aliases[alias_slot].active = 1;
+    struct vfs_node_state *node = &nodes[index];
+    node->external_data = 0;
+    node->pages = 0;
+    node->parent = VFS_NODE_MAX;
+    node->type = VFS_NODE_DIRECTORY;
+    node->size = size;
+    node->filesystem = VFS_FILESYSTEM_ADYTUMFS;
+    node->mount = mount_index;
+    node->mount_generation = mounts[mount_index].generation;
+    node->readonly = 0;
+    node->mode = mode ? mode : VFS_MODE_DIRECTORY_DEFAULT;
+    node->uid = 0;
+    node->gid = 0;
+    node->atime = 0;
+    node->mtime = 0;
+    node->ctime = 0;
+    node->atime_nsec = 0;
+    node->mtime_nsec = 0;
+    node->ctime_nsec = 0;
+    node->special = VFS_SPECIAL_NONE;
+    node->linked = 1;
+    node->referenced = 1;
+    node->fs_id = root_inode;
+    node->fs_generation = root_generation;
+    node->target_slot = 0;
+    node->active = 1;
+    for (u32 byte = 0; byte <= VFS_NAME_MAX; byte++) node->name[byte] = 0;
+    for (u32 byte = 0; point->name[byte]; byte++)
+        node->name[byte] = point->name[byte];
+    node->self = object_create(KOBJECT_DIRECTORY, index + 1, node_destroy);
+    if (!node->self) {
+        node->linked = 0;
+        node->active = 0;
+        adytumfs_detach(mount_index);
+        return -1;
     }
     struct vfs_mount_state *mount = &mounts[mount_index];
-    if (object_retain(nodes[slots[0]].self) || object_retain(directory)) {
-        if (nodes[slots[0]].self->references > 1)
-            object_release(nodes[slots[0]].self);
-        for (u32 undo = 0; undo < created; undo++)
-            object_release(nodes[slots[undo]].self);
+    if (object_retain(node->self) || object_retain(directory)) {
+        if (node->self->references > 1) object_release(node->self);
+        object_release(node->self);
+        node->linked = 0;
+        node->active = 0;
         adytumfs_detach(mount_index);
         return -1;
     }
-    mount->root = nodes[slots[0]].self;
+    mount->root = node->self;
     mount->mountpoint = directory;
     mount->filesystem = VFS_FILESYSTEM_ADYTUMFS;
     mount->active = 1;
-    mount->self = object_create(
-        KOBJECT_MOUNT, mount_index + 1, mount_destroy);
+    mount->self = object_create(KOBJECT_MOUNT, mount_index + 1,
+                                mount_destroy);
     if (!mount->self) {
         mount->active = 0;
         mount->root = 0;
         mount->mountpoint = 0;
         mount->filesystem = 0;
         object_release(directory);
-        object_release(nodes[slots[0]].self);
-        for (u32 undo = 0; undo < created; undo++)
-            object_release(nodes[slots[undo]].self);
+        object_release(node->self);
+        object_release(node->self);
+        node->linked = 0;
+        node->active = 0;
         adytumfs_detach(mount_index);
         return -1;
     }
@@ -819,9 +863,10 @@ struct kernel_object *vfs_create_mode(struct kernel_object *directory,
             nodes[index].parent == parent_index &&
             names_equal(nodes[index].name, name))
             return 0;
-    for (u32 index = 1; index < VFS_NODE_MAX; index++) {
+    {
+        u32 index = node_alloc();
+        if (!index) return 0;
         struct vfs_node_state *node = &nodes[index];
-        if (node->active) continue;
         node->external_data = 0;
         node->pages = 0;
         node->parent = parent_index;
@@ -844,6 +889,7 @@ struct kernel_object *vfs_create_mode(struct kernel_object *directory,
         node->ctime_nsec = created_nsec;
         node->special = VFS_SPECIAL_NONE;
         node->linked = 1;
+        node->referenced = 1;
         node->fs_id = 0;
         node->fs_generation = 0;
         node->active = 1;
@@ -853,7 +899,7 @@ struct kernel_object *vfs_create_mode(struct kernel_object *directory,
         node->target_slot = 0;
         if (parent->filesystem == VFS_FILESYSTEM_ADYTUMFS &&
             adytumfs_inode_create(parent->mount, name, parent->fs_id, type,
-                                 mode, &node->fs_id, &node->fs_generation)) {
+                                  mode, &node->fs_id, &node->fs_generation)) {
             node->linked = 0;
             node->active = 0;
             return 0;
@@ -864,7 +910,9 @@ struct kernel_object *vfs_create_mode(struct kernel_object *directory,
             object_type, index + 1, node_destroy);
         if (!object) {
             if (node->fs_id)
-                adytumfs_inode_remove(parent->mount, node->fs_id);
+                adytumfs_inode_remove(parent->mount, node->fs_id,
+                                      node->fs_generation, parent->fs_id,
+                                      name);
             node->linked = 0;
             node->active = 0;
             return 0;
@@ -872,7 +920,9 @@ struct kernel_object *vfs_create_mode(struct kernel_object *directory,
         node->self = object;
         if (object_retain(object)) {
             if (node->fs_id)
-                adytumfs_inode_remove(parent->mount, node->fs_id);
+                adytumfs_inode_remove(parent->mount, node->fs_id,
+                                      node->fs_generation, parent->fs_id,
+                                      name);
             node->linked = 0;
             object_release(object);
             return 0;
@@ -954,7 +1004,10 @@ struct kernel_object *vfs_symlink(struct kernel_object *directory,
         adytumfs_symlink_write(node->mount, node->fs_id,
                                node->fs_generation, target)) {
         node->linked = 0;
-        adytumfs_inode_remove(node->mount, node->fs_id);
+        u32 holder = node->parent;
+        adytumfs_inode_remove(node->mount, node->fs_id, node->fs_generation,
+                              holder < VFS_NODE_MAX ? nodes[holder].fs_id : 0,
+                              node->name);
         // Creating the node took two references on the same object, one for
         // the node table and one for the handle about to be returned. A failed
         // link returns no handle, so both have to go. Dropping only the handle
@@ -1010,6 +1063,7 @@ struct kernel_object *vfs_lookup(struct kernel_object *directory,
         struct vfs_mount_state *mount = mount_for_point(node->self);
         struct kernel_object *result = mount ? mount->root : node->self;
         if (object_retain(result)) return 0;
+        node->referenced = 1;
         return result;
     }
     // An extra hard-link name resolves to the same inode object.
@@ -1022,6 +1076,8 @@ struct kernel_object *vfs_lookup(struct kernel_object *directory,
         if (!result || object_retain(result)) return 0;
         return result;
     }
+    if (parent->filesystem == VFS_FILESYSTEM_ADYTUMFS)
+        return vfs_materialise(parent, name);
     return 0;
 }
 
@@ -1273,6 +1329,29 @@ static int vfs_unlink_locked(struct kernel_object *directory, const char *name,
             return -1;
         alias->active = 0;
         return 0;
+    }
+    // A name no lookup has met yet is still on the volume, so the backend
+    // removes it directly; only the last name would defer a reclaim, and a
+    // name nobody resolved has no descriptor to wait for.
+    if (parent->filesystem == VFS_FILESYSTEM_ADYTUMFS && parent->fs_id) {
+        u32 name_len = 0;
+        while (name[name_len] && name_len < VFS_NAME_MAX) name_len++;
+        u64 entry = 0;
+        u32 entry_type = 0;
+        if (!name_len ||
+            adytumfs_dir_find(parent->mount, parent->fs_id,
+                              parent->fs_generation, name, name_len, &entry,
+                              &entry_type))
+            return -1;
+        u32 used = 0;
+        u32 size = 0;
+        u32 mode = 0;
+        u64 generation = 0;
+        if (adytumfs_inode_get(parent->mount, entry, &used, &entry_type,
+                               &size, &mode, &generation) || !used)
+            return -1;
+        return adytumfs_unlink(parent->mount, entry, generation,
+                               parent->fs_id, name, 0);
     }
     return -1;
 }

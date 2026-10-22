@@ -10,19 +10,6 @@
 
 #define ADYTUMFS_MOUNT_MAX 8
 
-// The VFS numbers a mount's files 0..ADYTUMFS_INODE_MAX with 0 as the mount
-// root, and uses 0 as the "no backend file" id for ramfs nodes. The on-disk
-// format numbers inodes from 1 because a zero dirent target marks a free
-// record, so this backend translates through a dense slot table rebuilt by
-// walking the tree at attach. The table also carries the name and parent the
-// VFS mount scan asks for, which the on-disk inode does not store.
-struct adytumfs_slot {
-    u64 inode;
-    u64 generation;
-    u32 parent;
-    char name[VFS_NAME_MAX + 1];
-};
-
 // One bit per cached page. A single u64 word capped a file at 64 pages even
 // though the on-disk format has no such limit: an extent length is a free
 // u32 and a contiguous grow extends the last extent, so the array is what
@@ -34,6 +21,10 @@ struct adytumfs_cache {
     struct kernel_object *pages;
     u64 present[ADYTUMFS_PAGE_WORDS];
     u64 dirty[ADYTUMFS_PAGE_WORDS];
+    u64 inode;
+    // Unmount flushes every cache entry without a caller left to vouch for
+    // the file, so the generation it was attached with travels with it.
+    u64 generation;
     u32 active;
 };
 
@@ -70,8 +61,7 @@ struct adytumfs_mount {
     // per mount because the index it caches sits at an address the superblock
     // gives, and two volumes have two indexes.
     struct adytumfs_cas store;
-    struct adytumfs_slot slots[ADYTUMFS_INODE_MAX];
-    struct adytumfs_cache cache[ADYTUMFS_INODE_MAX];
+    struct adytumfs_cache cache[ADYTUMFS_CACHE_MAX];
     u32 active;
 };
 
@@ -87,32 +77,50 @@ static struct adytumfs_mount *mount_at(u32 mount) {
     return m->active ? m : 0;
 }
 
-// A slot id is reused once its file is unlinked, while a node that was
+// An inode number is reused once its file is unlinked, while a node that was
 // unlinked with an open handle keeps calling into the backend. Every entry
-// point that addresses a slot must therefore also see the generation the
-// caller captured when the node was scanned or created, and a mismatch is a
-// stale handle: fail closed rather than touch the new owner of the slot.
-static struct adytumfs_mount *slot_mount(u32 mount, u32 inode,
-                                         u64 generation) {
-    struct adytumfs_mount *m = mount_at(mount);
-    if (!m || inode >= ADYTUMFS_INODE_MAX || !m->slots[inode].inode ||
-        m->slots[inode].generation != generation)
-        return 0;
-    return m;
+// point therefore also takes the generation the caller captured when it met
+// the file, and a mismatch is a stale handle: fail closed rather than touch
+// the new owner of the number. The read that carries the generation is the
+// same read the caller needs anyway, so this replaces a separate lookup.
+static int inode_fetch(struct adytumfs_mount *m, u64 inode, u64 generation,
+                       struct adytumfs_inode *out) {
+    if (!m || !inode || !generation) return -1;
+    if (adytumfs_inode_read(m->device, &m->super, &m->store, inode, out))
+        return -1;
+    if (!out->mode || out->generation != generation) return -1;
+    return 0;
 }
 
-static u32 slot_name_len(const struct adytumfs_slot *slot) {
-    u32 length = 0;
-    while (length < VFS_NAME_MAX && slot->name[length]) length++;
-    return length;
-}
-
-// Read the on-disk inode behind a VFS slot id.
-static int slot_inode_read(struct adytumfs_mount *m, u32 slot,
+// Read an inode the caller addresses but holds no generation for, which is
+// every parent: a directory is named by the path walk that reached it, and
+// the walk has already resolved that name against the tree.
+static int inode_disk_read(struct adytumfs_mount *m, u64 inode,
                            struct adytumfs_inode *out) {
-    if (!m || slot >= ADYTUMFS_INODE_MAX || !m->slots[slot].inode) return -1;
-    return adytumfs_inode_read(m->device, &m->super, &m->store,
-                               m->slots[slot].inode, out);
+    if (!m || !inode) return -1;
+    if (adytumfs_inode_read(m->device, &m->super, &m->store, inode, out))
+        return -1;
+    return out->mode ? 0 : -1;
+}
+
+// Resolve the page cache of a file. A cache entry outlives the file it was
+// opened for only as long as the caller holds it, so the entry is matched on
+// the inode number alone; the generation check belongs to the entry point
+// that has already fetched the inode.
+static struct adytumfs_cache *cache_find(struct adytumfs_mount *m, u64 inode) {
+    for (u32 index = 0; index < ADYTUMFS_CACHE_MAX; index++)
+        if (m->cache[index].active && m->cache[index].inode == inode)
+            return &m->cache[index];
+    return 0;
+}
+
+static struct adytumfs_cache *cache_take(struct adytumfs_mount *m, u64 inode) {
+    for (u32 index = 0; index < ADYTUMFS_CACHE_MAX; index++)
+        if (!m->cache[index].active) {
+            m->cache[index].inode = inode;
+            return &m->cache[index];
+        }
+    return 0;
 }
 
 // The format stores the VFS node type in the POSIX type bits of the mode.
@@ -131,94 +139,13 @@ static u32 slot_type(const struct adytumfs_inode *inode) {
 // queue is bounded by the slot count because every directory owns a slot
 // before it is queued, and a parent always owns a lower slot than its
 // children, so the table cannot express a cycle.
-static int walk_tree(struct adytumfs_mount *m, adytumfs_alias_sink sink) {
-    struct adytumfs_inode root;
-    if (adytumfs_inode_read(m->device, &m->super, &m->store,
-                            m->super.root_inode, &root)) return -1;
-    // The mount root is the directory every walk starts from; anything else
-    // would have file data parsed as directory records.
-    if ((root.mode & ADYTUMFS_MODE_DIR) == 0) return -1;
-    m->slots[0].inode = m->super.root_inode;
-    m->slots[0].generation = root.generation;
-    m->slots[0].parent = 0;
-    for (u32 byte = 0; byte <= VFS_NAME_MAX; byte++) m->slots[0].name[byte] = 0;
-    u64 queue_inode[ADYTUMFS_INODE_MAX];
-    u32 queue_slot[ADYTUMFS_INODE_MAX];
-    u32 head = 0;
-    u32 tail = 1;
-    u32 used = 1;
-    queue_inode[0] = m->super.root_inode;
-    queue_slot[0] = 0;
-    while (head < tail) {
-        u64 dir_inode = queue_inode[head];
-        u32 dir_slot = queue_slot[head];
-        head++;
-        u64 cursor = 0;
-        for (;;) {
-            char name[ADYTUMFS_NAME_MAX + 1];
-            u32 name_len = 0;
-            u64 target = 0;
-            u8 type = 0;
-            int step = adytumfs_dir_iter(m->device, &m->super, &m->store, dir_inode,
-                                         &cursor, name, &name_len, &target,
-                                         &type);
-            if (step == 1) break;
-            if (step < 0) return -1;
-            struct adytumfs_inode child;
-            if (adytumfs_inode_read(m->device, &m->super, &m->store,
-                                    target, &child) || child.mode == 0)
-                return -1;
-            u32 bits = child.mode & (ADYTUMFS_MODE_DIR | ADYTUMFS_MODE_REG |
-                                     ADYTUMFS_MODE_LNK);
-            if (bits != ADYTUMFS_MODE_DIR && bits != ADYTUMFS_MODE_REG &&
-                bits != ADYTUMFS_MODE_LNK)
-                return -1;
-            u32 expect = bits == ADYTUMFS_MODE_DIR ? ADYTUMFS_DTYPE_DIR :
-                bits == ADYTUMFS_MODE_LNK ? ADYTUMFS_DTYPE_LNK :
-                ADYTUMFS_DTYPE_REG;
-            if (type != expect) return -1;
-            if (!name_len || name_len > VFS_NAME_MAX) return -1;
-            u32 found = ADYTUMFS_INODE_MAX;
-            for (u32 slot = 0; slot < used; slot++)
-                if (m->slots[slot].inode == target) {
-                    found = slot;
-                    break;
-                }
-            if (found != ADYTUMFS_INODE_MAX) {
-                // A second name for a regular inode is a hard link the
-                // caller records through the sink; a directory can never
-                // carry one, so that stays a structural reject.
-                if (bits != ADYTUMFS_MODE_REG || !sink ||
-                    sink(dir_slot, found, name, name_len))
-                    return -1;
-                continue;
-            }
-            if (used >= ADYTUMFS_INODE_MAX) return -1;
-            u32 slot = used++;
-            m->slots[slot].inode = target;
-            m->slots[slot].generation = child.generation;
-            m->slots[slot].parent = dir_slot;
-            for (u32 byte = 0; byte <= VFS_NAME_MAX; byte++)
-                m->slots[slot].name[byte] = 0;
-            for (u32 byte = 0; byte < name_len; byte++)
-                m->slots[slot].name[byte] = name[byte];
-            if (bits == ADYTUMFS_MODE_DIR) {
-                queue_inode[tail] = target;
-                queue_slot[tail] = slot;
-                tail++;
-            }
-        }
-    }
-    return 0;
-}
-
 // Resolve a cache slot, dropping it when the page resource it borrows was
 // revoked in the meantime.
 static struct adytumfs_cache *cache_slot(struct adytumfs_mount *m,
-                                         u32 inode) {
-    if (!m || inode >= ADYTUMFS_INODE_MAX) return 0;
-    struct adytumfs_cache *slot = &m->cache[inode];
-    if (!slot->active) return 0;
+                                         u64 inode) {
+    if (!m) return 0;
+    struct adytumfs_cache *slot = cache_find(m, inode);
+    if (!slot) return 0;
     struct page_resource *resource =
         slot->pages ? page_resource_get(slot->pages) : 0;
     if (!resource || resource->revoked) {
@@ -304,17 +231,19 @@ static int page_transfer(struct adytumfs_mount *m, struct adytumfs_cache *slot,
     return result;
 }
 
-int adytumfs_pages_attach(u32 mount, u32 inode, u64 generation,
+int adytumfs_pages_attach(u32 mount, u64 inode, u64 generation,
                           struct kernel_object *pages) {
-    struct adytumfs_mount *m = slot_mount(mount, inode, generation);
-    if (!m || !pages || m->cache[inode].active)
-        return -1;
+    struct adytumfs_mount *m = mount_at(mount);
+    if (!m || !pages || cache_find(m, inode)) return -1;
     struct adytumfs_inode in;
-    if (slot_inode_read(m, inode, &in) || (in.mode & ADYTUMFS_MODE_REG) == 0)
+    if (inode_fetch(m, inode, generation, &in) ||
+        (in.mode & ADYTUMFS_MODE_REG) == 0)
         return -1;
     struct page_resource *resource = page_resource_get(pages);
     if (!resource || resource->pages > ADYTUMFS_FILE_PAGES) return -1;
-    struct adytumfs_cache *slot = &m->cache[inode];
+    struct adytumfs_cache *slot = cache_take(m, inode);
+    if (!slot) return -1;
+    slot->generation = generation;
     slot->pages = pages;
     cache_clear_all(slot->present);
     cache_clear_all(slot->dirty);
@@ -322,12 +251,13 @@ int adytumfs_pages_attach(u32 mount, u32 inode, u64 generation,
     return 0;
 }
 
-int adytumfs_pages_fault(u32 mount, u32 inode, u64 generation, u32 page) {
-    struct adytumfs_mount *m = slot_mount(mount, inode, generation);
+int adytumfs_pages_fault(u32 mount, u64 inode, u64 generation, u32 page) {
+    struct adytumfs_mount *m = mount_at(mount);
     struct adytumfs_cache *slot = cache_slot(m, inode);
     struct adytumfs_inode in;
     if (!slot || page >= ADYTUMFS_FILE_PAGES ||
-        slot_inode_read(m, inode, &in) || (in.mode & ADYTUMFS_MODE_REG) == 0)
+        inode_fetch(m, inode, generation, &in) ||
+        (in.mode & ADYTUMFS_MODE_REG) == 0)
         return -1;
     if (cache_test(slot->present, page)) return 0;
     struct page_resource *resource = page_resource_get(slot->pages);
@@ -355,32 +285,34 @@ int adytumfs_pages_fault(u32 mount, u32 inode, u64 generation, u32 page) {
     return 0;
 }
 
-int adytumfs_pages_dirty(u32 mount, u32 inode, u64 generation, u32 page,
+int adytumfs_pages_dirty(u32 mount, u64 inode, u64 generation, u32 page,
                          u32 size) {
-    struct adytumfs_mount *m = slot_mount(mount, inode, generation);
+    struct adytumfs_mount *m = mount_at(mount);
     struct adytumfs_cache *slot = cache_slot(m, inode);
     struct adytumfs_inode in;
     if (!slot || page >= ADYTUMFS_FILE_PAGES || size > ADYTUMFS_FILE_SIZE_MAX ||
-        slot_inode_read(m, inode, &in) || (in.mode & ADYTUMFS_MODE_REG) == 0)
+        inode_fetch(m, inode, generation, &in) ||
+        (in.mode & ADYTUMFS_MODE_REG) == 0)
         return -1;
     cache_mark(slot->present, page);
     cache_mark(slot->dirty, page);
     if (size > in.size) {
         in.size = size;
         if (adytumfs_inode_write(m->device, &m->super, &m->store,
-                                 m->slots[inode].inode, &in))
+                                 inode, &in))
             return -1;
     }
     return 0;
 }
 
-int adytumfs_pages_sync(u32 mount, u32 inode, u64 generation) {
-    struct adytumfs_mount *m = slot_mount(mount, inode, generation);
+int adytumfs_pages_sync(u32 mount, u64 inode, u64 generation) {
+    struct adytumfs_mount *m = mount_at(mount);
     struct adytumfs_cache *slot = cache_slot(m, inode);
     if (!m) return -1;
     if (!slot) return 0;
     struct adytumfs_inode in;
-    if (slot_inode_read(m, inode, &in) || (in.mode & ADYTUMFS_MODE_REG) == 0)
+    if (inode_fetch(m, inode, generation, &in) ||
+        (in.mode & ADYTUMFS_MODE_REG) == 0)
         return -1;
     if (!cache_any(slot->dirty)) return 0;
     // Grow to the write-back size, not only over the dirty pages: a write
@@ -391,7 +323,7 @@ int adytumfs_pages_sync(u32 mount, u32 inode, u64 generation) {
     if (needed > ADYTUMFS_FILE_PAGES) needed = ADYTUMFS_FILE_PAGES;
     if (needed > in.blocks &&
         adytumfs_inode_grow(m->device, &m->super, &m->store, &in,
-                            m->slots[inode].inode, needed))
+                            inode, needed))
         return -1;
     // Every dirty page is remapped rather than written where it sits. The
     // block a page maps to is named by content hash and may be shared with
@@ -412,7 +344,7 @@ int adytumfs_pages_sync(u32 mount, u32 inode, u64 generation) {
         u8 *bytes = (u8 *)(uptr_t)resource->physical[page];
         if (!bytes) return -1;
         if (adytumfs_inode_remap(m->device, &m->super, &m->store, &in,
-                                 m->slots[inode].inode, page, bytes))
+                                 inode, page, bytes))
             return -1;
         cache_unmark(slot->dirty, page);
     }
@@ -421,11 +353,21 @@ int adytumfs_pages_sync(u32 mount, u32 inode, u64 generation) {
     return adytumfs_commit(m->device, &m->super, &m->store);
 }
 
-void adytumfs_pages_detach(u32 mount, u32 inode, u64 generation) {
-    struct adytumfs_mount *m = slot_mount(mount, inode, generation);
+void adytumfs_pages_detach(u32 mount, u64 inode, u64 generation) {
+    struct adytumfs_mount *m = mount_at(mount);
     if (!m) return;
-    struct adytumfs_cache *slot = &m->cache[inode];
+    struct adytumfs_cache *slot = cache_find(m, inode);
+    if (!slot) return;
+    // A generation the volume no longer carries means the number was
+    // reclaimed and handed to another file: that file's pages are not this
+    // caller's to drop. Unmount passes zero, which has no such ambiguity.
+    if (generation) {
+        struct adytumfs_inode in;
+        if (inode_fetch(m, inode, generation, &in)) return;
+    }
     slot->pages = 0;
+    slot->inode = 0;
+    slot->generation = 0;
     cache_clear_all(slot->present);
     cache_clear_all(slot->dirty);
     slot->active = 0;
@@ -437,8 +379,7 @@ int adytumfs_format(struct kernel_object *device) {
     return adytumfs_make(device);
 }
 
-int adytumfs_attach(u32 mount, struct kernel_object *device,
-                    adytumfs_alias_sink sink) {
+int adytumfs_attach(u32 mount, struct kernel_object *device) {
     if (!mount || mount >= ADYTUMFS_MOUNT_MAX || mount_at(mount) || !device)
         return -1;
     // One active mount per device: a second window on the same volume would
@@ -464,13 +405,10 @@ int adytumfs_attach(u32 mount, struct kernel_object *device,
     if (adytumfs_verify(device, &super)) return -1;
     if (object_retain(device)) return -1;
     struct adytumfs_mount *m = &mounts[mount];
-    for (u32 slot = 0; slot < ADYTUMFS_INODE_MAX; slot++) {
-        m->slots[slot].inode = 0;
-        m->slots[slot].generation = 0;
-        m->slots[slot].parent = 0;
-        for (u32 byte = 0; byte <= VFS_NAME_MAX; byte++)
-            m->slots[slot].name[byte] = 0;
+    for (u32 slot = 0; slot < ADYTUMFS_CACHE_MAX; slot++) {
         m->cache[slot].pages = 0;
+        m->cache[slot].inode = 0;
+        m->cache[slot].generation = 0;
         cache_clear_all(m->cache[slot].present);
         cache_clear_all(m->cache[slot].dirty);
         m->cache[slot].active = 0;
@@ -478,7 +416,13 @@ int adytumfs_attach(u32 mount, struct kernel_object *device,
     m->super = super;
     m->device = device;
     adytumfs_cas_open(&m->store, super.index_start, super.index_blocks);
-    if (walk_tree(m, sink)) {
+    // Every path on the volume is reached through the root, so a volume
+    // whose root inode does not resolve is corrupt rather than empty and
+    // cannot be mounted at all.
+    struct adytumfs_inode root;
+    if (adytumfs_inode_read(device, &super, &m->store, super.root_inode,
+                            &root) ||
+        (root.mode & ADYTUMFS_MODE_DIR) == 0) {
         m->device = 0;
         object_release(device);
         return -1;
@@ -491,10 +435,11 @@ void adytumfs_detach(u32 mount) {
     struct adytumfs_mount *m = mount_at(mount);
     if (!m) return;
     if (m->device) {
-        for (u32 inode = 0; inode < ADYTUMFS_INODE_MAX; inode++) {
-            if (!m->cache[inode].active) continue;
-            adytumfs_pages_sync(mount, inode, m->slots[inode].generation);
-            adytumfs_pages_detach(mount, inode, m->slots[inode].generation);
+        for (u32 slot = 0; slot < ADYTUMFS_CACHE_MAX; slot++) {
+            if (!m->cache[slot].active) continue;
+            adytumfs_pages_sync(mount, m->cache[slot].inode,
+                                m->cache[slot].generation);
+            adytumfs_pages_detach(mount, m->cache[slot].inode, 0);
         }
         // Unmount is the other commit boundary; pages_sync already committed
         // per file, so this lands windows that only touched raw metadata.
@@ -505,30 +450,32 @@ void adytumfs_detach(u32 mount) {
     m->active = 0;
 }
 
-u32 adytumfs_inode_count(u32 mount) {
-    // The VFS mount scan stacks arrays of this size and attach rejects a
-    // fuller image, so the bound is the slot table, not the volume's inode
-    // count.
-    return mount_at(mount) ? ADYTUMFS_INODE_MAX : 0;
+int adytumfs_root_inode(u32 mount, u64 *inode, u64 *generation) {
+    struct adytumfs_mount *m = mount_at(mount);
+    if (!m) return -1;
+    struct adytumfs_inode in;
+    if (adytumfs_inode_read(m->device, &m->super, &m->store,
+                            m->super.root_inode, &in) || !in.mode)
+        return -1;
+    if (inode) *inode = m->super.root_inode;
+    if (generation) *generation = in.generation;
+    return 0;
 }
 
-int adytumfs_inode_get(u32 mount, u32 inode, u32 *used, u32 *type, u32 *size,
-                      u32 *parent, u32 *mode, char *name, u64 *generation) {
+int adytumfs_inode_get(u32 mount, u64 inode, u32 *used, u32 *type, u32 *size,
+                       u32 *mode, u64 *generation) {
     struct adytumfs_mount *m = mount_at(mount);
-    if (!m || inode >= ADYTUMFS_INODE_MAX) return -1;
-    if (!m->slots[inode].inode) {
+    if (!m || !inode) return -1;
+    struct adytumfs_inode in;
+    if (adytumfs_inode_read(m->device, &m->super, &m->store, inode, &in) ||
+        !in.mode) {
         if (used) *used = 0;
         if (type) *type = 0;
         if (size) *size = 0;
-        if (parent) *parent = 0;
         if (mode) *mode = 0;
         if (generation) *generation = 0;
-        if (name)
-            for (u32 byte = 0; byte <= VFS_NAME_MAX; byte++) name[byte] = 0;
         return 0;
     }
-    struct adytumfs_inode in;
-    if (slot_inode_read(m, inode, &in)) return -1;
     // On-disk sizes are untrusted: clamp to the allocated extents and to the
     // page-resource bound, or a crafted inode drives reads past the mapping.
     u64 bound = in.blocks * ADYTUMFS_BLOCK_SIZE;
@@ -536,20 +483,36 @@ int adytumfs_inode_get(u32 mount, u32 inode, u32 *used, u32 *type, u32 *size,
     if (used) *used = 1;
     if (type) *type = slot_type(&in);
     if (size) *size = (u32)(in.size < bound ? in.size : bound);
-    if (parent) *parent = m->slots[inode].parent;
     if (mode) *mode = in.mode & VFS_MODE_MASK;
-    if (generation) *generation = m->slots[inode].generation;
-    if (name)
-        for (u32 byte = 0; byte <= VFS_NAME_MAX; byte++)
-            name[byte] = m->slots[inode].name[byte];
+    if (generation) *generation = in.generation;
     return 0;
 }
 
-int adytumfs_touch(u32 mount, u32 inode, u64 generation, u32 flags) {
-    struct adytumfs_mount *m = slot_mount(mount, inode, generation);
+int adytumfs_dir_find(u32 mount, u64 inode, u64 generation, const char *name,
+                      u32 name_len, u64 *entry_inode, u32 *type) {
+    struct adytumfs_mount *m = mount_at(mount);
+    struct adytumfs_inode in;
+    if (inode_fetch(m, inode, generation, &in) ||
+        (in.mode & ADYTUMFS_MODE_DIR) == 0)
+        return -1;
+    u64 target = 0;
+    u8 dtype = 0;
+    if (adytumfs_dir_item_find(m->device, &m->super, &m->store,
+                               m->super.inode_root, inode, name, name_len,
+                               &target, &dtype) || !target)
+        return -1;
+    if (entry_inode) *entry_inode = target;
+    if (type)
+        *type = dtype == ADYTUMFS_DTYPE_DIR ? VFS_NODE_DIRECTORY :
+            dtype == ADYTUMFS_DTYPE_LNK ? VFS_NODE_SYMLINK : VFS_NODE_REGULAR;
+    return 0;
+}
+
+int adytumfs_touch(u32 mount, u64 inode, u64 generation, u32 flags) {
+    struct adytumfs_mount *m = mount_at(mount);
     if (!m || !flags) return -1;
     struct adytumfs_inode in;
-    if (slot_inode_read(m, inode, &in)) return -1;
+    if (inode_fetch(m, inode, generation, &in)) return -1;
     u32 changed = 0;
     u64 now = rtc64_wall_clock();
     u32 now_nsec = rtc64_wall_clock_nsec();
@@ -572,17 +535,17 @@ int adytumfs_touch(u32 mount, u32 inode, u64 generation, u32 flags) {
     }
     if (!changed) return 0;
     return adytumfs_inode_write(m->device, &m->super, &m->store,
-                                m->slots[inode].inode, &in);
+                                inode, &in);
 }
 
-int adytumfs_inode_update(u32 mount, u32 inode, u64 generation, u32 flags,
+int adytumfs_inode_update(u32 mount, u64 inode, u64 generation, u32 flags,
                           u32 mode, u32 uid, u32 gid) {
-    struct adytumfs_mount *m = slot_mount(mount, inode, generation);
+    struct adytumfs_mount *m = mount_at(mount);
     if (!m || !flags || (flags & ~(ADYTUMFS_SET_MODE | ADYTUMFS_SET_UID |
                                    ADYTUMFS_SET_GID)))
         return -1;
     struct adytumfs_inode in;
-    if (slot_inode_read(m, inode, &in)) return -1;
+    if (inode_fetch(m, inode, generation, &in)) return -1;
     u32 changed = 0;
     if ((flags & ADYTUMFS_SET_MODE) && (in.mode & 0777u) != mode) {
         // The on-disk mode carries the type bits over the permission bits,
@@ -603,17 +566,17 @@ int adytumfs_inode_update(u32 mount, u32 inode, u64 generation, u32 flags,
     in.ctime = rtc64_wall_clock();
     in.ctime_nsec = rtc64_wall_clock_nsec();
     return adytumfs_inode_write(m->device, &m->super, &m->store,
-                                m->slots[inode].inode, &in);
+                                inode, &in);
 }
 
-int adytumfs_set_times(u32 mount, u32 inode, u64 generation, u32 flags,
+int adytumfs_set_times(u32 mount, u64 inode, u64 generation, u32 flags,
                        u64 atime, u32 atime_nsec, u64 mtime, u32 mtime_nsec) {
-    struct adytumfs_mount *m = slot_mount(mount, inode, generation);
+    struct adytumfs_mount *m = mount_at(mount);
     if (!m || !flags ||
         (flags & ~(ADYTUMFS_TIME_SET_ATIME | ADYTUMFS_TIME_SET_MTIME)))
         return -1;
     struct adytumfs_inode in;
-    if (slot_inode_read(m, inode, &in)) return -1;
+    if (inode_fetch(m, inode, generation, &in)) return -1;
     u32 changed = 0;
     if ((flags & ADYTUMFS_TIME_SET_ATIME) &&
         (in.atime != atime || in.atime_nsec != atime_nsec)) {
@@ -634,17 +597,17 @@ int adytumfs_set_times(u32 mount, u32 inode, u64 generation, u32 flags,
     in.ctime = rtc64_wall_clock();
     in.ctime_nsec = rtc64_wall_clock_nsec();
     return adytumfs_inode_write(m->device, &m->super, &m->store,
-                                m->slots[inode].inode, &in);
+                                inode, &in);
 }
 
-int adytumfs_inode_meta(u32 mount, u32 inode, u64 generation, u16 *links,
+int adytumfs_inode_meta(u32 mount, u64 inode, u64 generation, u16 *links,
                         u32 *uid, u32 *gid, u64 *atime, u64 *mtime,
                         u64 *ctime, u32 *atime_nsec, u32 *mtime_nsec,
                         u32 *ctime_nsec) {
-    struct adytumfs_mount *m = slot_mount(mount, inode, generation);
+    struct adytumfs_mount *m = mount_at(mount);
     if (!m) return -1;
     struct adytumfs_inode in;
-    if (slot_inode_read(m, inode, &in)) return -1;
+    if (inode_fetch(m, inode, generation, &in)) return -1;
     if (links) *links = in.links;
     if (uid) *uid = in.uid;
     if (gid) *gid = in.gid;
@@ -657,17 +620,20 @@ int adytumfs_inode_meta(u32 mount, u32 inode, u64 generation, u16 *links,
     return 0;
 }
 
-int adytumfs_dir_read(u32 mount, u32 inode, u64 generation, u64 *cursor,
+int adytumfs_dir_read(u32 mount, u64 inode, u64 generation, u64 *cursor,
                       char *name, u32 *name_len, u64 *entry_inode,
                       u32 *type) {
-    struct adytumfs_mount *m = slot_mount(mount, inode, generation);
+    struct adytumfs_mount *m = mount_at(mount);
     if (!m || !cursor || !name || !name_len || !entry_inode || !type)
+        return -1;
+    struct adytumfs_inode dir;
+    if (inode_fetch(m, inode, generation, &dir) ||
+        (dir.mode & ADYTUMFS_MODE_DIR) == 0)
         return -1;
     u64 target = 0;
     u8 disk_type = 0;
-    int result = adytumfs_dir_iter(m->device, &m->super,
-                                    &m->store,
-                                   m->slots[inode].inode, cursor, name,
+    int result = adytumfs_dir_iter(m->device, &m->super, &m->store,
+                                   inode, cursor, name,
                                    name_len, &target, &disk_type);
     if (result) return result;
     if (disk_type == ADYTUMFS_DTYPE_REG) {
@@ -682,10 +648,10 @@ int adytumfs_dir_read(u32 mount, u32 inode, u64 generation, u64 *cursor,
     return 0;
 }
 
-int adytumfs_inode_create(u32 mount, const char *name, u32 parent, u32 type,
-                         u32 mode, u32 *inode, u64 *generation) {
+int adytumfs_inode_create(u32 mount, const char *name, u64 parent, u32 type,
+                          u32 mode, u64 *inode, u64 *generation) {
     struct adytumfs_mount *m = mount_at(mount);
-    if (!m || !name || !name[0] || !inode || parent >= ADYTUMFS_INODE_MAX ||
+    if (!m || !name || !name[0] || !inode || !parent ||
         (type != VFS_NODE_REGULAR && type != VFS_NODE_DIRECTORY &&
          type != VFS_NODE_SYMLINK) ||
         (mode & ~VFS_MODE_MASK))
@@ -694,40 +660,24 @@ int adytumfs_inode_create(u32 mount, const char *name, u32 parent, u32 type,
     while (name[name_len] && name_len < VFS_NAME_MAX) name_len++;
     if (name_len == VFS_NAME_MAX && name[name_len]) return -1;
     struct adytumfs_inode dir;
-    if (slot_inode_read(m, parent, &dir) || (dir.mode & ADYTUMFS_MODE_DIR) == 0)
+    if (inode_disk_read(m, parent, &dir) || (dir.mode & ADYTUMFS_MODE_DIR) == 0)
         return -1;
-    // Reserve the table slot before touching the disk so a full table never
-    // leaves an allocated inode behind.
-    u32 slot = 0;
-    for (u32 index = 1; index < ADYTUMFS_INODE_MAX; index++)
-        if (!m->slots[index].inode) {
-            slot = index;
-            break;
-        }
-    if (!slot) return -1;
     u16 disk_mode = (u16)(mode | (type == VFS_NODE_DIRECTORY ?
         ADYTUMFS_MODE_DIR : type == VFS_NODE_SYMLINK ?
         ADYTUMFS_MODE_LNK : ADYTUMFS_MODE_REG));
     u64 target = 0;
     if (adytumfs_create_at(m->device, &m->super, &m->store,
-                           m->slots[parent].inode, name,
+                           parent, name,
                            name_len, disk_mode, &target))
         return -1;
-    // The allocator stamps a fresh generation into the on-disk inode, and the
-    // slot table must carry the same value the caller will be told to present
-    // on every later backend call.
+    // The allocator stamps a fresh generation into the on-disk inode, and
+    // that is the value the caller must present on every later call, so it
+    // is read back rather than assumed.
     struct adytumfs_inode fresh;
     if (adytumfs_inode_read(m->device, &m->super, &m->store,
                             target, &fresh))
         return -1;
-    m->slots[slot].inode = target;
-    m->slots[slot].generation = fresh.generation;
-    m->slots[slot].parent = parent;
-    for (u32 byte = 0; byte <= VFS_NAME_MAX; byte++)
-        m->slots[slot].name[byte] = 0;
-    for (u32 byte = 0; byte < name_len; byte++)
-        m->slots[slot].name[byte] = name[byte];
-    *inode = slot;
+    *inode = target;
     if (generation) *generation = fresh.generation;
     return 0;
 }
@@ -741,20 +691,20 @@ static u32 bounded_name_len(const char *name) {
     return name[len] ? VFS_NAME_MAX + 1u : len;
 }
 
-int adytumfs_inode_link(u32 mount, u32 inode, u64 generation, u32 parent,
+int adytumfs_inode_link(u32 mount, u64 inode, u64 generation, u64 parent,
                         const char *name) {
     // Slot zero is the mount root and a legitimate link parent; the
     // linked inode itself is always a regular file below it.
-    struct adytumfs_mount *m = slot_mount(mount, inode, generation);
-    if (!m || !name || parent >= ADYTUMFS_INODE_MAX) return -1;
+    struct adytumfs_mount *m = mount_at(mount);
+    if (!m || !name || !parent) return -1;
     u32 name_len = bounded_name_len(name);
     if (!name_len || name_len > VFS_NAME_MAX) return -1;
     struct adytumfs_inode in;
-    if (slot_inode_read(m, inode, &in) ||
+    if (inode_fetch(m, inode, generation, &in) ||
         (in.mode & ADYTUMFS_MODE_REG) == 0)
         return -1;
     struct adytumfs_inode dir;
-    if (slot_inode_read(m, parent, &dir) ||
+    if (inode_disk_read(m, parent, &dir) ||
         (dir.mode & ADYTUMFS_MODE_DIR) == 0)
         return -1;
     // The on-disk count is a u16 and stops there; the VFS alias bound is
@@ -767,19 +717,19 @@ int adytumfs_inode_link(u32 mount, u32 inode, u64 generation, u32 parent,
     in.ctime = rtc64_wall_clock();
     in.ctime_nsec = rtc64_wall_clock_nsec();
     if (adytumfs_inode_write(m->device, &m->super, &m->store,
-                             m->slots[inode].inode, &in))
+                             inode, &in))
         return -1;
-    if (adytumfs_dir_add(m->device, &m->super, &m->store, m->slots[parent].inode, name,
-                         name_len, m->slots[inode].inode,
+    if (adytumfs_dir_add(m->device, &m->super, &m->store, parent, name,
+                         name_len, inode,
                          ADYTUMFS_DTYPE_REG)) {
         // The name could not land, so the count goes back down; a failed
         // rollback write just leaves the stale-high drift above.
         in.links--;
         adytumfs_inode_write(m->device, &m->super, &m->store,
-                             m->slots[inode].inode, &in);
+                             inode, &in);
         return -1;
     }
-    adytumfs_touch(mount, parent, m->slots[parent].generation,
+    adytumfs_touch(mount, parent, dir.generation,
                    ADYTUMFS_TOUCH_MTIME | ADYTUMFS_TOUCH_CTIME);
     return 0;
 }
@@ -788,42 +738,41 @@ int adytumfs_inode_link(u32 mount, u32 inode, u64 generation, u32 parent,
 // caller removes the name first, so a crash inside leaves an orphan with
 // its data intact, never a live name over blocks a later allocation can
 // reuse.
-static int inode_reclaim(u32 mount, struct adytumfs_mount *m, u32 inode) {
+static int inode_reclaim(u32 mount, struct adytumfs_mount *m, u64 inode,
+                         u64 generation) {
     struct adytumfs_inode in;
-    if (slot_inode_read(m, inode, &in)) return -1;
-    adytumfs_pages_detach(mount, inode, m->slots[inode].generation);
-    if (adytumfs_inode_truncate(m->device, &m->super, &m->store, &in, m->slots[inode].inode, 0)) return -1;
+    if (inode_fetch(m, inode, generation, &in)) return -1;
+    adytumfs_pages_detach(mount, inode, generation);
+    if (adytumfs_inode_truncate(m->device, &m->super, &m->store, &in,
+                                inode, 0))
+        return -1;
     in.size = 0;
     if (adytumfs_inode_write(m->device, &m->super, &m->store,
-                             m->slots[inode].inode, &in))
+                             inode, &in))
         return -1;
     if (adytumfs_inode_free(m->device, &m->super, &m->store,
-                            m->slots[inode].inode))
+                            inode))
         return -1;
-    m->slots[inode].inode = 0;
-    m->slots[inode].parent = 0;
-    for (u32 byte = 0; byte <= VFS_NAME_MAX; byte++)
-        m->slots[inode].name[byte] = 0;
     return 0;
 }
 
-int adytumfs_unlink(u32 mount, u32 inode, u64 generation, u32 parent,
+int adytumfs_unlink(u32 mount, u64 inode, u64 generation, u64 parent,
                     const char *name, int last_close) {
     // Slot zero is the mount root and a legitimate unlink parent; the
     // unlinked inode below it can be either kind.
-    struct adytumfs_mount *m = slot_mount(mount, inode, generation);
-    if (!m || !name || parent >= ADYTUMFS_INODE_MAX) return -1;
+    struct adytumfs_mount *m = mount_at(mount);
+    if (!m || !name || !parent) return -1;
     u32 name_len = bounded_name_len(name);
     if (!name_len || name_len > VFS_NAME_MAX) return -1;
     struct adytumfs_inode in;
-    if (slot_inode_read(m, inode, &in)) return -1;
+    if (inode_fetch(m, inode, generation, &in)) return -1;
     u32 bits = in.mode & (ADYTUMFS_MODE_DIR | ADYTUMFS_MODE_REG |
                           ADYTUMFS_MODE_LNK);
     if (bits != ADYTUMFS_MODE_DIR && bits != ADYTUMFS_MODE_REG &&
         bits != ADYTUMFS_MODE_LNK)
         return -1;
     struct adytumfs_inode dir;
-    if (slot_inode_read(m, parent, &dir) ||
+    if (inode_disk_read(m, parent, &dir) ||
         (dir.mode & ADYTUMFS_MODE_DIR) == 0)
         return -1;
     if (bits == ADYTUMFS_MODE_DIR) {
@@ -835,7 +784,7 @@ int adytumfs_unlink(u32 mount, u32 inode, u64 generation, u32 parent,
         u64 target = 0;
         u8 type = 0;
         u64 cursor = 0;
-        if (adytumfs_dir_iter(m->device, &m->super, &m->store, m->slots[inode].inode,
+        if (adytumfs_dir_iter(m->device, &m->super, &m->store, inode,
                               &cursor, probe, &probe_len, &target,
                               &type) != 1)
             return -1;
@@ -843,10 +792,10 @@ int adytumfs_unlink(u32 mount, u32 inode, u64 generation, u32 parent,
     // The name goes before the count: a crash between the two leaves a
     // stale-high count, never a live name over blocks a later allocation
     // can reuse.
-    if (adytumfs_dir_remove(m->device, &m->super, &m->store, m->slots[parent].inode,
+    if (adytumfs_dir_remove(m->device, &m->super, &m->store, parent,
                             name, name_len))
         return -1;
-    adytumfs_touch(mount, parent, m->slots[parent].generation,
+    adytumfs_touch(mount, parent, dir.generation,
                    ADYTUMFS_TOUCH_MTIME | ADYTUMFS_TOUCH_CTIME);
     if (bits == ADYTUMFS_MODE_REG && in.links > 1) {
         // A regular inode keeps its remaining names; the count on disk
@@ -855,7 +804,7 @@ int adytumfs_unlink(u32 mount, u32 inode, u64 generation, u32 parent,
         in.ctime = rtc64_wall_clock();
         in.ctime_nsec = rtc64_wall_clock_nsec();
         return adytumfs_inode_write(m->device, &m->super, &m->store,
-                                    m->slots[inode].inode, &in);
+                                    inode, &in);
     }
     if (last_close) {
         // The last name is gone but a descriptor still holds the inode:
@@ -865,18 +814,19 @@ int adytumfs_unlink(u32 mount, u32 inode, u64 generation, u32 parent,
         in.ctime = rtc64_wall_clock();
         in.ctime_nsec = rtc64_wall_clock_nsec();
         return adytumfs_inode_write(m->device, &m->super, &m->store,
-                                    m->slots[inode].inode, &in);
+                                    inode, &in);
     }
-    return inode_reclaim(mount, m, inode);
+    return inode_reclaim(mount, m, inode, generation);
 }
 
-int adytumfs_rename(u32 mount, u32 inode, u64 generation, u32 old_parent,
-                    const char *name, u32 new_parent, const char *new_name) {
+int adytumfs_rename(u32 mount, u64 inode, u64 generation, u64 old_parent,
+                    const char *name, u64 new_parent,
+                    const char *new_name) {
     // The VFS settles names, kinds, mountpoints, and cycles; this layer
     // holds the disk to the same story and lands the move in one commit.
-    struct adytumfs_mount *m = slot_mount(mount, inode, generation);
+    struct adytumfs_mount *m = mount_at(mount);
     if (!m || !name || !new_name || !inode ||
-        old_parent >= ADYTUMFS_INODE_MAX || new_parent >= ADYTUMFS_INODE_MAX)
+        !old_parent || !new_parent)
         return -1;
     u32 name_len = bounded_name_len(name);
     u32 new_len = bounded_name_len(new_name);
@@ -884,27 +834,28 @@ int adytumfs_rename(u32 mount, u32 inode, u64 generation, u32 old_parent,
         new_len > VFS_NAME_MAX)
         return -1;
     struct adytumfs_inode in;
-    if (slot_inode_read(m, inode, &in)) return -1;
+    if (inode_fetch(m, inode, generation, &in)) return -1;
     u32 bits = in.mode & (ADYTUMFS_MODE_DIR | ADYTUMFS_MODE_REG |
                           ADYTUMFS_MODE_LNK);
     if (bits != ADYTUMFS_MODE_DIR && bits != ADYTUMFS_MODE_REG &&
         bits != ADYTUMFS_MODE_LNK)
         return -1;
     struct adytumfs_inode old_dir, new_dir;
-    if (slot_inode_read(m, old_parent, &old_dir) ||
+    if (inode_disk_read(m, old_parent, &old_dir) ||
         (old_dir.mode & ADYTUMFS_MODE_DIR) == 0 ||
-        slot_inode_read(m, new_parent, &new_dir) ||
+        inode_disk_read(m, new_parent, &new_dir) ||
         (new_dir.mode & ADYTUMFS_MODE_DIR) == 0)
         return -1;
     // The moved name must live under the old parent and point here, and the
     // new name must be free: anything else is a stale VFS view.
     u64 present = 0;
-    if (adytumfs_dir_lookup(m->device, &m->super, &m->store, m->slots[old_parent].inode, name,
+    if (adytumfs_dir_lookup(m->device, &m->super, &m->store, old_parent, name,
                             name_len, &present) ||
-        present != m->slots[inode].inode)
+        present != inode)
         return -1;
     u64 taken = 0;
-    if (adytumfs_dir_lookup(m->device, &m->super, &m->store, m->slots[new_parent].inode, new_name,
+    if (adytumfs_dir_lookup(m->device, &m->super, &m->store, new_parent,
+                            new_name,
                             new_len, &taken) == 0)
         return -1;
     // A rename never touches the link count: the moved name keeps vouching
@@ -915,60 +866,45 @@ int adytumfs_rename(u32 mount, u32 inode, u64 generation, u32 old_parent,
     in.ctime = rtc64_wall_clock();
     in.ctime_nsec = rtc64_wall_clock_nsec();
     if (adytumfs_inode_write(m->device, &m->super, &m->store,
-                             m->slots[inode].inode, &in))
+                             inode, &in))
         return -1;
     // The old name leaves before the new one lands: a crash between the
     // two leaves an orphan holding its data, never one inode under two
     // names the link count cannot vouch for.
-    if (adytumfs_dir_remove(m->device, &m->super, &m->store, m->slots[old_parent].inode, name,
+    if (adytumfs_dir_remove(m->device, &m->super, &m->store, old_parent, name,
                             name_len))
         return -1;
     u8 dtype = bits == ADYTUMFS_MODE_DIR ? ADYTUMFS_DTYPE_DIR :
         bits == ADYTUMFS_MODE_LNK ? ADYTUMFS_DTYPE_LNK :
         ADYTUMFS_DTYPE_REG;
-    if (adytumfs_dir_add(m->device, &m->super, &m->store, m->slots[new_parent].inode, new_name,
-                         new_len, m->slots[inode].inode, dtype)) {
+    if (adytumfs_dir_add(m->device, &m->super, &m->store, new_parent, new_name,
+                         new_len, inode, dtype)) {
         // The rename never happened, so put the old name back before
         // failing: the VFS view must keep matching the disk. A failed
         // rollback leaves the accepted orphan form.
-        adytumfs_dir_add(m->device, &m->super, &m->store, m->slots[old_parent].inode, name,
-                         name_len, m->slots[inode].inode, dtype);
+        adytumfs_dir_add(m->device, &m->super, &m->store, old_parent, name,
+                         name_len, inode, dtype);
         return -1;
     }
-    adytumfs_touch(mount, old_parent, m->slots[old_parent].generation,
+    adytumfs_touch(mount, old_parent, old_dir.generation,
                    ADYTUMFS_TOUCH_MTIME | ADYTUMFS_TOUCH_CTIME);
-    adytumfs_touch(mount, new_parent, m->slots[new_parent].generation,
+    adytumfs_touch(mount, new_parent, new_dir.generation,
                    ADYTUMFS_TOUCH_MTIME | ADYTUMFS_TOUCH_CTIME);
-    // The slot cache carries the primary name the mount scan asks for;
-    // when the moved name was an alias, the primary keeps its slot.
-    if (m->slots[inode].parent == old_parent &&
-        slot_name_len(&m->slots[inode]) == name_len) {
-        int primary = 1;
-        for (u32 byte = 0; byte < name_len; byte++)
-            if (m->slots[inode].name[byte] != name[byte]) primary = 0;
-        if (primary) {
-            m->slots[inode].parent = new_parent;
-            for (u32 byte = 0; byte <= VFS_NAME_MAX; byte++)
-                m->slots[inode].name[byte] = 0;
-            for (u32 byte = 0; byte < new_len; byte++)
-                m->slots[inode].name[byte] = new_name[byte];
-        }
-    }
     return 0;
 }
 
 // Write the target into a freshly created symlink inode's file body. The
 // write joins the create in the same staging window, so one commit lands
 // the inode, its name, and the string together.
-int adytumfs_symlink_write(u32 mount, u32 inode, u64 generation,
+int adytumfs_symlink_write(u32 mount, u64 inode, u64 generation,
                            const char *target) {
-    struct adytumfs_mount *m = slot_mount(mount, inode, generation);
+    struct adytumfs_mount *m = mount_at(mount);
     if (!m || !target || !target[0]) return -1;
     u32 length = 0;
     while (length < VFS_PATH_MAX && target[length]) length++;
     if (length >= VFS_PATH_MAX) return -1;
     struct adytumfs_inode in;
-    if (slot_inode_read(m, inode, &in)) return -1;
+    if (inode_fetch(m, inode, generation, &in)) return -1;
     u32 bits = in.mode & (ADYTUMFS_MODE_DIR | ADYTUMFS_MODE_REG |
                           ADYTUMFS_MODE_LNK);
     // Only a fresh link takes a body this way; anything else is a stale
@@ -978,11 +914,12 @@ int adytumfs_symlink_write(u32 mount, u32 inode, u64 generation,
         adytumfs_backend_scratch[index] = 0;
     for (u32 index = 0; index < length; index++)
         adytumfs_backend_scratch[index] = (u8)target[index];
-    if (adytumfs_inode_grow(m->device, &m->super, &m->store, &in, m->slots[inode].inode, 1)) return -1;
+    if (adytumfs_inode_grow(m->device, &m->super, &m->store, &in, inode, 1))
+        return -1;
     // Through a remap and not into the mapping, because the block the grow
     // added is the image of zeroes every hole on the volume shares.
     if (adytumfs_inode_remap(m->device, &m->super, &m->store, &in,
-                             m->slots[inode].inode, 0,
+                             inode, 0,
                              adytumfs_backend_scratch))
         return -1;
     u64 now = rtc64_wall_clock();
@@ -993,19 +930,19 @@ int adytumfs_symlink_write(u32 mount, u32 inode, u64 generation,
     in.ctime_nsec = now_nsec;
     in.size = length;
     if (adytumfs_inode_write(m->device, &m->super, &m->store,
-                             m->slots[inode].inode, &in))
+                             inode, &in))
         return -1;
     return 0;
 }
 
 // Read a symlink's target out of its data block for the mount scan: the
 // string is bounded by the path bound, so one block is the whole extent.
-int adytumfs_symlink_target(u32 mount, u32 inode, u64 generation,
+int adytumfs_symlink_target(u32 mount, u64 inode, u64 generation,
                             char *target) {
-    struct adytumfs_mount *m = slot_mount(mount, inode, generation);
+    struct adytumfs_mount *m = mount_at(mount);
     if (!m || !target) return -1;
     struct adytumfs_inode in;
-    if (slot_inode_read(m, inode, &in)) return -1;
+    if (inode_fetch(m, inode, generation, &in)) return -1;
     u32 bits = in.mode & (ADYTUMFS_MODE_DIR | ADYTUMFS_MODE_REG |
                           ADYTUMFS_MODE_LNK);
     if (bits != ADYTUMFS_MODE_LNK) return -1;
@@ -1021,23 +958,27 @@ int adytumfs_symlink_target(u32 mount, u32 inode, u64 generation,
     return target[0] ? 0 : -1;
 }
 
-int adytumfs_inode_release(u32 mount, u32 inode, u64 generation) {
+int adytumfs_inode_release(u32 mount, u64 inode, u64 generation) {
     struct adytumfs_mount *m = mount_at(mount);
-    if (!m || !m->active || !inode || inode >= ADYTUMFS_INODE_MAX)
-        return -1;
-    if (!m->slots[inode].inode ||
-        m->slots[inode].generation != generation)
+    if (!m || !m->active || !inode) return -1;
+    struct adytumfs_inode in;
+    // A number the volume already reclaimed, or has since handed to a new
+    // file, is a stale close rather than an error: the descriptor is being
+    // dropped either way and nothing left belongs to it.
+    if (adytumfs_inode_read(m->device, &m->super, &m->store, inode, &in) ||
+        !in.mode || in.generation != generation)
         return 0;
-    return inode_reclaim(mount, m, inode);
+    return inode_reclaim(mount, m, inode, generation);
 }
 
-int adytumfs_inode_remove(u32 mount, u32 inode) {
+int adytumfs_inode_remove(u32 mount, u64 inode, u64 generation, u64 parent,
+                          const char *name) {
     struct adytumfs_mount *m = mount_at(mount);
-    if (!m || !inode || inode >= ADYTUMFS_INODE_MAX ||
-        !m->slots[inode].inode)
-        return -1;
+    if (!m || !inode || !parent || !name) return -1;
+    u32 name_len = bounded_name_len(name);
+    if (!name_len || name_len > VFS_NAME_MAX) return -1;
     struct adytumfs_inode in;
-    if (slot_inode_read(m, inode, &in)) return -1;
+    if (inode_fetch(m, inode, generation, &in)) return -1;
     u32 bits = in.mode & (ADYTUMFS_MODE_DIR | ADYTUMFS_MODE_REG |
                           ADYTUMFS_MODE_LNK);
     if (bits != ADYTUMFS_MODE_DIR && bits != ADYTUMFS_MODE_REG &&
@@ -1051,34 +992,36 @@ int adytumfs_inode_remove(u32 mount, u32 inode) {
         u64 target = 0;
         u8 type = 0;
         u64 cursor = 0;
-        if (adytumfs_dir_iter(m->device, &m->super, &m->store, m->slots[inode].inode,
+        if (adytumfs_dir_iter(m->device, &m->super, &m->store, inode,
                               &cursor, name, &name_len, &target, &type) != 1)
             return -1;
     }
-    u32 parent = m->slots[inode].parent;
     // The name goes before the reclaim, so a crash between the two leaves
     // an orphan with its data intact rather than a live name over blocks
     // a later allocation can reuse.
-    if (adytumfs_dir_remove(m->device, &m->super, &m->store, m->slots[parent].inode,
-                            m->slots[inode].name,
-                            slot_name_len(&m->slots[inode])))
+    if (adytumfs_dir_remove(m->device, &m->super, &m->store, parent,
+                            name, name_len))
         return -1;
-    return inode_reclaim(mount, m, inode);
+    return inode_reclaim(mount, m, inode, generation);
 }
 
-int adytumfs_truncate(u32 mount, u32 inode, u64 generation, u32 size,
+int adytumfs_truncate(u32 mount, u64 inode, u64 generation, u32 size,
                      u32 *new_size) {
-    struct adytumfs_mount *m = slot_mount(mount, inode, generation);
+    struct adytumfs_mount *m = mount_at(mount);
     if (!m || !new_size || size > ADYTUMFS_FILE_SIZE_MAX) return -1;
     struct adytumfs_inode in;
-    if (slot_inode_read(m, inode, &in) || (in.mode & ADYTUMFS_MODE_REG) == 0)
+    if (inode_fetch(m, inode, generation, &in) ||
+        (in.mode & ADYTUMFS_MODE_REG) == 0)
         return -1;
     u64 blocks = size / ADYTUMFS_BLOCK_SIZE +
                  (size % ADYTUMFS_BLOCK_SIZE ? 1 : 0);
     if (blocks > in.blocks) {
-        if (adytumfs_inode_grow(m->device, &m->super, &m->store, &in, m->slots[inode].inode, blocks)) return -1;
+        if (adytumfs_inode_grow(m->device, &m->super, &m->store, &in,
+                                inode, blocks))
+            return -1;
     } else if (blocks < in.blocks) {
-        if (adytumfs_inode_truncate(m->device, &m->super, &m->store, &in, m->slots[inode].inode, blocks))
+        if (adytumfs_inode_truncate(m->device, &m->super, &m->store, &in,
+                                    inode, blocks))
             return -1;
     }
     if (size % ADYTUMFS_BLOCK_SIZE) {
@@ -1091,7 +1034,7 @@ int adytumfs_truncate(u32 mount, u32 inode, u64 generation, u32 size,
              index < ADYTUMFS_BLOCK_SIZE; index++)
             adytumfs_backend_scratch[index] = 0;
         if (adytumfs_inode_remap(m->device, &m->super, &m->store, &in,
-                                 m->slots[inode].inode, blocks - 1,
+                                 inode, blocks - 1,
                                  adytumfs_backend_scratch))
             return -1;
     }
@@ -1107,7 +1050,7 @@ int adytumfs_truncate(u32 mount, u32 inode, u64 generation, u32 size,
     // extent tree the committed inode names, so a staged truncation leaves
     // the tree and the blocks on the device disagreeing.
     if (adytumfs_inode_write(m->device, &m->super, &m->store,
-                             m->slots[inode].inode, &in) ||
+                             inode, &in) ||
         adytumfs_commit(m->device, &m->super, &m->store))
         return -1;
     *new_size = size;

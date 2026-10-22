@@ -11,8 +11,6 @@
 #include "vfs.h"
 #include "resource.h"
 
-void serial64_write(const char *text);
-
 // One staging block for raw device probes and on-disk edits; the test battery
 // is single-CPU, so reuse across probes is safe.
 static u8 adytumfs_probe_block[ADYTUMFS_BLOCK_SIZE];
@@ -61,44 +59,60 @@ static struct adytumfs_cas adytumfs_test_store;
 // Giving the whole battery that size pushed the suite past the smoke timeout.
 #define ADYTUMFS_OVERRUN_SECTORS 4096u
 
-
-// Find the mount slot holding a name.
-//
-// Slot numbers follow the order the mount walk met the names in, and a
-// directory now lists in hash order rather than insertion order, so a test
-// that wants a particular file has to look for it instead of assuming where it
-// landed. What is worth asserting is the metadata and the parent link, not the
-// numbering the walk happened to produce.
-static int probe_find_slot(u32 mount_id, const char *want, u32 *slot,
-                           u32 *used, u32 *type, u32 *size, u32 *parent,
-                           u32 *mode) {
-    char probe_name[VFS_NAME_MAX + 1];
-    for (u32 index = 1; index < 64u; index++) {
-        if (adytumfs_inode_get(mount_id, index, used, type, size, parent, mode,
-                               probe_name, 0))
-            continue;
-        if (*used && probe_name_equals(probe_name, want)) {
-            *slot = index;
-            return 0;
-        }
+// The attached volume's mount index. Only a live mount resolves a root, so
+// the question "which mount is this" is the same question as "which mount is
+// still attached".
+static u32 probe_mount(void) {
+    for (u32 probe = 1; probe < VFS_MOUNT_MAX; probe++) {
+        u64 root = 0;
+        u64 generation = 0;
+        if (!adytumfs_root_inode(probe, &root, &generation)) return probe;
     }
-    return -1;
+    return 0;
 }
 
-// A hard-linked inode is stored under whichever of its names the mount walk
-// met first, and a directory now lists in hash order, so which name that is
-// follows from the hashes rather than from the order the links were made in.
-// Both names resolve to the same node through the VFS, which is the property
-// that matters; the stored one is not.
+// Resolve one name inside a directory inode and report the file it names.
+//
+// Inode numbers are whatever the allocator handed out, and a directory lists
+// in hash order, so a test that wants a particular file looks for it by name
+// rather than assuming a number.
+static int probe_find_in(u32 mount_id, u64 dir, const char *want, u64 *slot,
+                         u32 *used, u32 *type, u32 *size, u32 *mode) {
+    u64 generation = 0;
+    if (adytumfs_inode_get(mount_id, dir, used, type, size, mode, &generation))
+        return -1;
+    u32 name_len = 0;
+    while (want[name_len]) name_len++;
+    u64 entry = 0;
+    u32 entry_type = 0;
+    if (adytumfs_dir_find(mount_id, dir, generation, want, name_len, &entry,
+                          &entry_type))
+        return -1;
+    if (adytumfs_inode_get(mount_id, entry, used, type, size, mode,
+                           &generation))
+        return -1;
+    *slot = entry;
+    return 0;
+}
+
+static int probe_find_slot(u32 mount_id, const char *want, u64 *slot,
+                           u32 *used, u32 *type, u32 *size, u32 *mode) {
+    u64 root = 0;
+    u64 generation = 0;
+    if (adytumfs_root_inode(mount_id, &root, &generation)) return -1;
+    return probe_find_in(mount_id, root, want, slot, used, type, size, mode);
+}
+
+// Either name of a hard link resolves to the same inode, and which one the
+// directory happens to answer with follows from the hashes rather than from
+// the order the links were made in.
 static int probe_find_slot_any(u32 mount_id, const char *first,
-                               const char *second, u32 *slot, u32 *used,
-                               u32 *type, u32 *size, u32 *parent, u32 *mode) {
-    if (!probe_find_slot(mount_id, first, slot, used, type, size, parent, mode))
+                               const char *second, u64 *slot, u32 *used,
+                               u32 *type, u32 *size, u32 *mode) {
+    if (!probe_find_slot(mount_id, first, slot, used, type, size, mode))
         return 0;
-    return probe_find_slot(mount_id, second, slot, used, type, size, parent,
-                           mode);
+    return probe_find_slot(mount_id, second, slot, used, type, size, mode);
 }
-
 
 static int policy_super(struct kernel_object *dev,
                         struct adytumfs_superblock *super) {
@@ -358,36 +372,27 @@ int test_adytumfs64(void) {
     }
     if (!vfs_stat(fresh_nested, &info)) {
     }
-    // Ask the backend for the slot picture the way the mount scan does: the
-    // slot table carries the name and parent the walk rebuilt, the inode
-    // carries the type, mode, and the truncated size that reached the disk.
-    u32 mount_id = 0;
-    for (u32 probe = 1; probe < VFS_MOUNT_MAX; probe++)
-        if (adytumfs_inode_count(probe)) {
-            mount_id = probe;
-            break;
-        }
-    u32 used = 0, type = 0, size = 0, parent = 0, mode = 0;
-    // The parent of "nested" is asserted against the slot "folder" actually
-    // occupies rather than against a number, because which slot a name lands
-    // in is an artefact of the walk order and not a property of the volume.
-    u32 hello_slot = 0;
-    u32 folder_slot = 0;
-    u32 nested_slot = 0;
-    u32 nested_parent = 0;
+    // Ask the backend for the picture a path walk would build: names resolve
+    // through the item tree and the inode carries the type, mode, and the
+    // truncated size that reached the disk.
+    u32 mount_id = probe_mount();
+    u32 used = 0, type = 0, size = 0, mode = 0;
+    u64 hello_slot = 0;
+    u64 folder_slot = 0;
+    u64 nested_slot = 0;
+    // "nested" is found inside the inode "folder" resolved to, which is the
+    // parent link stated directly rather than inferred from numbering.
     valid = valid && mount_id &&
         !probe_find_slot_any(mount_id, "hello", "hello-alias", &hello_slot,
-                             &used, &type, &size, &parent, &mode) &&
-        used == 1 && type == VFS_NODE_REGULAR && size == 4 && parent == 0 &&
-        mode == 0604 &&
-        !probe_find_slot(mount_id, "folder", &folder_slot, &used, &type, &size,
-                         &parent, &mode) &&
-        used == 1 && type == VFS_NODE_DIRECTORY && parent == 0 &&
-        mode == 0711 &&
-        !probe_find_slot(mount_id, "nested", &nested_slot, &used, &type, &size,
-                         &nested_parent, &mode) &&
+                             &used, &type, &size, &mode) &&
+        used == 1 && type == VFS_NODE_REGULAR && size == 4 && mode == 0604 &&
+        !probe_find_slot(mount_id, "folder", &folder_slot, &used, &type,
+                         &size, &mode) &&
+        used == 1 && type == VFS_NODE_DIRECTORY && mode == 0711 &&
+        !probe_find_in(mount_id, folder_slot, "nested", &nested_slot, &used,
+                       &type, &size, &mode) &&
         used == 1 && type == VFS_NODE_REGULAR && mode == 0620 &&
-        nested_parent == folder_slot;
+        nested_slot && nested_slot != folder_slot;
     if (reopened) {
         object_release(reopened);
         reopened = 0;
@@ -434,29 +439,28 @@ int test_adytumfs64(void) {
         object_release(ghost);
         ghost = 0;
     }
-    u32 ghost_mount = 0;
-    for (u32 probe = 1; probe < VFS_MOUNT_MAX; probe++)
-        if (adytumfs_inode_count(probe)) {
-            ghost_mount = probe;
-            break;
+    // The property under test is that nothing unlinked comes back: a fresh
+    // mount of the volume resolves its root and that root lists nothing.
+    u32 ghost_mount = probe_mount();
+    u64 ghost_root = 0;
+    u64 ghost_generation = 0;
+    u32 ghost_entries = 0;
+    if (ghost_mount &&
+        !adytumfs_root_inode(ghost_mount, &ghost_root, &ghost_generation)) {
+        u64 ghost_cursor = 0;
+        for (;;) {
+            char ghost_name[ADYTUMFS_NAME_MAX + 1];
+            u32 ghost_len = 0;
+            u64 ghost_target = 0;
+            u32 ghost_type = 0;
+            if (adytumfs_dir_read(ghost_mount, ghost_root, ghost_generation,
+                                  &ghost_cursor, ghost_name, &ghost_len,
+                                  &ghost_target, &ghost_type))
+                break;
+            ghost_entries++;
         }
-    u32 ghost_used = 0;
-    u32 ghost_root = 0;
-    char ghost_name[VFS_NAME_MAX + 1];
-    for (u32 probe = 0; probe < ADYTUMFS_INODE_MAX; probe++) {
-        u32 ghost_slot_used = 0;
-        u32 ghost_type = 0;
-        u32 ghost_size = 0;
-        u32 ghost_parent = 0;
-        u32 ghost_mode = 0;
-        if (adytumfs_inode_get(ghost_mount, probe, &ghost_slot_used,
-                               &ghost_type, &ghost_size, &ghost_parent,
-                               &ghost_mode, ghost_name, 0))
-            ghost_slot_used = 1;
-        if (probe) ghost_used += ghost_slot_used ? 1 : 0;
-        else ghost_root = ghost_slot_used;
     }
-    valid = valid && ghost_mount && ghost_root && !ghost_used;
+    valid = valid && ghost_mount && ghost_root && !ghost_entries;
     if (final_directory) object_release(final_directory);
     if (final_remount && vfs_unmount(mnt)) valid = 0;
     // Rename reaches the disk: the moved name, the replaced target, and
@@ -509,37 +513,32 @@ int test_adytumfs64(void) {
         info.type == VFS_NODE_REGULAR && info.links == 1 &&
         !vfs_stat(archive_again, &info) &&
         info.type == VFS_NODE_DIRECTORY && info.links == 2;
-    // The slot picture a later mount would scan: the moved file kept its
-    // inode under the replaced name, the renamed directory kept its own,
-    // and the replaced inode is gone.
-    u32 rename_mount = 0;
-    for (u32 probe = 1; probe < VFS_MOUNT_MAX; probe++)
-        if (adytumfs_inode_count(probe)) {
-            rename_mount = probe;
-            break;
-        }
+    // The picture a later mount would build: the renamed directory answers
+    // to its new name, the moved file kept its inode under the replaced
+    // name, and the name that was replaced no longer resolves.
+    u32 rename_mount = probe_mount();
     u32 rename_used = 0;
     u32 rename_type = 0;
     u32 rename_size = 0;
-    u32 rename_parent = 0;
     u32 rename_mode = 0;
-    char rename_name[VFS_NAME_MAX + 1];
+    u64 rename_root = 0;
+    u64 rename_generation = 0;
+    u64 archive_inode = 0;
+    u64 victim_inode = 0;
+    u64 gone_inode = 0;
     valid = valid && rename_mount &&
-        !adytumfs_inode_get(rename_mount, 1, &rename_used, &rename_type,
-                           &rename_size, &rename_parent, &rename_mode,
-                           rename_name, 0) &&
+        !adytumfs_root_inode(rename_mount, &rename_root, &rename_generation) &&
+        !probe_find_in(rename_mount, rename_root, "archive", &archive_inode,
+                       &rename_used, &rename_type, &rename_size,
+                       &rename_mode) &&
         rename_used == 1 && rename_type == VFS_NODE_DIRECTORY &&
-        rename_parent == 0 && probe_name_equals(rename_name, "archive") &&
-        !adytumfs_inode_get(rename_mount, 2, &rename_used, &rename_type,
-                           &rename_size, &rename_parent, &rename_mode,
-                           rename_name, 0) &&
+        !probe_find_in(rename_mount, rename_root, "victim", &victim_inode,
+                       &rename_used, &rename_type, &rename_size,
+                       &rename_mode) &&
         rename_used == 1 && rename_type == VFS_NODE_REGULAR &&
-        rename_size == 4 && rename_parent == 0 &&
-        probe_name_equals(rename_name, "victim") &&
-        !adytumfs_inode_get(rename_mount, 3, &rename_used, &rename_type,
-                           &rename_size, &rename_parent, &rename_mode,
-                           rename_name, 0) &&
-        !rename_used;
+        rename_size == 4 &&
+        adytumfs_dir_find(rename_mount, rename_root, rename_generation,
+                          "file", 4, &gone_inode, &rename_type);
     if (victim_again) object_release(victim_again);
     if (archive_again) object_release(archive_again);
     if (disk_again) object_release(disk_again);
@@ -765,8 +764,10 @@ int test_adytumfs_policy64(void) {
     struct kernel_object *root = vfs_root();
     int valid = root != 0;
 
-    // A dirent naming an inode the table no longer backs must fail the mount
-    // rather than surface a file with another inode's content.
+    // A dirent naming an inode the volume no longer backs must fail the mount
+    // rather than surface a file with another inode's content. What catches
+    // it is the volume audit, not a namespace walk: a zeroed inode fails its
+    // own mode and size checks before any name is resolved.
     {
         struct kernel_object *dev = block_create(ADYTUMFS_TEST_SECTORS, 0);
         struct kernel_object *point = root ?
@@ -913,12 +914,11 @@ int test_adytumfs_policy64(void) {
         if (dev) object_release(dev);
     }
 
-    // More reachable inodes than the mount's slot bound must fail the mount,
-    // so the volume cannot silently drop files. Slot 0 of the table is
-    // unused, so the volume has to carry more on-disk inodes than the slot
-    // bound to make the overrun reachable at all: a 2304-sector volume gets
-    // nine table blocks and so outnumbers the bound, and the last reachable
-    // inode is placed by the format layer itself.
+    // A volume carrying more files than the old mount's slot table held used
+    // to be unmountable, and the file past the bound was dropped with it.
+    // Nothing renumbers files now, so the mount succeeds and the last file
+    // resolves like the first: the bound this block existed to prove is the
+    // one that went away.
     {
         struct kernel_object *dev = block_create(ADYTUMFS_OVERRUN_SECTORS, 0);
         struct kernel_object *point = root ?
@@ -965,17 +965,70 @@ int test_adytumfs_policy64(void) {
                               extra, ADYTUMFS_DTYPE_REG);
         ok = ok && !adytumfs_commit(dev, &super, &adytumfs_test_store);
         if (dev) block_cache_drop_device((u32)dev->value);
-        ok = ok && vfs_mount_adytumfs(point, dev) < 0;
+        ok = ok && !vfs_mount_adytumfs(point, dev);
+        disk = ok ? vfs_lookup(root, "policy") : 0;
+        struct kernel_object *first_file = disk ?
+            vfs_lookup(disk, "f000") : 0;
+        struct kernel_object *past_bound = disk ?
+            vfs_lookup(disk, "extra") : 0;
+        ok = ok && disk && first_file && past_bound;
+        if (past_bound) object_release(past_bound);
+        if (first_file) object_release(first_file);
+        if (disk) object_release(disk);
+        ok = ok && !vfs_unmount(point);
         valid = valid && ok;
         if (point) object_release(point);
         if (root) vfs_unlink(root, "policy");
         if (dev) object_release(dev);
     }
 
-    // More hard-link names than the VFS alias bound must fail the mount
-    // rather than half-list the names: the sink counts the pairs and
-    // refuses the seventeenth. The names go in through the format layer
-    // directly because the VFS link path enforces the same bound upstream.
+    // Two names for one directory, built through the format layer so the
+    // volume is structurally sound and the audit accepts it. A file may carry
+    // many names, but a directory has one parent here, so the second name
+    // resolves to nothing rather than giving the subtree two homes.
+    {
+        struct kernel_object *dev = block_create(ADYTUMFS_TEST_SECTORS, 0);
+        struct kernel_object *point = root ?
+            vfs_create(root, "policy", VFS_NODE_DIRECTORY) : 0;
+        int ok = dev && point && !adytumfs_format(dev) &&
+            !vfs_mount_adytumfs(point, dev);
+        struct kernel_object *disk = ok ? vfs_lookup(root, "policy") : 0;
+        struct kernel_object *node = disk ?
+            vfs_create(disk, "a", VFS_NODE_DIRECTORY) : 0;
+        ok = ok && disk && node;
+        if (node) object_release(node);
+        if (disk) object_release(disk);
+        ok = ok && !vfs_unmount(point);
+        struct adytumfs_superblock super;
+        u64 target = 0;
+        ok = ok && !policy_super(dev, &super) &&
+            !adytumfs_dir_lookup(dev, &super, &adytumfs_test_store,
+                                 super.root_inode, "a", 1, &target) &&
+            target &&
+            !adytumfs_dir_add(dev, &super, &adytumfs_test_store,
+                              super.root_inode, "b", 1, target,
+                              ADYTUMFS_DTYPE_DIR) &&
+            !adytumfs_commit(dev, &super, &adytumfs_test_store);
+        if (dev) block_cache_drop_device((u32)dev->value);
+        ok = ok && !vfs_mount_adytumfs(point, dev);
+        disk = ok ? vfs_lookup(root, "policy") : 0;
+        struct kernel_object *first_name = disk ? vfs_lookup(disk, "a") : 0;
+        struct kernel_object *second_name = disk ? vfs_lookup(disk, "b") : 0;
+        ok = ok && disk && first_name && !second_name;
+        if (second_name) object_release(second_name);
+        if (first_name) object_release(first_name);
+        if (disk) object_release(disk);
+        ok = ok && !vfs_unmount(point);
+        valid = valid && ok;
+        if (point) object_release(point);
+        if (root) vfs_unlink(root, "policy");
+        if (dev) object_release(dev);
+    }
+
+    // A volume may carry more names for one file than this VFS can record.
+    // Nothing counts them at mount any more, so the mount succeeds and the
+    // names past the alias bound simply do not resolve: a name the VFS
+    // cannot record would be unlinked under another name's identity.
     {
         struct kernel_object *dev = block_create(ADYTUMFS_TEST_SECTORS, 0);
         struct kernel_object *point = root ?
@@ -1008,7 +1061,33 @@ int test_adytumfs_policy64(void) {
         }
         ok = ok && !adytumfs_commit(dev, &super, &adytumfs_test_store);
         if (dev) block_cache_drop_device((u32)dev->value);
-        ok = ok && vfs_mount_adytumfs(point, dev) < 0;
+        ok = ok && !vfs_mount_adytumfs(point, dev);
+        disk = ok ? vfs_lookup(root, "policy") : 0;
+        struct kernel_object *primary = disk ? vfs_lookup(disk, "hello") : 0;
+        ok = ok && disk && primary;
+        if (primary) object_release(primary);
+        for (u32 index = 0; ok && index < VFS_ALIAS_MAX; index++) {
+            char label[4];
+            label[0] = 'l';
+            label[1] = (char)('0' + index / 10);
+            label[2] = (char)('0' + index % 10);
+            label[3] = 0;
+            struct kernel_object *found = vfs_lookup(disk, label);
+            ok = found != 0;
+            if (found) object_release(found);
+        }
+        if (ok && disk) {
+            char label[4];
+            label[0] = 'l';
+            label[1] = (char)('0' + VFS_ALIAS_MAX / 10);
+            label[2] = (char)('0' + VFS_ALIAS_MAX % 10);
+            label[3] = 0;
+            struct kernel_object *overflow = vfs_lookup(disk, label);
+            ok = !overflow;
+            if (overflow) object_release(overflow);
+        }
+        if (disk) object_release(disk);
+        ok = ok && !vfs_unmount(point);
         valid = valid && ok;
         if (point) object_release(point);
         if (root) vfs_unlink(root, "policy");
@@ -1063,14 +1142,16 @@ int test_adytumfs_reuse64(void) {
         int ok = dev && point && !adytumfs_format(dev);
         ok = ok && !vfs_mount_adytumfs(point, dev);
         struct kernel_object *disk = ok ? vfs_lookup(root, "reuse") : 0;
-        u32 mount_id = 0;
-        for (u32 probe = 1; probe < VFS_MOUNT_MAX; probe++)
-            if (adytumfs_inode_count(probe)) {
-                mount_id = probe;
-                break;
-            }
-        u32 used = 0, type = 0, size = 0, parent = 0, mode = 0, moved = 0;
-        char name[VFS_NAME_MAX + 1];
+        u32 mount_id = probe_mount();
+        u32 used = 0, type = 0, size = 0, mode = 0, moved = 0;
+        u64 reuse_root = 0;
+        u64 reuse_generation = 0;
+        u64 first_inode = 0;
+        u64 second_inode = 0;
+        u64 third_inode = 0;
+        u64 fourth_inode = 0;
+        if (mount_id)
+            adytumfs_root_inode(mount_id, &reuse_root, &reuse_generation);
         u64 first_generation = 0;
         u64 second_generation = 0;
         u64 third_generation = 0;
@@ -1078,27 +1159,27 @@ int test_adytumfs_reuse64(void) {
         u8 payload[16];
         u8 received[16];
 
-        // Slot 1: an open descriptor holds the unlinked inode alive, so
-        // the slot frees with the final close and the next create reuses
-        // it. The data stays readable through the descriptor for exactly
-        // as long as the descriptor stays open.
+        // An open descriptor holds the unlinked inode alive, so the number
+        // is not handed back until the final close, and the data stays
+        // readable through the descriptor for exactly as long as the
+        // descriptor stays open.
         struct kernel_object *first = disk ?
             vfs_create(disk, "first", VFS_NODE_REGULAR) : 0;
         struct kernel_object *first_file = first ? vfs_open(first) : 0;
         reuse_fill(payload, sizeof(payload), 0x10);
         ok = ok && disk && mount_id && first && first_file &&
-            !adytumfs_inode_get(mount_id, 1, &used, &type, &size, &parent,
-                               &mode, name, &first_generation) &&
-            used == 1 && probe_name_equals(name, "first") &&
-            first_generation;
+            !probe_find_in(mount_id, reuse_root, "first", &first_inode,
+                           &used, &type, &size, &mode) &&
+            used == 1 && first_inode;
+        ok = ok &&
+            !adytumfs_inode_get(mount_id, first_inode, &used, &type, &size,
+                                &mode, &first_generation) &&
+            used == 1 && first_generation;
         ok = ok &&
             !vfs_write(first_file, 0, payload, sizeof(payload), &moved) &&
             moved == sizeof(payload) && !vfs_sync(first_file);
         ok = ok && !vfs_unlink(disk, "first") &&
             !vfs_lookup(disk, "first") &&
-            !adytumfs_inode_get(mount_id, 1, &used, &type, &size, &parent,
-                               &mode, name, 0) &&
-            used == 1 && probe_name_equals(name, "first") &&
             !vfs_read(first_file, 0, received, sizeof(received), &moved) &&
             moved == sizeof(received) &&
             reuse_matches(received, sizeof(received), 0x10);
@@ -1114,11 +1195,19 @@ int test_adytumfs_reuse64(void) {
             vfs_create(disk, "second", VFS_NODE_REGULAR) : 0;
         struct kernel_object *second_file = second ? vfs_open(second) : 0;
         reuse_fill(payload, sizeof(payload), 0x20);
+        // The allocation is a high-water mark, so the file created after
+        // the reclaim takes a fresh number rather than the reclaimed one,
+        // and a handle still holding the old pair cannot reach it.
         ok = ok && second && second_file &&
-            !adytumfs_inode_get(mount_id, 1, &used, &type, &size, &parent,
-                               &mode, name, &second_generation) &&
-            used == 1 && probe_name_equals(name, "second") &&
-            second_generation && second_generation != first_generation;
+            !probe_find_in(mount_id, reuse_root, "second", &second_inode,
+                           &used, &type, &size, &mode) &&
+            used == 1 && second_inode && second_inode != first_inode &&
+            !adytumfs_inode_get(mount_id, second_inode, &used, &type, &size,
+                                &mode, &second_generation) &&
+            second_generation && second_generation != first_generation &&
+            !adytumfs_inode_get(mount_id, first_inode, &used, &type, &size,
+                                &mode, 0) &&
+            !used;
         ok = ok &&
             !vfs_write(second_file, 0, payload, sizeof(payload), &moved) &&
             moved == sizeof(payload) && !vfs_sync(second_file) &&
@@ -1135,17 +1224,20 @@ int test_adytumfs_reuse64(void) {
             moved == sizeof(received) &&
             reuse_matches(received, sizeof(received), 0x30);
 
-        // Slot 2: a handle that never touched the disk still holds its
-        // inode past the unlink, so the slot cannot be reused under a live
+        // A handle that never touched the disk still holds its inode past
+        // the unlink, so the number cannot be handed out under a live
         // descriptor and the write-through-a-stale-cache hazard cannot
         // arise in the first place.
         struct kernel_object *third = disk ?
             vfs_create(disk, "third", VFS_NODE_REGULAR) : 0;
         struct kernel_object *third_file = third ? vfs_open(third) : 0;
         ok = ok && third && third_file &&
-            !adytumfs_inode_get(mount_id, 2, &used, &type, &size, &parent,
-                               &mode, name, &third_generation) &&
-            used == 1 && third_generation &&
+            !probe_find_in(mount_id, reuse_root, "third", &third_inode,
+                           &used, &type, &size, &mode) &&
+            used == 1 &&
+            !adytumfs_inode_get(mount_id, third_inode, &used, &type, &size,
+                                &mode, &third_generation) &&
+            third_generation &&
             !vfs_unlink(disk, "third") &&
             !vfs_read(third_file, 0, received, sizeof(received), &moved) &&
             moved == 0;
@@ -1162,9 +1254,11 @@ int test_adytumfs_reuse64(void) {
         struct kernel_object *fourth_file = fourth ? vfs_open(fourth) : 0;
         reuse_fill(payload, sizeof(payload), 0x50);
         ok = ok && fourth && fourth_file &&
-            !adytumfs_inode_get(mount_id, 2, &used, &type, &size, &parent,
-                               &mode, name, &fourth_generation) &&
-            used == 1 && probe_name_equals(name, "fourth") &&
+            !probe_find_in(mount_id, reuse_root, "fourth", &fourth_inode,
+                           &used, &type, &size, &mode) &&
+            used == 1 && fourth_inode && fourth_inode != third_inode &&
+            !adytumfs_inode_get(mount_id, fourth_inode, &used, &type, &size,
+                                &mode, &fourth_generation) &&
             fourth_generation && fourth_generation != third_generation;
         ok = ok && !vfs_write(fourth_file, 0, payload, sizeof(payload),
                               &moved) &&
@@ -1314,8 +1408,6 @@ static void integrity_cleanup(struct kernel_object *root,
     adytumfs_window_discard(dev);
     if (dev) object_release(dev);
 }
-
-
 
 int test_adytumfs_integrity64(void) {
     u32 objects = object_active_count();
@@ -1534,7 +1626,6 @@ int test_adytumfs_integrity64(void) {
         block_active_count() == devices;
     return valid ? 0 : -1;
 }
-
 
 int test_adytumfs_checksum64(void) {
     u32 objects = object_active_count();
