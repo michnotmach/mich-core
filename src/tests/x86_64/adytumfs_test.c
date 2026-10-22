@@ -2021,3 +2021,89 @@ int test_adytumfs_cow64(void) {
         block_active_count() == devices;
     return valid ? 0 : -1;
 }
+
+// A node the clock has given away has to come back with the same bytes and
+// the same stat. Without this half the eviction itself is untested: a node
+// that kept a stale address would answer a later lookup with plausible data,
+// and a test that only walks names would never notice the difference.
+#define ADYTUMFS_EVICT_SWEEP 700u
+int test_adytumfs_evict64(void) {
+    u32 objects = object_active_count();
+    u32 nodes = vfs_node_active_count();
+    u32 files = vfs_file_active_count();
+    u32 mounts = vfs_mount_active_count();
+    u32 devices = block_active_count();
+    struct kernel_object *root = vfs_root();
+    struct kernel_object *dev = block_create(ADYTUMFS_OVERRUN_SECTORS, 0);
+    struct kernel_object *point = root ?
+        vfs_create(root, "evict", VFS_NODE_DIRECTORY) : 0;
+    struct kernel_object *disk = 0;
+    int valid = root && dev && point && !adytumfs_format(dev) &&
+        !vfs_mount_adytumfs(point, dev);
+    if (valid) disk = vfs_lookup(root, "evict");
+    u8 payload[8];
+    u8 received[8];
+    u32 moved = 0;
+    struct vfs_node_info info;
+    for (u32 index = 0; index < sizeof(payload); index++)
+        payload[index] = (u8)(0xA0u + index);
+    struct kernel_object *probe = valid && disk ?
+        vfs_create(disk, "probe", VFS_NODE_REGULAR) : 0;
+    struct kernel_object *probe_file = probe ? vfs_open(probe) : 0;
+    valid = valid && disk && probe && probe_file &&
+        !vfs_write(probe_file, 0, payload, sizeof(payload), &moved) &&
+        moved == sizeof(payload) && !vfs_fsync(probe_file);
+    if (probe_file) object_release(probe_file);
+    if (probe) object_release(probe);
+
+    // Every name is looked up and then dropped, so the table ends up holding
+    // nodes that only the table references. Past its bound the clock has no
+    // choice but to give the oldest of them away, and "probe" is the oldest.
+    u32 sweep = 0;
+    for (u32 round = 0; valid && round < ADYTUMFS_EVICT_SWEEP; round++) {
+        char name[8];
+        u32 value = round;
+        name[0] = 'f';
+        for (u32 digit = 0; digit < 4u; digit++) {
+            name[4u - digit] = (char)('0' + (value % 10u));
+            value /= 10u;
+        }
+        name[5] = 0;
+        struct kernel_object *made = vfs_create(disk, name, VFS_NODE_REGULAR);
+        if (!made) break;
+        object_release(made);
+        struct kernel_object *seen = vfs_lookup(disk, name);
+        if (!seen) break;
+        object_release(seen);
+        sweep++;
+    }
+    int bounded = vfs_node_active_count() <= VFS_NODE_MAX;
+
+    // The sweep has to have outrun the table, or nothing was evicted and the
+    // assertions below would pass against a node that never left.
+    struct kernel_object *again = valid && disk ?
+        vfs_lookup(disk, "probe") : 0;
+    int rc_stat = again ? vfs_stat(again, &info) : -1;
+    struct kernel_object *again_file = again ? vfs_open(again) : 0;
+    int rc_read = again_file ?
+        vfs_read(again_file, 0, received, sizeof(received), &moved) : -1;
+    int same = !rc_read && moved == sizeof(received);
+    for (u32 index = 0; same && index < sizeof(received); index++)
+        if (received[index] != payload[index]) same = 0;
+    valid = valid && sweep > VFS_NODE_MAX && bounded && again && !rc_stat &&
+        info.type == VFS_NODE_REGULAR && info.size == sizeof(payload) && same;
+    if (again_file) object_release(again_file);
+    if (again) object_release(again);
+    if (disk) object_release(disk);
+    if (point && vfs_unmount(point)) valid = 0;
+    if (root && vfs_unlink(root, "evict")) valid = 0;
+    if (point) object_release(point);
+    if (root) object_release(root);
+    if (dev) object_release(dev);
+    valid = valid && object_active_count() == objects &&
+        vfs_node_active_count() == nodes &&
+        vfs_file_active_count() == files &&
+        vfs_mount_active_count() == mounts &&
+        block_active_count() == devices;
+    return valid ? 0 : -1;
+}

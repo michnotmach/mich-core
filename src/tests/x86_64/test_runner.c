@@ -202,6 +202,9 @@ int tests64_run(const struct test64_env *env) {
     if (test_report_record(TEST_ID_ADYTUMFS_POLICY, test_adytumfs_policy64()))
         return -1;
     serial64_write("Mich test64: adytumfs mount policies pass\n");
+    if (test_report_record(TEST_ID_ADYTUMFS_EVICT, test_adytumfs_evict64()))
+        return -1;
+    serial64_write("Mich test64: adytumfs node eviction pass\n");
     if (test_report_record(TEST_ID_ADYTUMFS_REUSE, test_adytumfs_reuse64()))
         return -1;
     serial64_write("Mich test64: adytumfs slot reuse pass\n");

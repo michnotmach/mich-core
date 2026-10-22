@@ -81,6 +81,7 @@ int test_task_runtime(void);
 int test_eevdf(void);
 int test_adytumfs_pages64(void);
 int test_adytumfs_policy64(void);
+int test_adytumfs_evict64(void);
 int test_adytumfs_reuse64(void);
 int test_adytumfs_integrity64(void);
 int test_adytumfs_checksum64(void);
