@@ -3,24 +3,14 @@ set -eu
 image="${1:-bin/x86_64/disk.img}"
 memory="${2:-128M}"
 profile="${3:-default}"
-# The default profile runs the whole kernel test battery, which has grown
-# well past the boot it was budgeted for. A passing run lands at seventy
-# seconds against a seventy second budget, so a good run and a killed one
-# differ by less than the host's jitter; the same truncation the tty profile
-# below already had.
-qemu_timeout=90
-# The crypto known-answer tests run before the profile-specific ones, and the
-# RSA modular exponentiations are the slowest thing in the boot under TCG.
-if [ "$profile" = "smp" ] || [ "$profile" = "iommu" ]; then qemu_timeout=130; fi
-if [ "$profile" = "msi" ]; then qemu_timeout=300; fi
-if [ "$profile" = "dns" ]; then qemu_timeout=150; fi
-if [ "$profile" = "netbench" ]; then qemu_timeout=300; fi
-if [ "$profile" = "tcpwire" ]; then qemu_timeout=300; fi
-if [ "$profile" = "virtio-blk" ]; then qemu_timeout=120; fi
-# The tty profile's passing run lands close to the old 60 second budget, which
-# truncated good runs on slower hosts mid-log rather than failing them.
-if [ "$profile" = "tty" ]; then qemu_timeout=120; fi
-if [ "$profile" = "nvme" ]; then qemu_timeout=300; fi
+# Every profile boots the same test battery, and the eviction test in it has
+# to create more files than the node table can hold, or nothing is evicted
+# and the test proves nothing. That is over five hundred inodes through the
+# format layer, and under TCG it outran every per-profile budget: measured,
+# 245 seconds was not enough while 300 passed. One shared number beats six
+# that each have to be retuned whenever the battery grows.
+qemu_timeout=300
+# The MSI recovery profiles boot three kernels in a row.
 if [ "$profile" = "msi-restart" ] || [ "$profile" = "msi-circuit" ] ||
    [ "$profile" = "msi-recovery" ]; then
     qemu_timeout=360
