@@ -166,6 +166,13 @@ static int index_probe(struct kernel_object *device,
         }
         if (live != ADYTUMFS_INDEX_LIVE && *reuse == index->capacity)
             *reuse = entry;
+        // An empty slot ends the probe: insertion always takes the first hole
+        // on its own chain, so nothing live can sit behind a slot that was
+        // never written. A tombstone cannot end it, because a live entry may
+        // have been inserted past the hole while the hole was already there.
+        // Without this distinction every miss walked the whole table, and
+        // each step re-read and re-checksummed a 4 KiB index block.
+        if (live == ADYTUMFS_INDEX_EMPTY) return 0;
         entry = (entry + 1u) % index->capacity;
     }
     return 0;
